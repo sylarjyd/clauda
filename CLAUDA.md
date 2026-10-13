@@ -256,6 +256,11 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 macOS 的 Cmd+Q / Cmd+H / Cmd+W 和复制粘贴都从菜单项的角色来，摘了等于把「退出」一起摘了。
 Windows / Linux 上不受影响：可编辑元素里的 Ctrl+C/V/X 由 Blink 自己处理，不经过菜单的
 加速键（已用真键盘事件验过：摘掉菜单后 Ctrl+V 照常把中文粘进输入框）。
+底部的写作区是一张卡片（`.composer`）：左右各留 16px 和 `.stream` 的边距对齐，textarea
+的 `min-height` 约三行。**随内容长高的上限 200px 在 `app.js` 和 `style.css` 里各写死了一份，
+改一处要改两处。** 卡片自己就是输入框的样子，里面的 textarea 不画边框、不填底色 ——
+焦点环由 `.composer:focus-within` 出（`textarea:focus` 的 `outline: none` 是全局规则，
+两者不冲突，也不会出现里外两道环）。
 
 ```
 desktop/                    薄壳，纯 JS，不在 tsconfig 的 rootDir 覆盖内

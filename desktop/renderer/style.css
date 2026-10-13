@@ -659,30 +659,88 @@ select:focus {
   font-size: 12.5px;
 }
 
+/*
+ * 底部的写作区。
+ *
+ * 原样是一条贴边的通栏：1px 上边框、textarea 只有 `rows="1"` 一行高、按钮和正文挤在
+ * 同一行 —— 打字的地方看着像这条栏的附属品，而不像是这个应用最主要的那块桌面。
+ * 现在做成**压在中栏底部的一张卡片**：左右各留 16px，和 `.stream` 的边距对齐；textarea
+ * 至少三行高；焦点落进来时整张卡片描上 accent 边（`:focus-within`），不必去盯
+ * textarea 那 1px 的边框变化。投影只给一点点 —— 要的是「压在消息流之上」，不是又一块
+ * 平贴的面板。
+ *
+ * `flex-wrap` + `.attach-list` 的 `flex-basis: 100%` 照旧：附件条要独占一行，而
+ * textarea 的父节点不许换（见 index.html 那条注释）。
+ */
 .composer {
   display: flex;
   align-items: flex-end;
-  /* 附件条要能独占一行：见 `.attach-list` 的 `flex-basis: 100%`。
-     不换行的话 chip 会和 textarea、按钮挤在同一行里 */
   flex-wrap: wrap;
   gap: 8px;
-  padding: 10px 16px 14px;
-  border-top: 1px solid var(--line);
-  background: var(--bg-soft);
+  margin: 0 16px 16px;
+  padding: 12px 12px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--bg-raise);
+  box-shadow:
+    0 1px 3px rgba(38, 34, 30, 0.05),
+    0 10px 26px -20px rgba(38, 34, 30, 0.4);
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
+.composer:focus-within {
+  border-color: var(--accent);
+  box-shadow:
+    0 1px 3px rgba(38, 34, 30, 0.05),
+    0 10px 26px -18px rgba(169, 79, 40, 0.5);
+}
+
+/*
+ * 卡片自己就是输入框的样子，里面的 textarea 于是**不画边框、不填底色** ——
+ * 两层框叠在一起会读成两个控件。
+ *
+ * 由此焦点环也从 textarea 移到卡片上（`:focus-within`）：`textarea:focus` 那条全局规则
+ * 本来就 `outline: none`，不冲突，也不会出现里外两道环。
+ *
+ * `min-height` 约三行，是「输入框太小了」那句抱怨的正解 —— `max-height` 和 app.js 里
+ * 那个 200 的上限**必须一致**（两边都写死了这个数），改一处要改两处。
+ */
 .composer textarea {
   flex: 1;
   min-width: 0;
+  min-height: 68px;
   max-height: 200px;
+  padding: 2px 4px;
+  border: none;
+  background: none;
   resize: none;
   overflow-y: auto;
 }
 
 .composer-actions {
   display: flex;
+  align-items: center;
   gap: 6px;
   flex: none;
+}
+
+/*
+ * 全应用只有这一个实心按钮。「发送」是这个界面上最主要的动作，其它按钮一律描边 ——
+ * 把 accent 的力气集中在这一处，比到处点缀好认。
+ */
+.composer-actions #send {
+  padding: 4px 18px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fffdfb;
+}
+
+.composer-actions #send:hover:not(:disabled) {
+  border-color: var(--accent-ink);
+  background: var(--accent-ink);
+  color: #fffdfb;
 }
 
 /* ---------------------------------------------------------------- 附件 */

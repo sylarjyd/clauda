@@ -1120,6 +1120,8 @@ els.input.addEventListener('keydown', (event) => {
   void submit()
 })
 
+// 随内容长高。这个 200 和 style.css 里 `.composer textarea` 的 `max-height` 是同一个数，
+// 改一处要改两处 —— 最小高度（三行）那边只由 CSS 的 `min-height` 兜着，这里不必管
 els.input.addEventListener('input', () => {
   els.input.style.height = 'auto'
   els.input.style.height = `${Math.min(200, els.input.scrollHeight)}px`
