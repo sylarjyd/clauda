@@ -73,7 +73,7 @@ const MCP_STATE = { connected: '已连接', failed: '失败', disabled: '未启�
 const SETTINGS_META = {
   model: {
     title: '模型配置',
-    sub: '当前项目解析后的生效配置。厂商与接口地址是**项目级**的，改完立刻对本项目的所有会话生效（切厂商会连默认模型一起换成该厂商的）；「默认模型」只决定之后新建的会话用哪个，当前会话的模型在中栏顶栏上改。',
+    sub: '当前项目解析后的生效配置。这里改的厂商、接口地址、默认模型**只决定之后新建的会话**用哪个 —— 已经开着的会话在创建那一刻就把端点和模型定下来了，改这里动不了它们。当前会话的模型在中栏顶栏上改。',
   },
   skills: {
     title: '技能',
@@ -364,7 +364,7 @@ function vendorSelect(project) {
 }
 
 function editBaseUrl(provider) {
-  return editLine('接口地址', provider.baseUrl, '存为接口地址', '写回项目配置文件，立刻对本项目的所有会话生效', saveBaseUrl)
+  return editLine('接口地址', provider.baseUrl, '存为接口地址', '写回项目配置文件，只影响之后新建的会话', saveBaseUrl)
 }
 
 function editModel(current, models) {
@@ -446,11 +446,10 @@ async function saveVendor(project, key) {
     return
   }
   const label = (project.vendors ?? []).find((v) => v.key === key)?.label ?? key
-  notice('info', `已切到 ${label}，接口地址与模型一起写入了 ${res.file}`)
+  notice('info', `已切到 ${label}，接口地址与模型一起写入了 ${res.file}，只影响之后新建的会话`)
+  // 活会话不动（配置冻结）：它们的端点和模型冻在创建那一刻，所以这里既不用刷会话，
+  // 也不用动顶栏和徽标 —— 那两处显示的是**当前会话**，本来就没变
   await refreshProjectInfo(activeSession()?.id)
-  // 会话的模型被一起换掉了，顶栏和导航徽标得跟着走
-  const session = activeSession()
-  if (session) await refreshSession(session.id)
 }
 
 async function saveBaseUrl(input) {
@@ -469,7 +468,7 @@ async function saveBaseUrl(input) {
     notice('error', `接口地址没写进去：${res.reason}`)
     return
   }
-  notice('info', `接口地址已写入 ${res.file}，立刻对本项目的会话生效`)
+  notice('info', `接口地址已写入 ${res.file}，只影响之后新建的会话`)
   await refreshProjectInfo(activeSession()?.id)
 }
 

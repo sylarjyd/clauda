@@ -145,19 +145,22 @@
   （`config.ts` 的 `writeProjectProvider`，`writeProjectModel` 只是它的薄封装）。
   `loadConfig` 内部的 `expandEnvRefs` 已经把 `${MY_KEY}` 换成了真实密钥，拿它回写等于把
   密钥明文落盘 —— 这是数据泄露，不是格式问题。同一处：改了默认模型／接口地址还要**同步
-  内存里的 `project.config`**，因为 `openSession` 走的是 `structuredClone(project.config)`，
-  只写文件的话已开着的项目仍拿旧值（表现是「改了没生效」）；文件解析不了时**报错返回、
+  内存里的 `project.config`**，因为它是新建会话**唯一**的来源（`openSession` 走的是
+  `structuredClone(project.config)`），漏了就成了「改了没生效」；文件解析不了时**报错返回、
   不覆盖**，别为了容错丢掉整份配置。
-- **切厂商必须「地址 + 模型」一次写完，并刷掉本项目所有活会话的模型**
-  （`SessionManager.setVendor`）。只换地址的话，当前会话会拿着旧模型名去问新端点
-  （`gpt-4o-mini` 问 DeepSeek），换来的只是一个费解的 404；而会话的 `model` 是 `openSession`
-  时克隆出来的旧值，不刷就是下一条消息必挂。语义记牢：**厂商定义「这个项目跟谁说话」
-  （传输层，项目级，立刻生效），默认模型定义「新会话用哪个脑子」（会话级默认）**。
+- **改配置一律只对之后新建的会话生效**（`SessionManager` 的类注释）。端点、密钥、模型在
+  `openSession` 那一刻就定死了：每个会话有**自己的 provider 实例**，而 `Agent.opts.provider`
+  构造后不可变。设置页三个入口（接口地址 / 厂商 / 默认模型）全是这个语义，活会话一个都不动。
+  其中 **`setVendor` 必须「地址 + 模型」一次写完**（`SessionManager.setVendor`）：只换地址的话，
+  新会话会拿着旧模型名去问新端点（`gpt-4o-mini` 问 DeepSeek），换来的只是一个费解的 404。
+  历史：2026-10 之前端点与厂商是**项目级立刻生效**的（全项目共享一个 provider 实例，`setVendor`
+  还会刷所有活会话的模型 + 重建系统提示词）。那让「切厂商」变成一个会打断正在跑的会话的动作，
+  也让同一个设置页要同时讲两套作用范围，于是统一成了现在这一条。
 - **provider 的 client 在 `stream()` 开头跟 `cfg` 对一次**（`provider/openai.ts` 的
-  `syncClient`）。`project.ts` 把 `config.provider` 那**一个对象**交给了 provider，桌面端改的
-  就是它；但 `new OpenAI({ baseURL })` 是构造函数里建好的快照，不同步的话界面显示新地址、
-  请求发往旧地址，**且不报任何错**（症状是「改了没反应」）。`model` 不在此列 —— agent 每轮
-  现读 `config.provider.model`，别把两者混为一谈。
+  `syncClient`）。`new OpenAI({ baseURL })` 是构造函数里建好的快照，不同步的话 `cfg` 改了而请求
+  发往旧地址，**且不报任何错**（症状是「改了没反应」）。当前这条**永远不会触发** —— 端点冻结在
+  会话创建那一刻，会话内没人改 `cfg.baseUrl`/`apiKey`；留着是给「以后允许改本会话端点」兜底，
+  别把它当成还在用的机制。`model` 从来不在此列 —— agent 每轮现读 `config.provider.model`。
 - **厂商不存字段，由 `baseUrl` 反推**（`provider/vendors.ts` 的 `vendorByBaseUrl`；预置表里
   每个地址互不相同，是单射）。存一个 label 只会多出「文件被手改了、label 与 baseUrl 对不上、
   界面开始撒谎」这种状态。推导**必须在主进程做**：renderer 走 `app://` 协议，`main.js` 的

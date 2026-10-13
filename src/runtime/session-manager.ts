@@ -6,10 +6,12 @@ import {
   writeProjectProvider,
   type ClaudaConfig,
   type PermissionMode,
+  type ProviderConfig,
 } from '../config.js'
 import { VENDORS, vendorByBaseUrl, type VendorPreset } from '../provider/vendors.js'
 import type { McpServerStatus } from '../mcp/manager.js'
 import { PermissionManager } from '../permissions.js'
+import { OpenAICompatibleProvider } from '../provider/openai.js'
 import type { Provider } from '../provider/types.js'
 import type { SkillMeta } from '../skills/types.js'
 import type { Tool } from '../tools/types.js'
@@ -43,9 +45,11 @@ export interface SessionProject {
   readonly cwd: string
   /**
    * 模板配置。会话创建时会被**克隆**一份 —— 见下面 `openSession` 的注释。
+   *
+   * 这里刻意**不放 provider**：早先放了一个共享实例，于是改接口地址会立刻钻到所有活会话
+   * 里去。provider 现在归会话自己（`openSession` 里建），项目这份只当模板。
    */
   readonly config: ClaudaConfig
-  readonly provider: Provider
   /**
    * 刻意不写成 `AgentOptions['skills']` —— 那边只声明了 `{name, description}`，
    * 而桌面端的技能页要显示 `file` / `dir`。`SkillMeta[]` 协变地满足 `SkillSummary[]`，
@@ -140,6 +144,12 @@ interface TurnMark {
 export interface SessionManagerOptions {
   sink: EventSink
   openProject(cwd: string): SessionProject | Promise<SessionProject>
+  /**
+   * 建 provider 的工厂，参数是那个会话克隆出来的 `config.provider`。默认就是真的
+   * `OpenAICompatibleProvider`；留这个口子是因为 `tests/unit.mjs` 不许碰 socket，
+   * 得能塞一个假的进去（e2e 才用真进程 + 真 loopback）。
+   */
+  createProvider?(config: ProviderConfig): Provider
 }
 
 interface ProjectEntry {
@@ -156,17 +166,25 @@ interface ProjectEntry {
  *   会让第一条的 Promise 泄漏
  * - **config 按会话克隆**：`/model` 写 `config.provider.model`、`/mode` 写
  *   `config.permissions.mode`，共享的话 A 切模型会串到所有会话
+ * - **provider 也按会话建**：它是「这个会话跟谁说话」，和 config 一起在创建那一刻定下来。
+ *   项目级共享一个实例的话，设置页改接口地址会直接钻到所有活会话里
  * - **授权 Promise 必须能结清**：`PermissionManager` 的 `ask` 不监听 signal，
  *   所以每条取消路径都要先 `denyAll`
+ *
+ * 由此得到一条贯穿设置页的规则：**改配置只对之后新建的会话生效**。「接口地址」「厂商」
+ * 「默认模型」三个入口都是这个语义，项目配置在这里只当模板。
  */
 export class SessionManager {
   private readonly sessions = new Map<string, Session>()
   private readonly projects = new Map<string, ProjectEntry>()
   private readonly marks = new Map<string, TurnMark>()
   private readonly bridge: PermissionBridge
+  /** 见 `SessionManagerOptions.createProvider` */
+  private readonly createProvider: (config: ProviderConfig) => Provider
   private seq = 0
 
   constructor(private readonly opts: SessionManagerOptions) {
+    this.createProvider = opts.createProvider ?? ((config) => new OpenAICompatibleProvider(config))
     this.bridge = new PermissionBridge(opts.sink, {
       onAllowForSession: (sessionId, label) => {
         const session = this.sessions.get(sessionId)
@@ -189,7 +207,10 @@ export class SessionManager {
     const agent = new Agent({
       cwd,
       config,
-      provider: entry.project.provider,
+      // provider 也归会话自己，而且**必须**跟着上面那份克隆走：`Agent.opts.provider` 构造后
+      // 不可变，于是端点与密钥在会话诞生的这一刻就冻住了 —— 之后项目改地址、换厂商，活着的
+      // 会话照旧打原来的地方，只有新会话拿新值。「配置只对新会话生效」就是这么实现的。
+      provider: this.createProvider(config.provider),
       view,
       permissions,
       tools: entry.project.assembleTools(),
@@ -345,16 +366,15 @@ export class SessionManager {
   }
 
   /**
-   * 改「接口地址」：写回项目配置文件，**并同步内存里那份 `project.config`**。
+   * 改「接口地址」：写回项目配置文件，**并同步内存里那份 `project.config`**，只影响之后
+   * 新建的会话。已经在跑的会话各有自己的 provider，端点冻在创建那一刻（见 `openSession`）。
    *
-   * 不双写就是「改了没生效」：provider 是在 `createProjectRuntime` 那一刻用
-   * `config.provider` 建的，已经开着的项目仍拿旧地址发请求（见 `provider/openai.ts`
-   * 的 `syncClient` —— 它盯的就是这份内存里的对象）。
+   * 但内存那份模板**必须**双写：它是新会话唯一的来源，漏了就成了「改了没生效」。
    */
   setDefaultBaseUrl(cwd: string, rawBaseUrl: string): string {
-    // **这里也必须归一化**，不能只在 `loadConfig` 里做：内存里这一个对象是 provider
-    // 现读的那份（`syncClient`），漏掉的话刚改完的地址要等重启才生效 —— 表现是
-    // 「存为」点了没反应
+    // **这里也必须归一化**，不能只在 `loadConfig` 里做：内存里这份模板是新会话唯一的来源，
+    // 留着未归一的原文，新建的会话拿到的地址就和重启后的不一致 —— 表现是「存为」点了，
+    // 重启前后行为不一样
     const baseUrl = normalizeBaseUrl(rawBaseUrl)
     const file = writeProjectProvider(cwd, { baseUrl })
     const entry = this.projects.get(cwd)
@@ -363,30 +383,23 @@ export class SessionManager {
   }
 
   /**
-   * 切厂商：**地址与模型一起原子写盘**，并把本项目所有活着的会话的模型刷成预置默认值。
+   * 切厂商：**地址与模型一起原子写盘**，只对之后新建的会话生效。
    *
-   * 两件事必须一起做，否则换来的只会是一个费解的 404：
-   * - 切到 DeepSeek 却留着 `gpt-4o-mini` → 模型名在新端点不存在；
-   * - 端点立刻生效（桌面端选的就是这条），而会话的 `model` 是 `openSession` 时
-   *   `structuredClone` 出来的旧值 → 当前会话下一条消息就必 404。
+   * 地址和模型必须一起写：切到 DeepSeek 却留着 `gpt-4o-mini`，换来的只会是一个费解的 404。
    *
-   * 语义是**自洽**的，不是两种作用范围打架：厂商定义「这个项目跟谁说话」（传输层，
-   * 项目级，立刻生效）；默认模型定义「新会话用哪个脑子」（会话级默认）。
+   * 活会话**不跟着换**（和「接口地址」「默认模型」同一条规则，见类注释）。所以这里没有
+   * 刷 `session.config` + `refreshSystemPrompt()` 那一步 —— 那会让「切厂商」变成一个会
+   * 打断正在跑的会话的动作，而它本该只是「以后新建的会话跟谁说话」。
    */
   setVendor(cwd: string, preset: VendorPreset): string {
     const model = preset.models[0]
     const file = writeProjectProvider(cwd, { baseUrl: preset.baseUrl, model })
 
+    // 同步内存里那份模板配置：它是新会话唯一的来源，不同步就还是旧厂商 —— 与「改了没生效」无异
     const entry = this.projects.get(cwd)
     if (entry) {
       entry.project.config.provider.baseUrl = preset.baseUrl
       if (model) entry.project.config.provider.model = model
-    }
-    for (const session of this.sessions.values()) {
-      if (session.cwd !== cwd) continue
-      if (model) session.config.provider.model = model
-      // 系统提示词里写着当前模型名，不重建的话会话会自报旧模型
-      session.agent.refreshSystemPrompt()
     }
     return file
   }

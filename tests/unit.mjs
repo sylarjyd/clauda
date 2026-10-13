@@ -1583,14 +1583,14 @@ console.log('\n== 会话管理：并发守卫与配置隔离 ==')
   const openProject = (dir) => ({
     cwd: dir,
     config: agentConfig(),
-    provider: textProvider('回答'),
     skills: { list: () => [] },
     assembleTools: () => ALL_TOOLS,
     mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
     dispose: () => { disposed.push(dir) },
   })
 
-  const mgr = new SessionManager({ sink, openProject })
+  // provider 不再是项目的一部分（一个会话一个），所以从工厂这儿塞假的进去
+  const mgr = new SessionManager({ sink, openProject, createProvider: () => textProvider('回答') })
   const a = await mgr.openSession(projDir)
   const b = await mgr.openSession(projDir)
 
@@ -1697,10 +1697,13 @@ console.log('\n== provider：改了地址，client 必须跟着换 ==')
 }
 
 // ------------------------------------------------------------------ 切厂商
-// 换端点会踩两个坑，任一都是「下一条消息必 404」：
-// provider 的 client 是构造时建的快照（改了 baseUrl 请求还打往旧地址，且不报错），
-// 以及会话的 model 是开会话时克隆出来的旧值（拿 gpt-4o-mini 去问 DeepSeek）。
-console.log('\n== 会话管理：切厂商写盘并刷活会话 ==')
+// 换端点会踩两个坑，任一都是「下一条消息必 404」：provider 的 client 是构造时建的快照
+// （改了 baseUrl 请求还打往旧地址，且不报错），以及会话的 model 是开会话时克隆出来的
+// 旧值（拿 gpt-4o-mini 去问 DeepSeek）。
+//
+// 这两条现在都由「一个会话一个 provider、端点与模型冻在创建那一刻」兜住，所以下面验的
+// 不再是「刷得对不对」，而是**活会话压根不许被刷** —— 那正是配置冻结要的效果。
+console.log('\n== 会话管理：切厂商写盘、活会话冻结 ==')
 {
   const { SessionManager } = await import(`${dist}runtime/session-manager.js`)
   const { findVendor } = await import(`${dist}provider/vendors.js`)
@@ -1716,30 +1719,35 @@ console.log('\n== 会话管理：切厂商写盘并刷活会话 ==')
     config.provider.baseUrl = 'http://127.0.0.1:9/v1'
     config.provider.model = 'old-model'
 
-    /** 每轮真正用到的地址 —— 读的就是那个会被 setVendor 改掉的活对象 */
+    /** 每轮真正打到的地址。记的是**建 provider 时那份 config** 里的地址 */
     const hit = []
     const project = {
       cwd: projDir,
       config,
-      provider: {
-        model: config.provider.model,
-        async *stream() {
-          hit.push(config.provider.baseUrl)
-          yield { type: 'text', text: '好的' }
-          yield { type: 'done', finishReason: 'stop' }
-        },
-      },
       skills: { list: () => [] },
       assembleTools: () => ALL_TOOLS,
       mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
       dispose: () => {},
     }
 
-    const mgr = new SessionManager({ sink: { send: () => {} }, openProject: () => project })
+    // 单元测试不许碰 socket，所以塞个假 provider 进去（真实现是 OpenAICompatibleProvider）。
+    // 关键：它只认**建的时候**拿到的那份 config，项目那份后来被改成什么与它无关 —— 正是冻结
+    const fakeProvider = (cfg) => ({
+      model: cfg.model,
+      async *stream() {
+        hit.push(cfg.baseUrl)
+        yield { type: 'text', text: '好的' }
+        yield { type: 'done', finishReason: 'stop' }
+      },
+    })
+    const mgr = new SessionManager({
+      sink: { send: () => {} },
+      openProject: () => project,
+      createProvider: fakeProvider,
+    })
     const a = await mgr.openSession(projDir)
     await mgr.send(a.id, '第一轮')
     check('第一轮打的是项目原来的地址', hit.at(-1) === 'http://127.0.0.1:9/v1', JSON.stringify(hit))
-    check('provider.model 是构造时的快照（所以换厂商必须刷会话模型）', project.provider.model === 'old-model', project.provider.model)
 
     const ds = findVendor('deepseek')
     const file = mgr.setVendor(projDir, ds)
@@ -1749,19 +1757,23 @@ console.log('\n== 会话管理：切厂商写盘并刷活会话 ==')
       disk.provider.baseUrl === ds.baseUrl && disk.provider.model === ds.models[0],
       JSON.stringify(disk.provider),
     )
-    check('切厂商同步了内存里那份项目配置（否则已开的项目仍发往旧地址）', config.provider.baseUrl === ds.baseUrl, config.provider.baseUrl)
+    check('切厂商同步了内存里那份项目配置（新会话唯一的来源）', config.provider.baseUrl === ds.baseUrl, config.provider.baseUrl)
     check(
-      '切厂商把活会话的模型也刷了',
-      a.config.provider.model === ds.models[0],
+      '切厂商不动活会话的模型（配置冻结）',
+      a.config.provider.model === 'old-model',
       a.config.provider.model,
     )
-    check('活会话的系统提示词里也换成新模型名', a.agent.messages[0].content.includes(ds.models[0]), a.agent.messages[0].content.slice(0, 300))
+    check('活会话的系统提示词里还是旧模型名', a.agent.messages[0].content.includes('old-model'), a.agent.messages[0].content.slice(0, 300))
 
     const opened = await mgr.openSession(projDir)
     check('切完之后新建的会话直接用新模型', opened.config.provider.model === ds.models[0], opened.config.provider.model)
 
     await mgr.send(a.id, '第二轮')
-    check('第二轮真的打到了新地址', hit.at(-1) === ds.baseUrl, JSON.stringify(hit))
+    check(
+      '第二轮仍然打到旧地址（冻结没生效的话，这里会变成新地址）',
+      hit.at(-1) === 'http://127.0.0.1:9/v1',
+      JSON.stringify(hit),
+    )
   } finally {
     if (prevHome === undefined) delete process.env.CLAUDA_HOME
     else process.env.CLAUDA_HOME = prevHome
@@ -1833,7 +1845,6 @@ console.log('\n== 会话管理：授权等待、MCP 与记忆广播 ==')
   const openProject = (d) => ({
     cwd: d,
     config: agentConfig({ permissions: { mode: 'default', allow: [], deny: [] } }),
-    provider: routingProvider,
     skills: { list: () => [] },
     assembleTools: () => (mcpOn ? [...ALL_TOOLS, mcpTool] : [...ALL_TOOLS]),
     mcp: {
@@ -1847,7 +1858,8 @@ console.log('\n== 会话管理：授权等待、MCP 与记忆广播 ==')
 
   const events = []
   const sink = { send: (sid, ev) => events.push([sid, ev]) }
-  const mgr = new SessionManager({ sink, openProject })
+  // routingProvider 无状态（只读 opts），两个会话共用同一个实例没有区别
+  const mgr = new SessionManager({ sink, openProject, createProvider: () => routingProvider })
 
   const a = await mgr.openSession(dir)
   const b = await mgr.openSession(dir)
@@ -1920,11 +1932,11 @@ console.log('\n== 会话管理：记忆写入后广播给同项目其它会话 =
   const sink = { send: (sid, ev) => events.push([sid, ev]) }
   const mgr = new SessionManager({
     sink,
+    createProvider: () => provider,
     openProject: (d) => ({
       cwd: d,
       // auto 模式：记忆工具是 write 权限，不然会卡在授权框上
       config: agentConfig({ permissions: { mode: 'auto', allow: [], deny: [] } }),
-      provider,
       skills: { list: () => [] },
       assembleTools: () => [...ALL_TOOLS, ...makeMemoryTools()],
       memoryIndex: () => { const entries = listMemories().entries; return { entries, total: entries.length } },

@@ -32,9 +32,13 @@ export class OpenAICompatibleProvider implements Provider {
   }
 
   /**
-   * `this.cfg` 是项目运行时那**一个**对象（`project.ts` 把 `config.provider` 直接传了进来），
-   * 桌面端改「接口地址 / 厂商」改的就是它。client 却只在构造时按当时的 baseUrl 建好了一次 ——
-   * 不同步的话，界面显示新端点、请求发往旧地址，而且**不报任何错**。
+   * `this.cfg` 是**本会话**克隆出来的那份 `config.provider`（`session-manager.ts` 的
+   * `openSession` 里建，一个会话一个实例）。client 却只在构造时按当时的 baseUrl 建好了一次 ——
+   * 不同步的话，`cfg` 改了而请求发往旧地址，而且**不报任何错**（症状是「改了没反应」）。
+   *
+   * **这条当前永远不会触发**：端点与密钥冻在会话创建那一刻（配置冻结），会话内没人改
+   * `cfg.baseUrl` / `cfg.apiKey`。留着是给「以后允许改本会话的端点」兜底 —— 那种改动一旦进来，
+   * 失败方式是**静默**的，所以宁肯平时白比一次。项目级改地址传不到活会话上，那正是冻结要的效果。
    */
   private syncClient(): void {
     if (this.clientBaseUrl === this.cfg.baseUrl && this.clientApiKey === this.cfg.apiKey) return

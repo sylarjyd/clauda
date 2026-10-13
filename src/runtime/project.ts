@@ -1,7 +1,6 @@
 import { listMemories } from '../agent/memory-store.js'
 import { loadConfig, type CliOverrides } from '../config.js'
 import { McpManager } from '../mcp/manager.js'
-import { OpenAICompatibleProvider } from '../provider/openai.js'
 import { SkillRegistry } from '../skills/registry.js'
 import { createToolAssembly } from './tools-assembly.js'
 import type { SessionProject } from './session-manager.js'
@@ -16,7 +15,11 @@ export interface ProjectRuntimeOptions {
 }
 
 /**
- * 建一个项目的运行时：配置、provider、技能、MCP、工具装配。
+ * 建一个项目的运行时：配置、技能、MCP、工具装配。
+ *
+ * **这里不建 provider。** 早先建了一个共享实例发给所有会话，改接口地址就会直接钻到
+ * 活会话里；现在 provider 归会话自己，在 `SessionManager.openSession` 里按会话克隆的
+ * 配置建。这条运行时只留模板配置与「跟进程绑定」的东西（技能、MCP 子进程、工具装配）。
  *
  * **`loadConfig` 必须包在 env 快照里。** 它内部的 dotenv 是改全局 `process.env` 的，
  * 而且不覆盖已存在的键 —— 桌面端同时开着 A、B 两个项目时，先加载的那个会把键留在
@@ -35,7 +38,6 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
     restoreEnv(envBefore)
   }
 
-  const provider = new OpenAICompatibleProvider(config.provider)
   const skills = SkillRegistry.discover(opts.cwd)
   const mcp = new McpManager(config.mcpServers ?? {}, {
     version: opts.version,
@@ -48,7 +50,6 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
   return {
     cwd: opts.cwd,
     config,
-    provider,
     skills,
     memoryIndex: () => listMemories(),
     assembleTools: assembly.assemble,
