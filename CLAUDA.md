@@ -251,6 +251,11 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 （按项目分组，状态点是空闲 / 运行中 / 等待授权）；中栏对话；右栏改动文件与待办。最底下还有一行通栏的通知栏，
 没通知时整行塌掉。灰阶是浅色暖调，赤陶 accent 沿用了原来暗色版的家族（白底上压深了一档）。
 斜杠命令不做成输入框 —— `/model` 和 `/mode` 是中栏顶栏的控件，`/compact` 自动触发。
+窗口**没有菜单栏**（`main.js` 里 `Menu.setApplicationMenu(null)`），文件 / 编辑 / 视图
+那几项一个都用不上，白占一条。**那一行必须带 `process.platform !== 'darwin'`** ——
+macOS 的 Cmd+Q / Cmd+H / Cmd+W 和复制粘贴都从菜单项的角色来，摘了等于把「退出」一起摘了。
+Windows / Linux 上不受影响：可编辑元素里的 Ctrl+C/V/X 由 Blink 自己处理，不经过菜单的
+加速键（已用真键盘事件验过：摘掉菜单后 Ctrl+V 照常把中文粘进输入框）。
 
 ```
 desktop/                    薄壳，纯 JS，不在 tsconfig 的 rootDir 覆盖内

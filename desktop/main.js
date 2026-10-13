@@ -1,12 +1,12 @@
 /**
- * Electron 主进程 —— **刻意只有四件事**：建窗口、把 `app://` 映射到 renderer 目录、
- * 转发 IPC、在退出时把 MCP 子进程收干净。
+ * Electron 主进程 —— **刻意只有五件事**：建窗口、摘掉默认菜单、把 `app://` 映射到
+ * renderer 目录、转发 IPC、在退出时把 MCP 子进程收干净。
  *
  * 一行业务逻辑都不许进来。`DesktopApp`（`dist/runtime/desktop-app.js`）才是逻辑所在，
  * 它不依赖 Electron，所以能被 `tests/desktop-driver.mjs` 用子进程跑一遍。
  * 这里每多写一行判断，就多一行只有人工点窗口才能验到的代码。
  */
-import { app, BrowserWindow, dialog, ipcMain, net, protocol } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -102,6 +102,16 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  /**
+   * 默认菜单（File / Edit / View / Window / Help）里没有一项是这个应用用得上的，
+   * 却白占一条窗口顶部。**只在非 macOS 上摘**：macOS 的 Cmd+Q、Cmd+H、Cmd+W 以及
+   * 复制粘贴都走菜单项的角色，摘掉等于把「退出」和「粘贴」一起摘了。
+   *
+   * Windows / Linux 上不担心复制粘贴：那两条由 Blink 在可编辑元素里自己处理，
+   * 不经过菜单的加速键（菜单项的角色只是给 macOS 和「点菜单」这两条路用的）。
+   */
+  if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
+
   protocol.handle('app', async (request) => {
     const rel = decodeURIComponent(new URL(request.url).pathname).replace(/^\/+/, '')
     const file = path.resolve(RENDERER_DIR, rel || 'index.html')
