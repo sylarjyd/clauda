@@ -488,6 +488,36 @@ console.log('\n== 配置优先级 ==')
     })
     const rules = loadConfig(proj).permissions.allow
     check('含 $ 的权限规则不被改写', rules[0] === 'Bash(npm run:$*)', JSON.stringify(rules))
+
+    // 写回「默认模型」。**这条是数据泄露的防线**：`loadConfig` 里的 `expandEnvRefs`
+    // 会把 `${VAR}` 换成明文，拿它的结果回写等于把密钥落到磁盘上
+    const { writeProjectModel, configPath } = await import(`${dist}config.js`)
+    const file = configPath(proj)
+    process.env.CLAUDA_WRITE_KEY = 'sk-super-secret'
+    writeCfg(path.join(proj, '.clauda'), {
+      provider: { apiKey: '${CLAUDA_WRITE_KEY}', model: 'old' },
+      permissions: { mode: 'auto', allow: [], deny: [] },
+    })
+    const written = writeProjectModel(proj, 'new-model')
+    const disk = fs.readFileSync(written, 'utf8')
+    check('写回默认模型写在项目配置文件上', written === file, written)
+    check('写回后模型真的变了', loadConfig(proj).provider.model === 'new-model', loadConfig(proj).provider.model)
+    check('写回保留 ${VAR} 引用，没把密钥明文落盘', disk.includes('${CLAUDA_WRITE_KEY}'), disk)
+    check('写回没把明文密钥写进磁盘', !disk.includes('sk-super-secret'), disk)
+    check('写回不碰别的字段', JSON.parse(disk).permissions.mode === 'auto', disk)
+    delete process.env.CLAUDA_WRITE_KEY
+
+    // 手滑写坏一个逗号不能连累整份配置 —— 报错返回、原文件不动
+    const broken = '{"provider": {"model": "x",}}'
+    fs.writeFileSync(file, broken, 'utf8')
+    let threw = ''
+    try {
+      writeProjectModel(proj, 'y')
+    } catch (e) {
+      threw = e.message
+    }
+    check('配置不是合法 JSON 时报错而不是覆盖', threw.length > 0, threw)
+    check('报错时原文件一字未动', fs.readFileSync(file, 'utf8') === broken)
   } finally {
     delete process.env.CLAUDA_TEST_KEY
     if (prevModel === undefined) delete process.env.CLAUDA_MODEL
@@ -1049,6 +1079,14 @@ console.log('\n== MCP token 提示 ==')
   check('没有 MCP 工具时不提示接入', none.infoText === '', JSON.stringify(none.infoText))
   check('没有 MCP 工具时不告警', none.warnText === '', JSON.stringify(none.warnText))
 
+  // 真机复现：一个 MCP 都没配的会话，页脚曾经多出一句「已接入 MCP：0 个服务器 /
+  // 0 个工具，约 +1 token 上下文」。根因在 `tokenHint()` —— `JSON.stringify([])`
+  // 是 `"[]"`，估算器会把它算成 1，而上面这条守卫判的是 `tokens <= 0`
+  const { McpManager } = await import(`${dist}mcp/manager.js`)
+  const idle = new McpManager({}, { version: '0.0.0-test', view: { warn() {} } })
+  check('没接入任何工具时 tokenHint 是 0 而不是 1', idle.tokenHint() === 0, String(idle.tokenHint()))
+  check('没配服务器的会话不显示 MCP 开销提示', mcpCostNotice(idle, 1000).infoText === '', JSON.stringify(mcpCostNotice(idle, 1000)))
+
   // 200/1000 = 20%，卡在阈值下沿 —— 是这条用来验「不告警」，上面那条才验数量
   const small = mcpCostNotice(fakeMcp({ tokens: 200, connected: 2, failed: 1, toolCount: 5 }), 1000)
   check('tokens 透传 tokenHint', small.tokens === 200, `实际 ${small.tokens}`)
@@ -1271,7 +1309,7 @@ console.log('\n== 会话管理：并发守卫与配置隔离 ==')
     provider: textProvider('回答'),
     skills: { list: () => [] },
     assembleTools: () => ALL_TOOLS,
-    mcp: { setEnabled() {} },
+    mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
     dispose: () => { disposed.push(dir) },
   })
 
@@ -1415,7 +1453,8 @@ console.log('\n== 会话管理：授权等待、MCP 与记忆广播 ==')
 
   // ---- 缺陷 #5：MCP 开关必须广播到同项目的每个会话
   check('开关前两个会话都拿得到 MCP 工具', a.agent.listTools().some((t) => t.name === 'mcp__demo__ping') && b.agent.listTools().some((t) => t.name === 'mcp__demo__ping'))
-  mgr.setMcpEnabled(dir, 'demo', false)
+  // 必须 await：`setMcpEnabled` 现在要把连接失败冒泡出去，广播工具集挪到了 await 之后
+  await mgr.setMcpEnabled(dir, 'demo', false)
   check('转发给了 project.mcp.setEnabled', JSON.stringify(enabledCalls) === JSON.stringify([['demo', false]]), JSON.stringify(enabledCalls))
   check('关掉后 A 的工具集里没有 MCP 工具', !a.agent.listTools().some((t) => t.name === 'mcp__demo__ping'), a.agent.listTools().map((t) => t.name).join(','))
   check('关掉后 B 的工具集里也没有（只改当前会话等于没改）', !b.agent.listTools().some((t) => t.name === 'mcp__demo__ping'), b.agent.listTools().map((t) => t.name).join(','))
@@ -2005,6 +2044,94 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   check('点允许真的发了授权回复', app.calls.includes('permission/reply'), app.calls.join(','))
   check('状态点不再标等待授权', !dot(1).className.includes('waiting'), dot(1).className)
 
+  // ---- 左导航与模型 / 技能 / MCP 三个设置页
+  // 假 DOM 的 textContent 不做聚合，断言文案只能自己把子树拼起来
+  const textOf = (node) => (node.textContent || '') + node.children.map(textOf).join(' ')
+  const find = (node, pred) => {
+    if (pred(node)) return node
+    for (const child of node.children) {
+      const hit = find(child, pred)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  check('默认停在会话视图', app.el('app').dataset.view === 'sessions', app.el('app').dataset.view)
+  check('会话视图下设置容器是藏着的', app.el('view-settings').hidden === true)
+  check('会话视图下对话区还在', app.el('view-sessions').hidden === false)
+
+  app.el('nav-model').click()
+  await tick()
+  check('点「模型」切到模型页', app.el('app').dataset.view === 'model', app.el('app').dataset.view)
+  check('设置容器显示出来了', app.el('view-settings').hidden === false)
+  check('对话区让位了', app.el('view-sessions').hidden === true)
+  check('当前导航项被标出来', app.el('nav-model').className.includes('is-current'), app.el('nav-model').className)
+  check('其余导航项没被误标', !app.el('nav-sessions').className.includes('is-current'))
+  check('导航条上的模型徽标跟着当前会话', app.el('badge-model').textContent === 'm', app.el('badge-model').textContent)
+
+  const body = app.el('settings-body')
+  const modelText = textOf(body)
+  check('模型页有标题', app.el('settings-title').textContent === '模型配置', app.el('settings-title').textContent)
+  check('模型页显示接口地址', modelText.includes('http://127.0.0.1:9/v1'))
+  check('模型页的密钥是打码的', modelText.includes('····abcd') && !modelText.includes('sk-'), modelText)
+  check('模型页显示温度与上下文窗口', modelText.includes('0.3') && modelText.includes('128000'))
+  check('模型页显示权限规则', modelText.includes('Read') && modelText.includes('Bash(rm:*)'))
+
+  // 「默认模型」是可编辑的那一格，写回项目配置文件
+  const modelEdit = find(body, (n) => n.className === 'set-edit')
+  check('默认模型那一格是可编辑的', modelEdit !== null)
+  modelEdit.children[0].value = 'gpt-x'
+  modelEdit.children[1].click()
+  await tick()
+  check(
+    '点「存为默认」把模型写回了项目配置',
+    app.savedModels.length === 1 && app.savedModels[0].model === 'gpt-x',
+    JSON.stringify(app.savedModels),
+  )
+  check('写完提示了写到哪个文件', textOf(app.el('notices')).includes('config.json'), textOf(app.el('notices')))
+
+  app.el('nav-skills').click()
+  await tick()
+  check('点「技能」切到技能页', app.el('app').dataset.view === 'skills', app.el('app').dataset.view)
+  const skillText = textOf(app.el('settings-body'))
+  check('技能页列出了技能名', skillText.includes('/demo'), skillText)
+  check('技能页列出了技能文件路径', skillText.includes('SKILL.md'), skillText)
+  check('技能页的说明写了技能从哪来', textOf(app.el('settings-sub')).includes('skills'))
+  check('技能数画进了导航徽标', app.el('badge-skills').textContent === '1', app.el('badge-skills').textContent)
+
+  app.el('nav-mcp').click()
+  await tick()
+  check('点「MCP」切到 MCP 页', app.el('app').dataset.view === 'mcp', app.el('app').dataset.view)
+  const mcpText = textOf(app.el('settings-body'))
+  check('MCP 页列出了服务器名', mcpText.includes('demo') && mcpText.includes('broken'), mcpText)
+  check('MCP 页列出了 transport', mcpText.includes('stdio') && mcpText.includes('http'), mcpText)
+  check('MCP 页显示已连接 / 已配置', app.el('badge-mcp').textContent === '1/2', app.el('badge-mcp').textContent)
+  // 文案由 `mcpCostNotice` 出，桌面端只摆位置 —— 这里换了措辞就会被抓到
+  check('MCP 页用了后端给的开销文案', mcpText.includes('已接入 MCP：1 个服务器 / 2 个工具'), mcpText)
+
+  // 陷阱 1 的验收点：服务器连不上时必须报失败，且开关不能停在「已接入」
+  app.mcp.fail = { broken: 'spawn ENOENT' }
+  const brokenRow = find(app.el('settings-body'), (n) => n.dataset?.name === 'broken')
+  check('MCP 页给每一行挂上了服务器名', brokenRow !== null)
+  const toggle = brokenRow.children[0]
+  check('没连上的服务器开关是关的', toggle.checked === false, String(toggle.checked))
+  toggle.checked = true
+  toggle.fire('change')
+  await tick()
+  const mcpNotices = textOf(app.el('notices'))
+  check('MCP 开关失败时报错而不是报成功', mcpNotices.includes('spawn ENOENT'), mcpNotices)
+  check('报错里点名了是哪台', mcpNotices.includes('broken'), mcpNotices)
+  const after = find(app.el('settings-body'), (n) => n.dataset?.name === 'broken').children[0]
+  check('失败后开关回到真实状态（没接上就不该是开的）', after.checked === false, String(after.checked))
+
+  // 切回会话视图：三栏布局塌了的话，这里能抓到「视图藏反了」
+  app.el('nav-sessions').click()
+  await tick()
+  check('切回会话视图', app.el('app').dataset.view === 'sessions', app.el('app').dataset.view)
+  check('切回后对话区回来了', app.el('view-sessions').hidden === false)
+  check('切回后设置容器藏起来了', app.el('view-settings').hidden === true)
+  check('切回后消息流还在', app.el('stream').children.length === 1, String(app.el('stream').children.length))
+
   uninstallDom()
 }
 
@@ -2063,6 +2190,17 @@ console.log('\n== 自检：Electron 不许漏进运行时 ==')
   const missingIds = idsWanted.filter((id) => !idsInHtml.has(id))
   check('app.js 绑的每个 id 在 index.html 里都存在', missingIds.length === 0, missingIds.join(', '))
   check('确实绑到了一批 id（否则上一条是白验的）', idsWanted.length >= 10, String(idsWanted.length))
+
+  // 通知栏不能待在侧栏里。侧栏在模型/技能/MCP 三个设置视图下是 `display: none`，
+  // 于是「MCP 开关接不上」这种恰好发生在设置页上的报错，会死在引发它的那一页上，
+  // 一个字都看不到 —— 而这正是当初把通道改成 `{ok:false, reason}` 要解决的事。
+  // 纯结构断言，不点窗口就能查。
+  const sidebar = html.slice(html.indexOf('<aside class="sidebar">'), html.indexOf('</aside>'))
+  check(
+    '通知栏不在侧栏里（否则设置页上看不见报错）',
+    !sidebar.includes('id="notices"'),
+    sidebar.slice(0, 80),
+  )
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

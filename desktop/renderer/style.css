@@ -1,20 +1,32 @@
 /*
- * 三栏布局：左栏会话 / 中栏对话 / 右栏改动与待办。
- * 尺寸全用 grid 的 minmax(0, 1fr) 而不是 flex，否则长文件名会把中栏挤扁 ——
- * flex 项默认 min-width:auto，里面的 pre 撑多宽它就跟着多宽。
+ * 浅色主题。暖色调家族和赤陶 accent 是从原来的暗色版继承的 —— 这是同一个应用的
+ * 白天形态，不是另起一套配色。唯一被迫改的是 accent：`#c96f4a` 是给深底挑的，
+ * 直接放白底上对比度只有 ~3:1，当正文色不合格，所以压深到 `#a94f28`（5.4:1）。
+ *
+ * 布局是四列 grid，靠 `.app[data-view]` 切换列数：会话视图四列都在，设置视图
+ * 摘掉会话列表和右栏、把中栏拉满。
  */
 :root {
-  --bg: #1c1a18;
-  --bg-soft: #232120;
-  --bg-raise: #2b2825;
-  --line: #3a3633;
-  --text: #e8e3dc;
-  --text-dim: #a49c92;
-  --text-faint: #6f6862;
-  --accent: #c96f4a;
-  --ok: #6aa86a;
-  --warn: #c9a24a;
-  --danger: #c2554f;
+  --bg: #f7f5f1;
+  --bg-soft: #f1ede7;
+  --bg-raise: #fffdfb;
+  /* 代码块、进度槽这些「凹下去」的表面。浅色下要更深，不能再用 --bg */
+  --bg-sunken: #eae5dd;
+  --line: #e3ddd4;
+  --line-strong: #cdc5b9;
+  --text: #26221e;
+  --text-dim: #5f584f;
+  /* 只给分隔线、圆点这类非文本元素用。11px 的小标签请用 --text-dim，
+     --text-faint 在浅底上只有 ~3.9:1，当正文色是不达标的 */
+  --text-faint: #7e756b;
+  --accent: #a94f28;
+  --accent-ink: #8c3f1f;
+  --accent-soft: #f2e4da;
+  --ok: #2f7a45;
+  --warn: #8a6412;
+  --danger: #ac3a33;
+  --mono: Consolas, "Cascadia Mono", monospace;
+  --rail-w: 76px;
 }
 
 * {
@@ -34,11 +46,17 @@ body {
   overflow: hidden;
 }
 
+/* 浅底上默认焦点环很淡，显式给一个。键盘用户全靠它认路 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 button {
   font: inherit;
   color: inherit;
   background: var(--bg-raise);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: 6px;
   padding: 4px 10px;
   cursor: pointer;
@@ -46,6 +64,7 @@ button {
 
 button:hover:not(:disabled) {
   border-color: var(--accent);
+  color: var(--accent-ink);
 }
 
 button:disabled {
@@ -55,6 +74,7 @@ button:disabled {
 
 button.ghost {
   background: transparent;
+  border-color: var(--line);
 }
 
 button.small {
@@ -72,8 +92,8 @@ select,
 textarea {
   font: inherit;
   color: inherit;
-  background: var(--bg);
-  border: 1px solid var(--line);
+  background: var(--bg-raise);
+  border: 1px solid var(--line-strong);
   border-radius: 6px;
   padding: 4px 8px;
 }
@@ -85,12 +105,62 @@ select:focus {
   border-color: var(--accent);
 }
 
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------------------------------------------------------------- 骨架 */
 
+/*
+ * 每个子元素**必须**写死 grid-column。设置视图下靠 `display: none` 摘掉两列，
+ * 剩下的会自动往前补位 —— 不写死的话中栏会掉进那个 0 宽的列里，整个界面只剩
+ * 一条竖线。
+ */
 .app {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 280px;
+  grid-template-columns: var(--rail-w) 260px minmax(0, 1fr) 280px;
+  /* 第二行是通知栏，空的时候塌成 0 高。它通栏，所以四个主列都钉在第 1 行 */
+  grid-template-rows: minmax(0, 1fr) auto;
   height: 100vh;
+}
+
+.rail {
+  grid-row: 1;
+  grid-column: 1;
+}
+.sidebar {
+  grid-row: 1;
+  grid-column: 2;
+}
+.chat {
+  grid-row: 1;
+  grid-column: 3;
+}
+.panel {
+  grid-row: 1;
+  grid-column: 4;
+}
+
+.app[data-view='model'],
+.app[data-view='skills'],
+.app[data-view='mcp'] {
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+}
+
+.app[data-view='model'] .sidebar,
+.app[data-view='skills'] .sidebar,
+.app[data-view='mcp'] .sidebar,
+.app[data-view='model'] .panel,
+.app[data-view='skills'] .panel,
+.app[data-view='mcp'] .panel {
+  display: none;
+}
+
+.app[data-view='model'] .chat,
+.app[data-view='skills'] .chat,
+.app[data-view='mcp'] .chat {
+  grid-column: 2;
 }
 
 .sidebar,
@@ -109,6 +179,91 @@ select:focus {
 .panel {
   border-left: 1px solid var(--line);
   overflow-y: auto;
+}
+
+/* ---------------------------------------------------------------- 导航条 */
+
+/* 窄竖条，每一项 = 标签 + 实时徽标。它同时是全应用的状态脊，见 index.html */
+.rail {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 10px 6px;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.rail-mark {
+  color: var(--accent);
+  font-size: 15px;
+  text-align: center;
+  padding: 2px 0 12px;
+}
+
+.rail-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 7px 2px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-dim);
+}
+
+.rail-item:hover:not(:disabled) {
+  background: var(--bg-raise);
+  color: var(--text);
+}
+
+/* 当前视图。用 className 而不是 setAttribute('aria-current')，是为了让假 DOM
+   也能表示这个状态（tests/renderer-dom.mjs 只实现了 dataset / classList） */
+.rail-item.is-current {
+  background: var(--bg-raise);
+  border-color: var(--line-strong);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.rail-label {
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.rail-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.rail-item.is-current .rail-badge {
+  color: var(--accent);
+}
+
+.rail-spacer {
+  flex: 1;
+  min-height: 8px;
+}
+
+/* 当前项目只显示最后一段目录名，全路径放 title —— 76px 里塞不下整条路径，
+   硬塞只会变成一团看不懂的截断 */
+.rail-project {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-align: center;
 }
 
 /* ---------------------------------------------------------------- 左栏 */
@@ -138,7 +293,7 @@ select:focus {
 
 .project-path {
   padding: 4px 12px 10px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 12px;
   /* 长路径要能从中间断，否则会把左栏撑出横向滚动条 */
   overflow-wrap: anywhere;
@@ -157,7 +312,7 @@ select:focus {
 
 .group-head {
   padding: 4px 6px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 11px;
   letter-spacing: 0.08em;
 }
@@ -179,8 +334,8 @@ select:focus {
 }
 
 .session-row.active {
-  background: var(--bg-raise);
-  border-color: var(--line);
+  background: var(--accent-soft);
+  border-color: var(--line-strong);
 }
 
 .session-title {
@@ -208,7 +363,7 @@ select:focus {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--text-faint);
+  background: var(--line-strong);
 }
 
 .dot.running {
@@ -227,11 +382,26 @@ select:focus {
   }
 }
 
+/*
+ * 网格第二行的通栏状态条。早先它是侧栏底部的一条内嵌条，但设置视图下侧栏被摘掉，
+ * 通知就跟着没了 —— 而「MCP 开关拨不动」的报错正是在设置页上发出来的。
+ *
+ * 做成通栏而不是浮层：通知不自动消失、也没有关闭按钮（见 state.js 的 app-notice），
+ * 浮层会一直盖着底下的内容，而输入框恰好也在底部。占一行就不重叠。
+ * 空的时候 display:none，这一行跟着塌成 0 高。
+ */
 .notices {
-  border-top: 1px solid var(--line);
+  grid-row: 2;
+  grid-column: 1 / -1;
   padding: 6px 12px;
   max-height: 120px;
   overflow-y: auto;
+  border-top: 1px solid var(--line);
+  background: var(--bg-raise);
+}
+
+.notices:empty {
+  display: none;
 }
 
 .notice-line {
@@ -252,8 +422,30 @@ select:focus {
 
 .chat {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* 写死一行并让它占满：只靠隐式的 auto 行的话，里面 `.view` 的 minmax(0,1fr)
+     就没有确定高度可分配，消息流会缩成内容那么高 */
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+/* `[hidden]` 必须显式写：下面 `.view` 的 `display: grid` 是作者样式，优先级压得过
+   浏览器自带的 `[hidden] { display: none }`，不写的话设置页永远关不掉。
+   同 `.modal-host` 那条弯路 */
+.view[hidden] {
+  display: none;
+}
+
+.view {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+#view-settings {
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .topbar {
@@ -263,6 +455,7 @@ select:focus {
   gap: 12px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
 }
 
 .topbar-title {
@@ -285,7 +478,7 @@ select:focus {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 12px;
 }
 
@@ -301,7 +494,7 @@ select:focus {
 .context-bar {
   width: 90px;
   height: 6px;
-  background: var(--bg-raise);
+  background: var(--bg-sunken);
   border-radius: 3px;
   overflow: hidden;
 }
@@ -333,16 +526,18 @@ select:focus {
   padding: 8px 12px;
   border-radius: 10px;
   background: var(--bg-raise);
+  border: 1px solid var(--line);
   overflow-wrap: anywhere;
 }
 
 .entry.user .bubble {
-  background: #35302c;
+  background: var(--accent-soft);
+  border-color: #e6d2c4;
 }
 
 .bubble.streaming::after {
   content: "▍";
-  color: var(--text-faint);
+  color: var(--accent);
   animation: pulse 1s step-end infinite;
 }
 
@@ -368,17 +563,17 @@ select:focus {
 }
 
 .bubble code {
-  background: var(--bg);
+  background: var(--bg-sunken);
   border-radius: 4px;
   padding: 1px 5px;
-  font-family: Consolas, "Cascadia Mono", monospace;
+  font-family: var(--mono);
   font-size: 12.5px;
 }
 
 .bubble pre {
   margin: 8px 0;
   padding: 10px 12px;
-  background: var(--bg);
+  background: var(--bg-sunken);
   border: 1px solid var(--line);
   border-radius: 6px;
   overflow-x: auto;
@@ -393,7 +588,7 @@ select:focus {
   border: 1px solid var(--line);
   border-left-width: 3px;
   border-radius: 6px;
-  background: var(--bg-soft);
+  background: var(--bg-raise);
   overflow: hidden;
 }
 
@@ -410,7 +605,7 @@ select:focus {
 }
 
 .card.done {
-  border-left-color: var(--text-faint);
+  border-left-color: var(--line-strong);
 }
 
 .card-head {
@@ -422,8 +617,8 @@ select:focus {
 }
 
 .card-name {
-  font-family: Consolas, "Cascadia Mono", monospace;
-  color: var(--accent);
+  font-family: var(--mono);
+  color: var(--accent-ink);
 }
 
 .card-summary {
@@ -437,7 +632,7 @@ select:focus {
 
 .card-status {
   flex: none;
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
 
@@ -448,11 +643,12 @@ select:focus {
   border-top: 1px solid var(--line);
   max-height: 260px;
   overflow: auto;
-  font-family: Consolas, "Cascadia Mono", monospace;
+  font-family: var(--mono);
   font-size: 12.5px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--text-dim);
+  background: var(--bg-sunken);
 }
 
 .card-body:empty {
@@ -481,6 +677,7 @@ select:focus {
   gap: 8px;
   padding: 10px 16px 14px;
   border-top: 1px solid var(--line);
+  background: var(--bg-soft);
 }
 
 .composer textarea {
@@ -497,6 +694,253 @@ select:focus {
   flex: none;
 }
 
+/* ---------------------------------------------------------------- 设置页 */
+
+.settings-head {
+  padding: 16px 24px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.settings-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.settings-sub {
+  margin: 4px 0 0;
+  max-width: 72ch;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.settings-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 24px 32px;
+}
+
+/* 空态是「邀请」不是「情绪」：说清为什么空、下一步做什么 */
+.settings-empty {
+  margin: 20px 0 0;
+  padding: 20px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.set-section {
+  margin-top: 22px;
+}
+
+.set-section > h2 {
+  margin: 0 0 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.set-rows {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-raise);
+  overflow: hidden;
+}
+
+.set-row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px 12px;
+  align-items: baseline;
+}
+
+.set-row + .set-row {
+  border-top: 1px solid var(--line);
+}
+
+.set-key {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.set-val {
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+/* 编辑行：右边跟一个输入框和按钮 */
+.set-edit {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.set-edit input {
+  flex: 1;
+  min-width: 0;
+  max-width: 320px;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0 6px;
+  margin-right: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* ---- 技能 ---- */
+
+.skill-row {
+  padding: 12px 14px;
+}
+
+.skill-row + .skill-row {
+  border-top: 1px solid var(--line);
+}
+
+.skill-name {
+  color: var(--accent-ink);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.skill-desc {
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.skill-file {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- MCP ---- */
+
+.mcp-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 11px 14px;
+  align-items: center;
+}
+
+.mcp-row + .mcp-row {
+  border-top: 1px solid var(--line);
+}
+
+.mcp-name {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.mcp-meta {
+  margin-top: 3px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.mcp-state {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.mcp-state.connected {
+  color: var(--ok);
+}
+
+.mcp-state.failed {
+  color: var(--danger);
+}
+
+.mcp-state.disabled {
+  color: var(--text-faint);
+}
+
+/* 失败原因独占一行铺满，别挤在状态那一列里被截掉 —— 用户要靠它判断哪儿配错了 */
+.mcp-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mcp-foot {
+  margin: 10px 2px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.mcp-foot.warn {
+  color: var(--warn);
+}
+
+/* 原生 checkbox 自绘成开关。不引组件库 —— 这层没有构建步骤 */
+.switch {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--bg-sunken);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(38, 34, 30, 0.35);
+  transition: transform 0.15s ease;
+}
+
+.switch:checked {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.switch:checked::after {
+  transform: translateX(14px);
+}
+
+.switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ---------------------------------------------------------------- 右栏 */
 
 .panel-block {
@@ -506,7 +950,7 @@ select:focus {
 
 .panel-block h2 {
   margin: 0 0 8px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -525,7 +969,7 @@ select:focus {
 }
 
 .plain li.file {
-  font-family: Consolas, "Cascadia Mono", monospace;
+  font-family: var(--mono);
   color: var(--text-dim);
 }
 
@@ -540,7 +984,7 @@ select:focus {
 }
 
 .plain li.todo.completed {
-  color: var(--text-faint);
+  color: var(--text-dim);
   text-decoration: line-through;
 }
 
@@ -565,16 +1009,16 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(38, 34, 30, 0.4);
 }
 
 .modal {
   width: min(480px, 88vw);
   padding: 18px 20px;
   background: var(--bg-raise);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: 10px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 40px rgba(38, 34, 30, 0.22);
 }
 
 .modal h3 {
@@ -584,8 +1028,8 @@ select:focus {
 
 .modal-label {
   margin: 0 0 6px;
-  font-family: Consolas, "Cascadia Mono", monospace;
-  color: var(--accent);
+  font-family: var(--mono);
+  color: var(--accent-ink);
   overflow-wrap: anywhere;
 }
 
@@ -604,4 +1048,15 @@ select:focus {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 16px;
+}
+
+/* 呼吸点那条动效是全局唯一的装饰，尊重系统的减少动效设置 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

@@ -1,9 +1,12 @@
 import { Agent, type AgentOptions, type SessionSnapshot, type TurnOutcome } from '../agent/agent.js'
-import type { ClaudaConfig, PermissionMode } from '../config.js'
+import { configPath, writeProjectModel, type ClaudaConfig, type PermissionMode } from '../config.js'
+import type { McpServerStatus } from '../mcp/manager.js'
 import { PermissionManager } from '../permissions.js'
 import type { Provider } from '../provider/types.js'
+import type { SkillMeta } from '../skills/types.js'
 import type { Tool } from '../tools/types.js'
 import { IpcView, type ViewEvent } from './ipc-view.js'
+import { mcpCostNotice, type McpCostNotice } from './mcp-cost.js'
 import { persistSession } from './persist.js'
 import {
   PermissionBridge,
@@ -34,15 +37,61 @@ export interface SessionProject {
    */
   readonly config: ClaudaConfig
   readonly provider: Provider
-  readonly skills?: AgentOptions['skills']
+  /**
+   * 刻意不写成 `AgentOptions['skills']` —— 那边只声明了 `{name, description}`，
+   * 而桌面端的技能页要显示 `file` / `dir`。`SkillMeta[]` 协变地满足 `SkillSummary[]`，
+   * 所以传给 `Agent` 依然合法。
+   */
+  readonly skills?: { list(): SkillMeta[] }
   readonly memoryIndex?: AgentOptions['memoryIndex']
   /** 每次现算，跟着 MCP 开关走 */
   assembleTools(): Tool[]
   readonly mcp: {
-    setEnabled(name: string, enabled: boolean): void
+    /** 可能抛：连接失败的服务器在这里报错，别把返回值丢掉（见 `setMcpEnabled`） */
+    setEnabled(name: string, enabled: boolean): Promise<void>
+    status(): McpServerStatus[]
+    tokenHint(): number
+    /** 只要 MCP 那几个，`assembleTools()` 是全部工具。`mcpCostNotice` 要靠它数工具个数 */
+    tools(): Tool[]
   }
   /** 引用计数归零时调用 */
   dispose(): Promise<void> | void
+}
+
+/**
+ * 桌面端「模型 / 技能 / MCP」三个设置页要的全部数据。
+ *
+ * 和 `SessionInfo` 一样是**可序列化快照**：renderer 拿到就能画，不用再问主进程。
+ */
+export interface ProjectInfo {
+  cwd: string
+  /** 写在哪一份配置文件上，UI 要告诉用户「改到哪去了」 */
+  configFile: string
+  provider: {
+    baseUrl: string
+    /**
+     * 密钥本身**不出主进程**，只回一段能认出「配没配、是不是这一把」的提示。
+     * 渲染层拿到也不该有机会把它写进日志或截图。
+     */
+    apiKeyHint: string
+    model: string
+    temperature: number
+    maxTokens: number
+  }
+  context: {
+    window: number
+    autoCompact: boolean
+    compactThreshold: number
+    maxSteps: number
+  }
+  permissions: { mode: PermissionMode; allow: string[]; deny: string[] }
+  skills: SkillMeta[]
+  mcp: McpServerStatus[]
+  /**
+   * MCP 开销提示。**措辞由 `mcpCostNotice` 统一出**，桌面端只负责摆位置 ——
+   * 两端各写一套的话，改了阈值或口径没人会想起来去对齐另一边。
+   */
+  mcpCost: McpCostNotice
 }
 
 export interface Session {
@@ -203,14 +252,69 @@ export class SessionManager {
   /**
    * 开关某个 MCP 服务器，并**广播给同项目的每个会话**。
    * 只重算当前会话的话，同项目其它会话的 agent 仍持有旧工具列表 —— 用户以为关了其实没关。
+   *
+   * **必须 await 并把异常放出去**：`McpManager.setEnabled` 在连不上时会抛，早先这里把
+   * 返回的 Promise 丢了，于是「接入一个配错了的服务器」既不报错、工具也没接上，界面还显示
+   * 成功。工具集只在真成功之后才重算，否则会把一份没变的列表当成新的发下去。
    */
-  setMcpEnabled(cwd: string, name: string, enabled: boolean): void {
+  async setMcpEnabled(cwd: string, name: string, enabled: boolean): Promise<void> {
     const entry = this.projects.get(cwd)
     if (!entry) return
-    entry.project.mcp.setEnabled(name, enabled)
+    await entry.project.mcp.setEnabled(name, enabled)
     for (const session of this.sessions.values()) {
       if (session.cwd === cwd) session.agent.setTools(entry.project.assembleTools())
     }
+  }
+
+  /** 设置页的快照。会话或项目已经没了就返回 null，由 channel 层翻成 `{ok:false}` */
+  projectInfo(sessionId: string): ProjectInfo | null {
+    const session = this.sessions.get(sessionId)
+    if (!session) return null
+    const entry = this.projects.get(session.cwd)
+    if (!entry) return null
+
+    const { project } = entry
+    const cfg = project.config
+    return {
+      cwd: project.cwd,
+      configFile: configPath(project.cwd),
+      provider: {
+        baseUrl: cfg.provider.baseUrl,
+        apiKeyHint: maskKey(cfg.provider.apiKey),
+        model: cfg.provider.model,
+        temperature: cfg.provider.temperature,
+        maxTokens: cfg.provider.maxTokens,
+      },
+      context: {
+        window: cfg.contextWindow,
+        autoCompact: cfg.autoCompact,
+        compactThreshold: cfg.compactThreshold,
+        maxSteps: cfg.maxSteps,
+      },
+      // 这里是**项目模板**里的权限配置，不是某个会话当前的模式 —— 后者在中栏顶栏上
+      permissions: {
+        mode: cfg.permissions.mode,
+        allow: [...cfg.permissions.allow],
+        deny: [...cfg.permissions.deny],
+      },
+      skills: project.skills?.list() ?? [],
+      mcp: project.mcp.status(),
+      mcpCost: mcpCostNotice(project.mcp, cfg.contextWindow),
+    }
+  }
+
+  /**
+   * 改「默认模型」：写回项目配置文件，**并同步内存里那份 `project.config`**。
+   *
+   * 少了后一半就是「改了没生效」：`openSession` 走的是 `structuredClone(project.config)`，
+   * 而它在 `createProjectRuntime` 那一刻就加载完了。项目已经开着时，用户新建的会话仍会拿到
+   * 旧模型 —— 从界面上看和「没改」一模一样。
+   */
+  setDefaultModel(cwd: string, model: string): string {
+    const file = writeProjectModel(cwd, model)
+    const entry = this.projects.get(cwd)
+    if (entry) entry.project.config.provider.model = model
+    return file
   }
 
   setModel(sessionId: string, model: string): void {
@@ -302,4 +406,9 @@ export class SessionManager {
     this.projects.delete(cwd)
     await entry.project.dispose()
   }
+}
+
+/** 密钥只回末尾四位。空串原样返回，好让 UI 分得清「没配」和「配了」 */
+function maskKey(key: string): string {
+  return key ? `····${key.slice(-4)}` : ''
 }

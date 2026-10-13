@@ -518,7 +518,8 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
   if (d) {
     check('驱动正常跑完', d.ok === true, `${d.error ?? ''}\n${stderr.slice(0, 800)}`)
     check('退出码为 0', code === 0, `code=${code}\n${stderr.slice(0, 800)}`)
-    check('开出了两个会话', d.sessionIds.length === 2, JSON.stringify(d.sessionIds))
+    // 三个：并发跑的那两个，外加下面验「默认模型只影响新会话」时新开的一个
+    check('开出了三个会话', d.sessionIds.length === 3, JSON.stringify(d.sessionIds))
 
     // 并发：两边都跑完了，A 读到项目名、B 写完文件
     check('会话 A 的回合成功', d.send.a?.ok === true, JSON.stringify(d.send.a))
@@ -611,6 +612,40 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
       d.resumedState?.session?.id === d.sessionIds[0] && d.resumedState.session.model === 'desk-model',
       JSON.stringify(d.resumedState?.session?.id),
     )
+
+    // ---- 设置页（模型 / 技能 / MCP）的数据源
+    const info = d.projectInfo?.info
+    check('project/info 拿得到快照', d.projectInfo?.ok === true && !!info, JSON.stringify(d.projectInfo))
+    // 环境变量里那个刻意非默认的名字，得一路传到设置页
+    check('快照里的模型与生效配置一致', info?.provider?.model === 'desk-model', info?.provider?.model)
+    check('快照带上了接口地址', info?.provider?.baseUrl?.includes('localhost'), info?.provider?.baseUrl)
+    // 密钥**不出主进程**：快照里只能有打码提示，绝不能是 `mock` 本身
+    check('快照里的密钥是打码的', info?.provider?.apiKeyHint === '····mock' && !JSON.stringify(info).includes('"mock"'), info?.provider?.apiKeyHint)
+    check('快照带上了上下文与权限配置', info?.context?.window > 0 && Array.isArray(info?.permissions?.allow), JSON.stringify(info?.context))
+    check('临时项目里没有技能', Array.isArray(info?.skills) && info.skills.length === 0, JSON.stringify(info?.skills))
+    check('没配 mcpServers 就是空列表', Array.isArray(info?.mcp) && info.mcp.length === 0, JSON.stringify(info?.mcp))
+    check(
+      'MCP 开销提示的措辞由后端统一出（没接入时是空串）',
+      info?.mcpCost?.infoText === '' && info.mcpCost.warnText === '',
+      JSON.stringify(info?.mcpCost),
+    )
+
+    // 开关一个不存在的服务器：必须报失败并把原因带出来，不能报成功
+    check(
+      '接不上的 MCP 服务器返回 {ok:false, reason}',
+      d.mcpToggle?.ok === false && typeof d.mcpToggle.reason === 'string' && d.mcpToggle.reason.includes('nope'),
+      JSON.stringify(d.mcpToggle),
+    )
+
+    // 改「默认模型」：写回项目配置文件，且只影响之后新建的会话
+    check('默认模型写回了项目配置文件', d.setDefaultModel?.ok === true, JSON.stringify(d.setDefaultModel))
+    check(
+      '写到的是项目里那份 config.json',
+      String(d.setDefaultModel?.file).endsWith(path.join('.clauda', 'config.json')),
+      d.setDefaultModel?.file,
+    )
+    check('落盘的是合法 JSON 且带着新模型', JSON.parse(d.configOnDisk).provider.model === 'desk-model-2', d.configOnDisk)
+    check('新会话拿到了新的默认模型', d.openedAfterModel?.model === 'desk-model-2', d.openedAfterModel?.model)
 
     check('退出后会话真的没了', d.afterQuit?.ok === false, JSON.stringify(d.afterQuit))
     check('退出不卡死（MCP 该关的都关了）', elapsed < 30_000, `耗时 ${elapsed}ms`)

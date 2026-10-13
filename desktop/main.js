@@ -64,7 +64,8 @@ function createWindow() {
     height: 820,
     minWidth: 940,
     minHeight: 560,
-    backgroundColor: '#1b1b1d',
+    // 和 style.css 的 --bg 保持一致：差一档的话窗口起来那一下会闪一下别的颜色
+    backgroundColor: '#f7f5f1',
     title: 'clauda',
     webPreferences: {
       preload: path.join(HERE, 'preload.cjs'),

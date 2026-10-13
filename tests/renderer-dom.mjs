@@ -11,6 +11,10 @@
  */
 
 const IDS = [
+  'app',
+  'nav-sessions', 'nav-model', 'nav-skills', 'nav-mcp',
+  'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp', 'rail-project',
+  'view-sessions', 'view-settings', 'settings-title', 'settings-sub', 'settings-body',
   'new-session', 'pick-project', 'project-path', 'session-list', 'notices', 'chat-title',
   'model-input', 'mode-select', 'context-fill', 'stream', 'composer', 'input', 'abort',
   'changed-files', 'todos', 'modal-host',
@@ -68,6 +72,18 @@ class El {
     this.parent = null
   }
 
+  /**
+   * 设置页给开关和输入框挂 `aria-label` 要用它。真 DOM 有这个方法，
+   * 桩里缺一个就会在「切到技能/MCP 页」那条路径上炸成 `setAttribute is not a function`。
+   */
+  setAttribute(name, value) {
+    ;(this.attrs ??= {})[name] = value
+  }
+
+  getAttribute(name) {
+    return (this.attrs ?? {})[name] ?? null
+  }
+
   addEventListener(type, fn) {
     ;(this.listeners[type] ??= []).push(fn)
   }
@@ -102,6 +118,37 @@ export async function bootRenderer() {
   const opened = new Map()
   let seq = 0
 
+  // 用例可以改它，模拟「配错了的服务器连不上」。默认成功
+  const mcp = { fail: null }
+  const savedModels = []
+  const projectInfo = {
+    cwd: 'C:/p',
+    configFile: 'C:/p/.clauda/config.json',
+    provider: {
+      baseUrl: 'http://127.0.0.1:9/v1',
+      apiKeyHint: '····abcd',
+      model: 'desk-model',
+      temperature: 0.3,
+      maxTokens: 4096,
+    },
+    context: { window: 128000, autoCompact: true, compactThreshold: 0.8, maxSteps: 40 },
+    permissions: { mode: 'default', allow: ['Read'], deny: ['Bash(rm:*)'] },
+    skills: [
+      {
+        name: 'demo',
+        description: '演示技能',
+        dir: 'C:/p/.clauda/skills/demo',
+        file: 'C:/p/.clauda/skills/demo/SKILL.md',
+      },
+    ],
+    mcp: [
+      { name: 'demo', transport: 'stdio', state: 'connected', toolCount: 2 },
+      // 刻意配错、连不上的那台。用例靠它验「开关失败必须报出来」
+      { name: 'broken', transport: 'http', state: 'disabled', toolCount: 0 },
+    ],
+    mcpCost: { tokens: 900, servers: 1, tools: 2, infoText: '已接入 MCP：1 个服务器 / 2 个工具', warnText: '' },
+  }
+
   globalThis.document = {
     getElementById: (id) => byId.get(id) ?? null,
     createElement: (tag) => new El(tag),
@@ -130,6 +177,17 @@ export async function bootRenderer() {
           return { ok: true, session }
         }
         if (channel === 'session/state') return { ok: true, session: opened.get(payload.sessionId) }
+        if (channel === 'project/info') return { ok: true, info: projectInfo }
+        if (channel === 'project/set-default-model') {
+          savedModels.push(payload)
+          return { ok: true, file: projectInfo.configFile }
+        }
+        // 连不上的服务器：`McpManager.setEnabled` 会抛，channel 层翻成 `{ok:false, reason}`。
+        // 界面必须把这个 reason 显示出来，不能报成功
+        if (channel === 'mcp/set-enabled') {
+          const reason = mcp.fail?.[payload.name]
+          return reason ? { ok: false, reason } : { ok: true }
+        }
         return { ok: true }
       },
       onEvent: (fn) => handlers.push(fn),
@@ -148,6 +206,9 @@ export async function bootRenderer() {
     },
     calls,
     opened,
+    mcp,
+    savedModels,
+    projectInfo,
     /** 侧边栏第 n 个会话行。组的第 0 个孩子是标题，行从 1 开始 */
     row: (n) => byId.get('session-list').children[0].children[n],
     tick,

@@ -12,6 +12,12 @@
 /** 通知栏上限。它只会被读最近几条，不封顶的话开一整天窗口能攒出几万条 */
 const MAX_NOTICES = 50
 
+/**
+ * 左导航的四个视图。**视图名同时是 CSS 选择器**（`.app[data-view="…"]`），所以
+ * 拼错了不会报错、只会让三栏布局静默塌掉 —— 归约时挡一道，别指望肉眼发现。
+ */
+export const VIEWS = ['sessions', 'model', 'skills', 'mcp']
+
 export function createState() {
   return {
     /** `project/list` 的结果，按项目分组的历史会话 */
@@ -26,6 +32,13 @@ export function createState() {
     notices: [],
     /** 打开过多少次会话。只用来给 `openSeq` 发号，不参与任何判断 */
     opens: 0,
+    /** 左导航选中的视图，见 `VIEWS` */
+    view: 'sessions',
+    /**
+     * `project/info` 的结果，模型 / 技能 / MCP 三个设置页共用这一份。
+     * null 表示还没拉到（没有会话、或者刚切完会话正在重新拉）。
+     */
+    project: null,
   }
 }
 
@@ -70,9 +83,15 @@ export function reduce(state, action) {
     case 'history':
       return { ...state, history: { ...state.history, [action.cwd]: action.sessions ?? [] } }
     case 'select':
-      return { ...state, activeId: action.id }
+      // 项目信息是跟着会话走的。换了会话先清空，免得设置页拿上一个项目的配置 /
+      // 技能 / MCP 顶上 —— 那看着像「切了会话但设置没跟着变」
+      return { ...state, activeId: action.id, project: null }
     case 'session-opened':
       return openSession(state, action.session)
+    case 'view':
+      return VIEWS.includes(action.view) ? { ...state, view: action.view } : state
+    case 'project-info':
+      return { ...state, project: action.info ?? null }
     case 'app-notice':
       return { ...state, notices: [...state.notices, { level: action.level, text: action.text }].slice(-MAX_NOTICES) }
     default:
@@ -92,6 +111,8 @@ function openSession(state, info) {
     sessions: { ...state.sessions, [session.id]: session },
     order,
     activeId: session.id,
+    // 同理 `select`：新会话是另一个项目（或至少是一份新的运行时），旧的项目信息作废
+    project: null,
   }
 }
 

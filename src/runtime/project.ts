@@ -52,7 +52,14 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
     skills,
     memoryIndex: () => listMemories(),
     assembleTools: assembly.assemble,
-    mcp: { setEnabled: (name, enabled) => mcp.setEnabled(name, enabled) },
+    mcp: {
+      // 原样把 Promise 交出去，不要在这里 `void` 掉：SessionManager 要 await 它，
+      // 连接失败得能冒泡到界面 —— 吞掉的后果是「点了开关，报成功，其实没接上」
+      setEnabled: (name, enabled) => mcp.setEnabled(name, enabled),
+      status: () => mcp.status(),
+      tokenHint: () => mcp.tokenHint(),
+      tools: () => mcp.tools(),
+    },
     // MCP 子进程不关掉的话，关窗口之后进程会一直活着 —— 表现是「卡住」不是报错
     dispose: () => mcp.closeAll(),
   }

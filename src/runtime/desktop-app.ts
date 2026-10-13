@@ -106,11 +106,29 @@ export class DesktopApp {
           )
           return { ok: true }
 
-        case 'mcp/set-enabled':
-          return withStr(payload, 'cwd', (cwd) => {
-            this.manager.setMcpEnabled(cwd, str(payload, 'name'), bool(payload, 'enabled'))
-            return { ok: true }
+        case 'mcp/set-enabled': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          // 不包 try：连不上时 `McpManager.setEnabled` 会抛，正是外层的 catch 把它翻成
+          // `{ ok:false, reason }`。在这里吞掉的话，界面会显示「已接入」而工具一个没多
+          await this.manager.setMcpEnabled(cwd, str(payload, 'name'), bool(payload, 'enabled'))
+          return { ok: true }
+        }
+
+        case 'project/info':
+          return withSession(this.manager, payload, (session) => {
+            const info = this.manager.projectInfo(session.id)
+            return info ? { ok: true, info } : { ok: false, reason: '项目运行时还没就绪' }
           })
+
+        case 'project/set-default-model': {
+          const model = str(payload, 'model').trim()
+          if (!model) return { ok: false, reason: '模型名不能为空' }
+          return withStr(payload, 'cwd', (cwd) => ({
+            ok: true,
+            file: this.manager.setDefaultModel(cwd, model),
+          }))
+        }
 
         case 'app/quit':
           await this.manager.disposeAll()

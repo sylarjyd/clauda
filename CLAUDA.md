@@ -129,6 +129,28 @@
   `closeAll()` 不可逆（`closed = true` 之后 `start()` 直接 return），提前关掉就再也开不回来。
 - **开关 MCP 要广播给同项目所有会话**（`setMcpEnabled` 遍历 `session.cwd === cwd`）。
   只重算当前会话的话，其它会话的 agent 仍持有旧工具列表 —— 用户以为关了其实没关。
+  而且**必须 `await` 并把异常放出去**：`McpManager.setEnabled` 在连不上时会抛，早先
+  这个 Promise 被直接丢掉，于是「接入一个配错了的服务器」既不报错、工具也没接上，
+  界面还显示成功。`mcp/set-enabled` 因此不能再无条件返回 `{ok:true}`。
+- **写配置文件只能改磁盘上的原始文本，不许拿 `loadConfig()` 的结果回写**
+  （`config.ts` 的 `writeProjectModel`）。`loadConfig` 内部的 `expandEnvRefs` 已经把
+  `${MY_KEY}` 换成了真实密钥，拿它回写等于把密钥明文落盘 —— 这是数据泄露，不是格式问题。
+  同一处：改了默认模型还要**同步内存里的 `project.config`**，因为 `openSession` 走的是
+  `structuredClone(project.config)`，只写文件的话已开着的项目新建会话仍拿旧模型
+  （表现是「改了没生效」）；文件解析不了时**报错返回、不覆盖**，别为了容错丢掉整份配置。
+- **左侧导航条同时是状态脊**（`index.html` 的 `.rail`），四个视图 `sessions / model /
+  skills / mcp` 由 `.app[data-view]` 驱动 grid 模板切换（会话视图四列，设置视图两列）。
+  两条容易踩的：**每个子元素要写死 `grid-column`**（`display:none` 摘掉子元素后剩下的会
+  自动补位，`.chat` 会掉进那个 0 宽的列里）；`state.js` 里 `VIEWS` 既是视图名又是 CSS
+  选择器，拼错了不报错、只会让布局静默塌掉，所以归约时要挡一道。徽标（会话数 / 当前模型 /
+  技能数 / MCP 已连接比）编码的是后台状态，别把它退化成纯装饰。
+- **通知栏（`#notices`）必须待在侧栏之外**，在 `.app` 网格的第二行通栏（`grid-row: 2;
+  grid-column: 1 / -1`，空的时 `display:none` 让这一行塌掉）。它早先是侧栏底部的一条，
+  而侧栏在三个设置视图下都是 `display:none`，于是「MCP 开关接不上」这种**恰好发生在设置页
+  上**的报错会死在引发它的那一页，一个字都看不到 —— 那正是把通道改成 `{ok:false, reason}`
+  要解决的问题，白修了。别改成浮层：通知不自动消失也没有关闭按钮，浮层会常驻盖住输入框
+  （底部正是输入框），要盖住什么才能看见，得先想清楚。`tests/unit.mjs` 末尾有一条结构断言
+  钉着「它不在 `<aside class="sidebar">` 里」。
 - **`createProjectRuntime` 必须把 `loadConfig` 包在 `process.env` 快照里**。它内部的
   dotenv 改全局 env 且不覆盖已存在的键，同时开两个项目时后加载的那个 `.env` 会**静默失效**、
   继承前一个项目的配置。还原时只动这次多出来 / 被改写的键，整个替换 `process.env` 会抹掉
@@ -155,6 +177,16 @@
 - **`app.js` 绑的 id 必须和 `index.html` 对得上**。改了一边忘了另一边的话，
   `getElementById` 返回 null，启动时第一个 `addEventListener` 就抛 TypeError，
   窗口一片空白 —— 看着像整个渲染层没生效。自检组里有交叉断言盯着。
+- **模型 / 技能 / MCP 三个设置页共用 `project/info` 这一份快照**（`session-manager.ts`
+  的 `projectInfo`），按**会话**取 —— 技能与 MCP 都挂在项目运行时上，而运行时是开会话
+  时才建出来的。切换会话要先把它清成 `null`，否则会拿上一个项目的配置顶上。
+  设置页在 `app.js` 里**按指纹增量重建**（同 `renderModal` 那套），没有这道判断的话
+  流式输出期间每一帧都会重画整块，「默认模型」输入框当场失焦。**反过来也有坑**：MCP
+  开关失败时服务器状态没变、指纹就不变，光重拉会判定「无变化」直接返回，开关停在用户
+  刚拨过去的那一侧 —— 正是这次要修的那个谎，所以失败路径要显式作废指纹。
+- **展示文案不要在这里另造**：MCP 开销提示走 `src/runtime/mcp-cost.ts` 的
+  `infoText` / `warnText`（纯文本、不含 ANSI，CLI 与桌面端共用），技能空态抄
+  `repl.ts` 里 `/skills` 那句。两处各写一套的话，改了阈值或口径没人会想起来去对齐另一边。
 
 ## 测试
 
@@ -180,8 +212,10 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 
 ## 桌面端
 
-`npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是三栏：左栏会话列表
-（按项目分组，状态点是空闲 / 运行中 / 等待授权）、中栏对话、右栏改动文件与待办。
+`npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是一条窄导航条加三栏：
+导航条（会话 / 模型 / 技能 / MCP，每项带实时徽标）、左栏会话列表（按项目分组，状态点是
+空闲 / 运行中 / 等待授权）、中栏对话、右栏改动文件与待办。最底下还有一行通栏的通知栏，
+没通知时整行塌掉。灰阶是浅色暖调，赤陶 accent 沿用了原来暗色版的家族（白底上压深了一档）。
 斜杠命令不做成输入框 —— `/model` 和 `/mode` 是中栏顶栏的控件，`/compact` 自动触发。
 
 ```
@@ -189,7 +223,7 @@ desktop/                    薄壳，纯 JS，不在 tsconfig 的 rootDir 覆盖
   main.js                   建窗口 / 注册 IPC / webContents → EventSink
   preload.cjs               contextBridge 暴露 window.clauda（必须 CJS）
   renderer/
-    index.html  style.css   三栏骨架
+    index.html  style.css   四列骨架（导航条 + 三栏 + 底部通知行），靠 data-view 切列数
     state.js                纯归约 reduce(state, action)，单测直接 import
     markdown.js             最小 markdown → HTML（先转义再套标签）
     app.js                  DOM 绑定 + 流式增量更新
@@ -233,7 +267,13 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
   队列还是空的，于是走了等待分支（`rl.prompt()` 已经打过提示符），第二行起才命中
   「队列里已有」的 echo 分支。写 e2e 时别拿 stdout 断言管道进去的第一行 —— 查会话文件。
 - **在本机（控制台代码页 936）用 bash heredoc 写测试脚本要小心**：命令字符串到达 bash 时
-  已经是 GBK，写进 `.mjs` 的中文字面量会变成非法 UTF-8 源码。测试脚本一律用 Write 工具写。
+  已经是 GBK，写进 `.mjs` 的中文字面量会变成非法 UTF-8 源码（报 `Invalid or unexpected
+  token` 或渲染成乱码）。测试脚本、fixture 一律用 Write 工具写。
+- **改完 `desktop/renderer/style.css` 刷新窗口看到的可能还是旧样式**：`app://` 背后是
+  `net.fetch(file://…)`，Chromium 会把它缓存住，`location.reload()` 拿不到新文件。
+  用 CDP 目视验收时要 `Network.clearBrowserCache` + `Page.reload({ignoreCache:true})`，
+  否则验的是上一版样式（`getComputedStyle` 一查就露馅）。挂载在 `app://` 会话上的
+  旧样式会让元素定位整个错位，看着像 CSS 写错了。
   同一个坑还会以另一种面目出现：**用 heredoc 写 `.md` 测试数据也会写成 GBK**，而
   `readFileSync(..., 'utf8')` 读出来是一片乱码 —— 会被误判成「clauda 有编码 bug」。
   实测字节：heredoc 写「审查」是 `c9 f3 b2 e9`，Write 工具写才是 `e5 ae a1 e6 9f a5`。

@@ -158,8 +158,16 @@ export class McpManager {
     return [...this.statuses.values()]
   }
 
-  /** 接入的工具 schema 每轮请求都要付的 token 估算，`/mcp` 页脚用 */
+  /**
+   * 接入的工具 schema 每轮请求都要付的 token 估算，`/mcp` 页脚用。
+   *
+   * 没接入任何工具时**直接返回 0**：`JSON.stringify([])` 是 `"[]"`，估算器会把它
+   * 算成 1 token。差一个数看着无所谓，但 `mcpCostNotice` 是靠「tokens 有没有大过 0」
+   * 判断要不要出提示的，于是没配 MCP 的会话也会看到「已接入 MCP：0 个服务器 /
+   * 0 个工具，约 +1 token」这种胡话。
+   */
   tokenHint(): number {
+    if (this.active.length === 0) return 0
     return estimateTokens(JSON.stringify(toolSpecs(this.active)))
   }
 

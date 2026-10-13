@@ -5,6 +5,8 @@
     <!--
       CSP 收紧到「只有同源脚本」：模型输出会经 markdown.js 变成 innerHTML，
       虽然那边已经先转义了，但再多一层兜底不亏。`unsafe-inline` 只留给样式。
+      注意 `default-src 'none'` 把 font-src 也挡死了 —— 所以只能用系统字体，
+      别指望引外链字体。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -14,7 +16,40 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <div class="app">
+    <!--
+      `data-view` 是整块布局的开关（见 style.css 的 `.app[data-view=…]`）。
+      初始值必须和 state.js 的 `createState().view` 一致，否则首帧会先按错的
+      列宽排一遍再跳回来。
+    -->
+    <div class="app" id="app" data-view="sessions">
+      <!--
+        导航条同时是「状态脊」：每一项自带一个实时徽标（会话数 / 当前模型 /
+        技能数 / MCP 已连接数）。这些是后台状态，不该逼用户点进去才知道。
+      -->
+      <nav class="rail" aria-label="主导航">
+        <div class="rail-mark" title="clauda">◆</div>
+
+        <button type="button" class="rail-item" id="nav-sessions">
+          <span class="rail-label">会话</span>
+          <span class="rail-badge" id="badge-sessions"></span>
+        </button>
+        <button type="button" class="rail-item" id="nav-model">
+          <span class="rail-label">模型</span>
+          <span class="rail-badge mono" id="badge-model"></span>
+        </button>
+        <button type="button" class="rail-item" id="nav-skills">
+          <span class="rail-label">技能</span>
+          <span class="rail-badge" id="badge-skills"></span>
+        </button>
+        <button type="button" class="rail-item" id="nav-mcp">
+          <span class="rail-label">MCP</span>
+          <span class="rail-badge" id="badge-mcp"></span>
+        </button>
+
+        <div class="rail-spacer"></div>
+        <div class="rail-project" id="rail-project"></div>
+      </nav>
+
       <aside class="sidebar">
         <header class="sidebar-head">
           <span class="brand">clauda</span>
@@ -26,41 +61,55 @@
         </label>
         <div id="project-path" class="project-path"></div>
         <div id="session-list" class="session-list"></div>
-        <div id="notices" class="notices"></div>
       </aside>
 
       <main class="chat">
-        <header class="topbar">
-          <div class="topbar-title" id="chat-title">还没有打开的会话</div>
-          <div class="topbar-controls">
-            <label class="control">
-              <span>模型</span>
-              <input id="model-input" type="text" spellcheck="false" placeholder="模型名" />
-            </label>
-            <label class="control">
-              <span>模式</span>
-              <select id="mode-select">
-                <option value="default">default</option>
-                <option value="auto">auto</option>
-                <option value="plan">plan</option>
-              </select>
-            </label>
-            <div class="control context">
-              <span>上下文</span>
-              <div class="context-bar" title="上下文占用"><i id="context-fill"></i></div>
+        <!--
+          `stream` 和下面那些 id 必须原样留着，而且不能改它们的父节点 ——
+          tests/renderer-dom.mjs 会按 id 取到节点再按下标遍历子节点。
+        -->
+        <div class="view" id="view-sessions">
+          <header class="topbar">
+            <div class="topbar-title" id="chat-title">还没有打开的会话</div>
+            <div class="topbar-controls">
+              <label class="control">
+                <span>模型</span>
+                <input id="model-input" type="text" spellcheck="false" placeholder="模型名" />
+              </label>
+              <label class="control">
+                <span>模式</span>
+                <select id="mode-select">
+                  <option value="default">default</option>
+                  <option value="auto">auto</option>
+                  <option value="plan">plan</option>
+                </select>
+              </label>
+              <div class="control context">
+                <span>上下文</span>
+                <div class="context-bar" title="上下文占用"><i id="context-fill"></i></div>
+              </div>
             </div>
-          </div>
-        </header>
+          </header>
 
-        <div id="stream" class="stream"></div>
+          <div id="stream" class="stream"></div>
 
-        <form id="composer" class="composer">
-          <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
-          <div class="composer-actions">
-            <button type="button" id="abort" class="ghost" hidden>停止</button>
-            <button type="submit" id="send">发送</button>
-          </div>
-        </form>
+          <form id="composer" class="composer">
+            <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <div class="composer-actions">
+              <button type="button" id="abort" class="ghost" hidden>停止</button>
+              <button type="submit" id="send">发送</button>
+            </div>
+          </form>
+        </div>
+
+        <!-- 模型 / 技能 / MCP 三个设置页共用这一个容器，内容由 app.js 现画 -->
+        <div class="view" id="view-settings" hidden>
+          <header class="settings-head">
+            <h1 class="settings-title" id="settings-title"></h1>
+            <p class="settings-sub" id="settings-sub"></p>
+          </header>
+          <div class="settings-body" id="settings-body"></div>
+        </div>
       </main>
 
       <aside class="panel">
@@ -73,6 +122,13 @@
           <ul id="todos" class="plain"></ul>
         </section>
       </aside>
+
+      <!--
+        通知栏是 `.app` 网格的第二行（见 style.css），四个视图下都看得见。
+        它早先是侧栏底部的一条，而侧栏在模型/技能/MCP 三个设置页上是 `display:none`，
+        于是「MCP 开关接不上」这类错误恰好死在引发它的那个页面上，一个字都看不到。
+      -->
+      <div id="notices" class="notices"></div>
     </div>
 
     <div id="modal-host" class="modal-host" hidden></div>

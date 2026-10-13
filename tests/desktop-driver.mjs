@@ -44,6 +44,11 @@ const out = {
   noteContent: null,
   opened: {},
   tools: {},
+  projectInfo: null,
+  mcpToggle: null,
+  setDefaultModel: null,
+  openedAfterModel: null,
+  configOnDisk: null,
   history: null,
   closed: null,
   resumed: null,
@@ -140,6 +145,14 @@ try {
   }
   out.opened = { a: a.session, b: b.session }
 
+  // 设置页（模型 / 技能 / MCP）唯一的数据源。这条通道要是坏了，三个页面一起空白
+  out.projectInfo = await app.handle('project/info', { sessionId: a.session.id })
+
+  // 故意用一个没配置过的名字：`McpManager.setEnabled` 会抛，channel 层必须翻成
+  // `{ok:false, reason}`。这条通道早先是无条件 `{ok:true}` 的，界面显示「已接入」
+  // 而工具一个没多 —— 这是那次的回归点
+  out.mcpToggle = await app.handle('mcp/set-enabled', { cwd: projectDir, name: 'nope', enabled: true })
+
   // 轮次跑完要落盘，否则关掉窗口这一轮就没了；侧边栏的「历史会话」也正是读这份文件
   out.history = await app.handle('session/list', { cwd: projectDir })
 
@@ -147,6 +160,18 @@ try {
   out.closed = await app.handle('session/close', { sessionId: a.session.id })
   out.resumed = await app.handle('session/resume', { cwd: projectDir, id: a.session.id })
   out.resumedState = await app.handle('session/state', { sessionId: a.session.id })
+
+  // 改「默认模型」：写回项目配置文件，并且只影响**之后**新建的会话。
+  // 必须排在 `session/resume` 之后 —— 恢复会话走的是 `structuredClone(project.config)`，
+  // 提前改掉的话上面那条「恢复出来还是 desk-model」会跟着变成新模型，测的就不是恢复逻辑了
+  out.setDefaultModel = await app.handle('project/set-default-model', {
+    cwd: projectDir,
+    model: 'desk-model-2',
+  })
+  const c = await app.handle('session/open', { cwd: projectDir })
+  out.openedAfterModel = c.ok ? c.session : null
+  if (c.ok) out.sessionIds.push(c.session.id)
+  out.configOnDisk = fs.readFileSync(path.join(projectDir, '.clauda', 'config.json'), 'utf8')
 
   const tQuit = Date.now()
   await app.handle('app/quit')

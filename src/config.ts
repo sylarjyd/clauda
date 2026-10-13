@@ -218,6 +218,45 @@ export function configPath(cwd: string): string {
   return path.join(cwd, '.clauda', 'config.json')
 }
 
+/**
+ * 把默认模型写进项目配置文件，返回写到了哪个文件。
+ *
+ * **必须操作磁盘上的原始文本，不能拿 `loadConfig()` 的结果回写。** 那个结果已经过
+ * `expandEnvRefs`，`${MY_KEY}` 在那儿是真实密钥 —— 回写等于把密钥明文落盘。
+ *
+ * 文件存在但解析不了时**报错返回、不覆盖**：手滑写坏一个逗号就丢掉整份配置，
+ * 比「改了没生效」难受得多。
+ */
+export function writeProjectModel(cwd: string, model: string): string {
+  const file = configPath(cwd)
+  const raw = readJsonObjectForWrite(file)
+
+  const provider = raw.provider
+  raw.provider =
+    provider && typeof provider === 'object' && !Array.isArray(provider)
+      ? { ...(provider as Record<string, unknown>), model }
+      : { model }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8')
+  return file
+}
+
+/** 读一份「准备原样写回去」的 JSON 对象。和 `readJsonIfExists` 不同，这里解析不了要抛 */
+function readJsonObjectForWrite(file: string): Record<string, unknown> {
+  if (!fs.existsSync(file)) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch (e) {
+    throw new Error(`配置文件不是合法 JSON，没有改动：${file} — ${(e as Error).message}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`配置文件顶层不是对象，没有改动：${file}`)
+  }
+  return parsed as Record<string, unknown>
+}
+
 /** 首次运行时生成一份注释齐全的配置模板 */
 export function writeConfigTemplate(cwd: string): string {
   const file = configPath(cwd)
