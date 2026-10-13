@@ -735,6 +735,73 @@ console.log('\n== 管道输入的编码兜底 ==')
 
 fs.rmSync(tmp, { recursive: true, force: true })
 
+// ------------------------------------------------ 子进程输出的编码嗅探
+
+console.log('\n== 子进程输出的编码嗅探 ==')
+{
+  const { ConsoleDecoder, sniffBytes } = await import(`${dist}util/console-decoder.js`)
+
+  // 夹具是这台中文 Windows 上真抓的字节：`chcp` 和 `certutil` 的输出（控制台代码页 936）。
+  // 别用 Buffer.from(中文, 'gbk') 造 —— Node 不认 'gbk' 这个标签，会静默按 UTF-8 编，
+  // 于是夹具本身是 UTF-8，测试就变成在验一个不存在的场景
+  const chcpOut = Buffer.from('bbeeb6afb4fac2ebd2b33a203933360d0a', 'hex') // 活动代码页: 936\r\n
+  const certTail = Buffer.from('c3fcc1eeb3c9b9a6cdeab3c9a1a3', 'hex') // 命令成功完成。
+  const gbkCn = Buffer.from('d6d0cec4b2e2cad4', 'hex') // 中文测试
+  const utf8Cn = Buffer.from('中文测试', 'utf8')
+
+  const run = (chunks, platform = 'win32') => {
+    const d = new ConsoleDecoder(platform)
+    let out = ''
+    for (const c of chunks) out += d.push(c)
+    return out + d.flush()
+  }
+
+  const first = new ConsoleDecoder('win32')
+  check('纯 ASCII 的块立刻出字（流式没被压住）', first.push(Buffer.from('hello ')) === 'hello ')
+  check('ASCII 之后接着来 ASCII 也不会压住', first.push(Buffer.from('world')) === 'world')
+
+  check('整块 GBK 解成中文', run([chcpOut]) === '活动代码页: 936\r\n', JSON.stringify(run([chcpOut])))
+  check(
+    '开头的 ASCII 前缀不会把编码锁死',
+    run([Buffer.from('MD5 '), certTail]) === 'MD5 命令成功完成。',
+    JSON.stringify(run([Buffer.from('MD5 '), certTail])),
+  )
+
+  // 下面三条盯的是同一件事：**块边界切在多字节字符中间**时不能急着定调
+  check('GBK 被切成两块也能拼回来', run([gbkCn.subarray(0, 3), gbkCn.subarray(3)]) === '中文测试')
+  check(
+    'GBK 汉字被切成两个单字节块也能拼回来',
+    run([gbkCn.subarray(0, 1), gbkCn.subarray(1, 2), gbkCn.subarray(2)]) === '中文测试',
+    JSON.stringify(run([gbkCn.subarray(0, 1), gbkCn.subarray(1, 2), gbkCn.subarray(2)])),
+  )
+  // 这条是最容易写错的一处：UTF-8 的中文被切在字符中间时同样「解不通」，把它当成
+  // GB18030 的证据就会让**每一个**被切开的汉字变成一个错字 —— 也就是又一种乱码
+  check(
+    'UTF-8 中文被切在字符中间，不会误判成 GB18030',
+    run([utf8Cn.subarray(0, 1), utf8Cn.subarray(1, 2), utf8Cn.subarray(2)]) === '中文测试',
+    JSON.stringify(run([utf8Cn.subarray(0, 1), utf8Cn.subarray(1, 2), utf8Cn.subarray(2)])),
+  )
+  check('UTF-8 中文整块原样通过', run([utf8Cn]) === '中文测试')
+
+  check('定调之后后续块不再重新判定', run([gbkCn, Buffer.from(' tail')]) === '中文测试 tail')
+
+  // 非 Windows 不嗅探：同样的字节在那里只当 UTF-8。这是刻意的，不给 macOS / Linux
+  // 引入一份没有收益、只有误判风险的逻辑
+  check(
+    '非 Windows 平台不走嗅探（GBK 字节照旧解不出来）',
+    run([gbkCn], 'linux').includes('�'),
+    JSON.stringify(run([gbkCn], 'linux')),
+  )
+
+  check(
+    'sniffBytes 的三种结论各就各位',
+    sniffBytes(utf8Cn) === 'utf-8' &&
+      sniffBytes(gbkCn) === 'gb18030' &&
+      sniffBytes(utf8Cn.subarray(0, 2)) === 'incomplete',
+    [sniffBytes(utf8Cn), sniffBytes(gbkCn), sniffBytes(utf8Cn.subarray(0, 2))].join(' / '),
+  )
+}
+
 // ---------------------------------------------------------------- 技能
 // 技能是「说明书按需载入」：系统提示词里只放名字和用途，正文等模型调 skill 工具再给。
 console.log('\n== 技能 ==')

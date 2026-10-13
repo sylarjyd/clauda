@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { isDangerousCommand } from '../permissions.js'
+import { ConsoleDecoder } from '../util/console-decoder.js'
 import { formatMs, truncateMiddle } from '../util/text.js'
 import { optionalNumber, requireString, type Tool } from './types.js'
 
@@ -113,13 +114,25 @@ function execute(command: string, opts: ExecOptions): Promise<ExecResult> {
     })
 
     let output = ''
-    const onData = (chunk: Buffer) => {
-      const text = chunk.toString('utf8')
+    // 两个流各持一个解码器：它们是两条独立的字节流，共用一个的话，一个流末尾那半截
+    // 字符会和另一个流的字节拼在一起
+    const decoders = [new ConsoleDecoder(), new ConsoleDecoder()]
+    const onData = (decoder: ConsoleDecoder) => (chunk: Buffer) => {
+      const text = decoder.push(chunk)
+      if (!text) return
       output += text
       opts.onOutput?.(text)
     }
-    child.stdout?.on('data', onData)
-    child.stderr?.on('data', onData)
+    child.stdout?.on('data', onData(decoders[0]!))
+    child.stderr?.on('data', onData(decoders[1]!))
+
+    /** 收尾：把解码器里压着的半截吐出来。error 和 close 都会到这儿，flush 是幂等的 */
+    const drain = () => {
+      const tail = decoders.map((d) => d.flush()).join('')
+      if (!tail) return
+      output += tail
+      opts.onOutput?.(tail)
+    }
 
     let timedOut = false
     let aborted = false
@@ -136,10 +149,12 @@ function execute(command: string, opts: ExecOptions): Promise<ExecResult> {
     opts.signal.addEventListener('abort', onAbort, { once: true })
 
     child.on('error', (err) => {
+      drain()
       done({ output: output + `\n[启动命令失败：${err.message}]`, code: null, timedOut, aborted })
     })
 
     child.on('close', (code) => {
+      drain()
       done({ output, code, timedOut, aborted })
     })
   })

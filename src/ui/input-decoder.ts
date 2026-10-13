@@ -1,4 +1,5 @@
 import { Transform } from 'node:stream'
+import { sniffBytes } from '../util/console-decoder.js'
 
 /**
  * 把 stdin 的原始字节规范成 UTF-8 文本流。
@@ -7,22 +8,20 @@ import { Transform } from 'node:stream'
  * 从 cmd 重定向或某些 shell 管道过来的字节是 GBK。那样解出来是一片 U+FFFD，
  * 坏掉的内容既会喂给模型、又会回显给用户，看起来就像 clauda 自己坏了。
  *
- * 判定策略：按行用 fatal 模式试 UTF-8，非法字节会抛错，说明不是 UTF-8，退回
- * GB18030 重解。纯 ASCII 两种编码结果一致，所以**不锁定** —— 否则开头一行 ASCII
- * 会把后面真正需要判定的行也带偏。一旦确认是 GB18030 就记住，后续行不再试。
+ * 判据在 `util/console-decoder.ts`（子进程输出认的是同一件事）。这里额外要的是
+ * 「按行」这个粒度：stdin 是行式协议，按 `\n` 切就天然不会切在多字节字符中间。
+ *
+ * 纯 ASCII 两种编码结果一致，所以**不锁定** —— 否则开头一行 ASCII 会把后面真正
+ * 需要判定的行也带偏。一旦确认不是 UTF-8 就记住，后续行不再试。
  */
 export function decodeInput(): Transform {
   let decided: 'utf-8' | 'gb18030' | null = null
   let pending = Buffer.alloc(0)
 
   const convert = (line: Buffer): Buffer => {
-    if (decided === null) {
-      try {
-        new TextDecoder('utf-8', { fatal: true }).decode(line)
-      } catch {
-        decided = 'gb18030'
-      }
-    }
+    // 'incomplete' 也当成 GB18030：这是一行的**结尾**，后面不会再来字节了，
+    // 没有「等下一块」这个选项（和 `sniffBytes` 在流式那边的用法正相反）
+    if (decided === null && sniffBytes(line) !== 'utf-8') decided = 'gb18030'
     // 没锁定说明这段本来就是合法 UTF-8，原样放行，不做多余的重新编码
     if (decided === null) return line
     return Buffer.from(new TextDecoder(decided).decode(line), 'utf8')

@@ -328,8 +328,19 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
   `readFileSync(..., 'utf8')` 读出来是一片乱码 —— 会被误判成「clauda 有编码 bug」。
   实测字节：heredoc 写「审查」是 `c9 f3 b2 e9`，Write 工具写才是 `e5 ae a1 e6 9f a5`。
   排查这类乱码先 `od -t x1` 看字节，别先怀疑代码。
-- **读文件一律按 UTF-8**（`CLAUDA.md`、`SKILL.md` 都一样），只有 stdin 走管道时有 GB18030
-  兜底。用户在本机用记事本存成 ANSI 就会读成乱码。要不要给文件读也加编码探测是个
+- **`bash` 工具的输出要嗅探编码**，否则中文命令的结果在会话里显示成 `�`（模型看到的
+  也是乱码）。中文 Windows（代码页 936）上 `cmd.exe` 的原生工具（certutil、findstr、
+  ipconfig…）按控制台代码页吐 GB18030，而 node / python / Git Bash 的 coreutils 吐 UTF-8
+  —— **同一个工具前后两条命令可以是两种编码**，所以只能看字节，不能按平台猜。
+  判据（`sniffBytes`）和流式解码器都在 `util/console-decoder.ts`，stdin 那条路共用前者。
+  两个要点：**stdout 和 stderr 各持一个解码器**（共用的话一个流末尾那半截字符会和另一个流
+  的字节拼起来）；**别把「解不通 UTF-8」直接当成 GB18030** —— 管道按块给数据，一个汉字的
+  三字节经常被切成 `e4 | b8 ad`，那是 `incomplete`、要等下一块，混为一谈会让每个被切开的
+  汉字变成一个错字，也就是**又一种乱码**（`sniffBytes` 的 cut 循环允许砍到空就是为了这个）。
+  没定调之前只放 ASCII 前缀出去，纯英文命令（`git status`）照旧一块一块地出字。
+- **读文件一律按 UTF-8**（`CLAUDA.md`、`SKILL.md` 都一样），只有 stdin 的管道输入和
+  `bash` 工具的子进程输出有 GB18030 兜底。用户在本机用记事本存成 ANSI 就会读成乱码。
+  要不要给文件读也加编码探测是个
   独立决定，别顺手加 —— 会牵动记忆那一层。
 - frontmatter 解析器（`skills/frontmatter.ts`）刻意**只支持单行 `key: value`**，嵌套、列表、
   块标量、行内 `#` 注释一概不认。**遇到不认识的一律降级，绝不抛异常** —— 坏一个技能不该
