@@ -24,6 +24,16 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-home-'))
 // 会话的 cwd 必须是个临时目录：write_file 会真落盘，写进仓库根目录就污染工作区了
 const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-proj-'))
 fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({ name: 'deskdemo' }), 'utf8')
+// 预先放一份项目配置，用来验「写回时只动 provider 里被指定的键」：
+//   - `${CLAUDA_API_KEY}` 是**原文**，写回后必须还是原文（展开了就成明文密钥落盘）
+//   - `timeoutMs` 是 provider 里不该被碰的键，`mcpServers` 在 provider 之外
+// 空对象 `mcpServers` 不会真的起服务器，所以下面的「MCP 列表为空」那条不受影响
+fs.mkdirSync(path.join(projectDir, '.clauda'), { recursive: true })
+fs.writeFileSync(
+  path.join(projectDir, '.clauda', 'config.json'),
+  JSON.stringify({ provider: { apiKey: '${CLAUDA_API_KEY}', timeoutMs: 20000 }, mcpServers: {} }, null, 2) + '\n',
+  'utf8',
+)
 
 // 必须在 import dist 之前设好：claudaHome() 读的就是这个变量
 process.env.CLAUDA_HOME = home
@@ -52,6 +62,12 @@ const out = {
   setDefaultModel: null,
   openedAfterModel: null,
   configOnDisk: null,
+  setVendor: null,
+  configAfterVendor: null,
+  projectInfoAfterVendor: null,
+  openedAfterVendor: null,
+  badVendor: null,
+  configAfterBadVendor: null,
   history: null,
   closed: null,
   resumed: null,
@@ -185,6 +201,25 @@ try {
   out.openedAfterModel = c.ok ? c.session : null
   if (c.ok) out.sessionIds.push(c.session.id)
   out.configOnDisk = fs.readFileSync(path.join(projectDir, '.clauda', 'config.json'), 'utf8')
+
+  // 切厂商：**地址与模型一次写完**。只换地址的话，当前会话会拿着旧模型名去问新端点，
+  // 换来的只是个费解的 404。
+  //
+  // 必须排在读 `configOnDisk` 之后：提前切会改掉 `provider.model`，
+  // 上面那条「新会话拿到了新的默认模型 = desk-model-2」就变成 deepseek-chat 了
+  const configFile = path.join(projectDir, '.clauda', 'config.json')
+  out.setVendor = await app.handle('project/set-vendor', { cwd: projectDir, vendorKey: 'deepseek' })
+  out.configAfterVendor = fs.readFileSync(configFile, 'utf8')
+  // 设置页读的就是这条：它回来的 `vendorKey` 必须与新地址一致，否则界面会显示旧厂商
+  out.projectInfoAfterVendor = await app.handle('project/info', { sessionId: c.session.id })
+  const d = await app.handle('session/open', { cwd: projectDir })
+  out.openedAfterVendor = d.ok ? d.session : null
+  if (d.ok) out.sessionIds.push(d.session.id)
+
+  // 未知厂商必须在 channel 层就被挡住：`setVendor` 只接受已解析的 preset，
+  // 于是不存在「写一个界面没提供过的地址」这条路径
+  out.badVendor = await app.handle('project/set-vendor', { cwd: projectDir, vendorKey: 'nope' })
+  out.configAfterBadVendor = fs.readFileSync(configFile, 'utf8')
 
   const tQuit = Date.now()
   await app.handle('app/quit')

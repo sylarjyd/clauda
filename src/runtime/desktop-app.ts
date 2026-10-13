@@ -1,5 +1,6 @@
 import { isSafeSessionId, listProjects, listSessionSummaries, loadSession } from '../agent/session.js'
 import type { PermissionMode } from '../config.js'
+import { findVendor } from '../provider/vendors.js'
 import type { PermissionDecision } from './permission-bridge.js'
 import { SessionManager, type EventSink, type Session, type SessionProject } from './session-manager.js'
 
@@ -127,6 +128,32 @@ export class DesktopApp {
           return withStr(payload, 'cwd', (cwd) => ({
             ok: true,
             file: this.manager.setDefaultModel(cwd, model),
+          }))
+        }
+
+        case 'project/set-base-url': {
+          const baseUrl = str(payload, 'baseUrl').trim()
+          if (!baseUrl) return { ok: false, reason: '接口地址不能为空' }
+          return withStr(payload, 'cwd', (cwd) => ({
+            ok: true,
+            file: this.manager.setDefaultBaseUrl(cwd, baseUrl),
+          }))
+        }
+
+        /**
+         * 切厂商：地址与模型一次写完（理由见 `SessionManager.setVendor`）。
+         *
+         * **候选集校验就放在这一层**：`setVendor` 只接受已解析的 preset，于是不存在
+         * 「写一个界面没提供过的地址」这条路径。
+         */
+        case 'project/set-vendor': {
+          const key = str(payload, 'vendorKey')
+          const preset = findVendor(key)
+          // `__custom__` 也会走到这里：它没有可写的地址，只能是手动调这个通道的
+          if (!preset) return { ok: false, reason: `未知厂商：${key}` }
+          return withStr(payload, 'cwd', (cwd) => ({
+            ok: true,
+            file: this.manager.setVendor(cwd, preset),
           }))
         }
 

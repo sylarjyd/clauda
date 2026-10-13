@@ -69,7 +69,7 @@ async function main(): Promise<void> {
     .argument('[prompt]', '直接提问（等价于 -p），不填则进入交互模式')
     .option('-p, --print <prompt>', '无头模式：执行一次并输出结果后退出')
     .option('--model <model>', '覆盖模型名称')
-    .option('--base-url <url>', '覆盖 API 地址（需以 /v1 结尾）')
+    .option('--base-url <url>', '覆盖 API 地址。只写主机名会自动补 /v1；非标准路径要写全（方舟 /api/v3、百炼 /compatible-mode/v1、智谱 /api/paas/v4）')
     .option('--api-key <key>', '覆盖 API Key')
     .addOption(
       new Option('--permission-mode <mode>', '权限模式').choices(['default', 'auto', 'plan']),

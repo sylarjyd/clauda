@@ -529,6 +529,167 @@ console.log('\n== 配置优先级 ==')
   }
 }
 
+// ---------------------------------------------------------------- 厂商预置
+console.log('\n== 厂商预置表 ==')
+{
+  const { VENDORS, findVendor, vendorByBaseUrl } = await import(`${dist}provider/vendors.js`)
+
+  check('预置表不是空的', VENDORS.length >= 8, String(VENDORS.length))
+  check('厂商 key 唯一', new Set(VENDORS.map((v) => v.key)).size === VENDORS.length)
+  check(
+    '每个厂商都有 http(s) 地址（无尾斜杠）和至少一个候选模型',
+    VENDORS.every((v) => /^https?:\/\//.test(v.baseUrl) && !v.baseUrl.endsWith('/') && v.models.length > 0),
+    JSON.stringify(VENDORS.map((v) => v.baseUrl)),
+  )
+  check(
+    '环境变量名要么留空要么是合法变量名',
+    VENDORS.every((v) => v.envKey === '' || /^[A-Z_][A-Z0-9_]*$/.test(v.envKey)),
+    JSON.stringify(VENDORS.map((v) => v.envKey)),
+  )
+  // 厂商是由 baseUrl 推导的（不存字段），所以每个预置必须能反查回自己，否则界面会显示「自定义」
+  check('每个预置都能按地址反查回自己', VENDORS.every((v) => vendorByBaseUrl(v.baseUrl)?.key === v.key))
+  check('尾斜杠不影响反查', vendorByBaseUrl('https://api.deepseek.com/v1/')?.key === 'deepseek')
+  check('反查不到就是没匹配上', vendorByBaseUrl('http://127.0.0.1:9/v1') === undefined)
+  check(
+    'findVendor 认得预置、认不得野名字',
+    findVendor('deepseek')?.key === 'deepseek' && findVendor('nope') === undefined,
+  )
+  check(
+    'OpenAI 那条的首个候选与内置默认模型一致',
+    findVendor('openai')?.models[0] === 'gpt-4o-mini',
+    findVendor('openai')?.models[0],
+  )
+}
+
+console.log('\n== baseUrl 归一化 ==')
+{
+  const { normalizeBaseUrl } = await import(`${dist}config.js`)
+  const cases = [
+    // 只补「没有 path」这一种 —— 救掉最常见的手填错误
+    ['http://localhost:11434', 'http://localhost:11434/v1'],
+    ['http://localhost:11434/', 'http://localhost:11434/v1'],
+    ['https://api.deepseek.com/v1/', 'https://api.deepseek.com/v1'],
+    // 这两条是回归护栏：错误地「补全」会把方舟的 /api/v3 拼成 /v3/v1，是真实事故
+    ['https://ark.cn-beijing.volces.com/api/v3', 'https://ark.cn-beijing.volces.com/api/v3'],
+    ['https://dashscope.aliyuncs.com/compatible-mode/v1', 'https://dashscope.aliyuncs.com/compatible-mode/v1'],
+    ['https://open.bigmodel.cn/api/paas/v4', 'https://open.bigmodel.cn/api/paas/v4'],
+    ['不是个地址', '不是个地址'],
+  ]
+  for (const [input, want] of cases) {
+    check(`归一化 ${input}`, normalizeBaseUrl(input) === want, normalizeBaseUrl(input))
+  }
+}
+
+console.log('\n== 写回接口地址 / 模型，以及厂商环境变量回退 ==')
+{
+  const { loadConfig, writeProjectProvider, writeProjectModel, configPath, writeConfigTemplate } = await import(
+    `${dist}config.js`
+  )
+  const { findVendor } = await import(`${dist}provider/vendors.js`)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vendor-home-'))
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vendor-proj-'))
+
+  // 开发机上很可能真挂着这几个（尤其 OPENAI_API_KEY），不摘掉下面的回退用例就是白验
+  const saved = {}
+  for (const name of ['CLAUDA_HOME', 'CLAUDA_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY']) {
+    saved[name] = process.env[name]
+    delete process.env[name]
+  }
+  process.env.CLAUDA_HOME = home
+
+  const writeCfg = (dir, obj) => {
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(obj), 'utf8')
+  }
+
+  try {
+    // 解析时归一，但**绝不写回**用户文件里的原文
+    const file = configPath(proj)
+    writeCfg(path.join(proj, '.clauda'), { provider: { baseUrl: 'http://127.0.0.1:9', model: 'm' } })
+    check('解析时补上 /v1', loadConfig(proj).provider.baseUrl === 'http://127.0.0.1:9/v1', loadConfig(proj).provider.baseUrl)
+    check('归一化没写回文件', fs.readFileSync(file, 'utf8').includes('http://127.0.0.1:9"'))
+
+    // 写回：一次改地址 + 模型，且**保留 ${VAR}` 引用**（拿 loadConfig 的结果回写就是泄露密钥）
+    process.env.CLAUDA_VENDOR_KEY = 'sk-super-secret'
+    writeCfg(path.join(proj, '.clauda'), {
+      provider: { baseUrl: 'http://old/v1', apiKey: '${CLAUDA_VENDOR_KEY}', model: 'old', temperature: 7 },
+      permissions: { mode: 'auto', allow: [], deny: [] },
+      mcpServers: { demo: { command: 'npx' } },
+    })
+    const ds = findVendor('deepseek')
+    const written = writeProjectProvider(proj, { baseUrl: ds.baseUrl, model: ds.models[0] })
+    const disk = fs.readFileSync(written, 'utf8')
+    check('写回落在项目配置文件上', written === file, written)
+    check('地址与模型同时写进去了', loadConfig(proj).provider.baseUrl === ds.baseUrl && loadConfig(proj).provider.model === ds.models[0])
+    check('写回保留 ${VAR} 引用，没把密钥明文落盘', disk.includes('${CLAUDA_VENDOR_KEY}'), disk)
+    check('写回没把明文密钥写进磁盘', !disk.includes('sk-super-secret'), disk)
+    check('写回不碰 provider 里别的键', JSON.parse(disk).provider.temperature === 7, disk)
+    check('写回不碰别的段落', JSON.parse(disk).permissions.mode === 'auto', disk)
+    check('写回不碰 mcpServers', !!JSON.parse(disk).mcpServers?.demo, disk)
+    delete process.env.CLAUDA_VENDOR_KEY
+
+    // 没给的键一个都不能碰 —— `{ model: undefined }` 展开进去会把磁盘上原有的抹掉
+    const before = fs.readFileSync(file, 'utf8')
+    writeProjectProvider(proj, { baseUrl: 'https://api.deepseek.com/v1' })
+    check('只给地址时不碰模型', JSON.parse(fs.readFileSync(file, 'utf8')).provider.model === ds.models[0], before)
+
+    // writeProjectModel 仍是薄封装，性质一条不少
+    const onlyModel = fs.readFileSync(writeProjectModel(proj, 'some-model'), 'utf8')
+    check('writeProjectModel 仍只改模型', JSON.parse(onlyModel).provider.model === 'some-model' && JSON.parse(onlyModel).provider.baseUrl === ds.baseUrl, onlyModel)
+
+    // 手滑写坏一个逗号不能连累整份配置
+    const broken = '{"provider": {"model": "x",}}'
+    fs.writeFileSync(file, broken, 'utf8')
+    let threw = ''
+    try {
+      writeProjectProvider(proj, { baseUrl: 'http://x/v1' })
+    } catch (e) {
+      threw = e.message
+    }
+    check('配置不是合法 JSON 时报错而不是覆盖', threw.length > 0, threw)
+    check('报错时原文件一字未动', fs.readFileSync(file, 'utf8') === broken)
+
+    // 厂商专属环境变量回退：界面说「该厂商读 DEEPSEEK_API_KEY」，这里就得真读
+    writeCfg(path.join(proj, '.clauda'), { provider: { baseUrl: ds.baseUrl, model: ds.models[0] } })
+    process.env.DEEPSEEK_API_KEY = 'sk-deepseek'
+    check('没有通用 key 时回退到厂商专属变量', loadConfig(proj).provider.apiKey === 'sk-deepseek', loadConfig(proj).provider.apiKey)
+
+    writeCfg(path.join(proj, '.clauda'), { provider: { baseUrl: 'http://localhost:11434/v1', model: 'x' } })
+    check('本地部署不认厂商变量（该条 envKey 为空）', loadConfig(proj).provider.apiKey === '', loadConfig(proj).provider.apiKey)
+
+    writeCfg(path.join(proj, '.clauda'), {
+      provider: { baseUrl: ds.baseUrl, apiKey: '${CLAUDA_VENDOR_KEY2}', model: 'x' },
+    })
+    process.env.CLAUDA_VENDOR_KEY2 = 'sk-from-file'
+    check(
+      '配置文件里写了 key 就不被环境变量回退顶掉',
+      loadConfig(proj).provider.apiKey === 'sk-from-file',
+      loadConfig(proj).provider.apiKey,
+    )
+    delete process.env.CLAUDA_VENDOR_KEY2
+    delete process.env.DEEPSEEK_API_KEY
+
+    // 生成模板的那份地址与模型必须来自预置表，否则两边会脱节
+    const tpl = writeConfigTemplate(proj)
+    const tplText = fs.readFileSync(tpl, 'utf8')
+    check(
+      '配置模板的地址与模型来自预置表',
+      JSON.parse(tplText).provider.baseUrl === ds.baseUrl && JSON.parse(tplText).provider.model === ds.models[0],
+      tplText,
+    )
+    // 模板里的密钥是占位串，不参与这条断言 —— 要验的是「模板能读出预置地址」，
+    // 拿真 key 去比会把「模板过期」和「env 回退失效」两件事混在一起
+    check('配置模板写在了这个项目的配置路径上', tpl === configPath(proj), tpl)
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    fs.rmSync(home, { recursive: true, force: true })
+    fs.rmSync(proj, { recursive: true, force: true })
+  }
+}
+
 console.log('\n== 管道输入的编码兜底 ==')
 {
   const { decodeInput } = await import(`${dist}ui/input-decoder.js`)
@@ -1391,6 +1552,147 @@ console.log('\n== 会话管理：并发守卫与配置隔离 ==')
   fs.rmSync(projDir, { recursive: true, force: true })
 }
 
+// ------------------------------------------------------------------ provider 的 client 冻死
+// 界面能改的两个键（baseUrl / apiKey）在 `openai.ts` 里是被 constructor **捕获**进 client 的。
+// 不修的话：设置页显示新地址、请求发往旧地址，**且不报任何错** —— 症状是「改了没反应」。
+console.log('\n== provider：改了地址，client 必须跟着换 ==')
+{
+  const { OpenAICompatibleProvider } = await import(`${dist}provider/openai.js`)
+
+  const cfg = {
+    baseUrl: 'http://old-host.invalid/v1',
+    apiKey: 'k1',
+    model: 'm-old',
+    temperature: 0,
+    maxTokens: 10,
+    includeUsage: true,
+    timeoutMs: 1000,
+    maxRetries: 0,
+  }
+  // 这个 cfg 就是项目运行时那一份（`project.ts` 把 `config.provider` 传了进来），
+  // 所以下面「改 cfg」等价于桌面端改配置
+  const p = new OpenAICompatibleProvider(cfg)
+
+  check('构造时 client 用的是当时的地址', p.client.baseURL === 'http://old-host.invalid/v1', p.client.baseURL)
+  check('model 也是构造快照（所以换厂商必须刷会话的 model，见下一组）', p.model === 'm-old', p.model)
+
+  cfg.baseUrl = 'http://new-host.invalid/v1'
+  check('只改 config 不动 client —— 这正是「冻死」本身', p.client.baseURL === 'http://old-host.invalid/v1', p.client.baseURL)
+
+  // 真走一遍 `stream()` 的入口（syncClient 就在它的第一行）。**给一个已 abort 的 signal**：
+  // 请求在开 socket 之前就被拒掉，于是这里不会产生任何真实网络 I/O
+  // —— 本文件至今一个 socket 都不开，别在这儿破例
+  const controller = new AbortController()
+  controller.abort()
+  const noop = () => {}
+  const gen = p.stream({
+    model: 'm',
+    messages: [],
+    tools: [],
+    temperature: 0,
+    maxTokens: 1,
+    signal: controller.signal,
+  })
+  try {
+    for await (const _ of gen) noop(_)
+    check('已 abort 的请求必须抛出来，而不是静默返回', false)
+  } catch {
+    check('已 abort 的请求必须抛出来，而不是静默返回', true)
+  }
+  check('stream() 开头把 client 换到了新地址', p.client.baseURL === 'http://new-host.invalid/v1', p.client.baseURL)
+
+  const kept = p.client
+  try {
+    for await (const _ of p.stream({
+      model: 'm',
+      messages: [],
+      tools: [],
+      temperature: 0,
+      maxTokens: 1,
+      signal: controller.signal,
+    })) {
+      noop(_)
+    }
+  } catch {
+    /* 已经验过会抛，这里只关心 client 有没有被重建 */
+  }
+  check('地址没变就不重建 client（否则每个请求都新建一个连接池）', p.client === kept)
+}
+
+// ------------------------------------------------------------------ 切厂商
+// 换端点会踩两个坑，任一都是「下一条消息必 404」：
+// provider 的 client 是构造时建的快照（改了 baseUrl 请求还打往旧地址，且不报错），
+// 以及会话的 model 是开会话时克隆出来的旧值（拿 gpt-4o-mini 去问 DeepSeek）。
+console.log('\n== 会话管理：切厂商写盘并刷活会话 ==')
+{
+  const { SessionManager } = await import(`${dist}runtime/session-manager.js`)
+  const { findVendor } = await import(`${dist}provider/vendors.js`)
+  const { ALL_TOOLS } = await import(`${dist}tools/index.js`)
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vhome-'))
+  const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vproj-'))
+  const prevHome = process.env.CLAUDA_HOME
+  process.env.CLAUDA_HOME = home
+
+  try {
+    const config = agentConfig()
+    config.provider.baseUrl = 'http://127.0.0.1:9/v1'
+    config.provider.model = 'old-model'
+
+    /** 每轮真正用到的地址 —— 读的就是那个会被 setVendor 改掉的活对象 */
+    const hit = []
+    const project = {
+      cwd: projDir,
+      config,
+      provider: {
+        model: config.provider.model,
+        async *stream() {
+          hit.push(config.provider.baseUrl)
+          yield { type: 'text', text: '好的' }
+          yield { type: 'done', finishReason: 'stop' }
+        },
+      },
+      skills: { list: () => [] },
+      assembleTools: () => ALL_TOOLS,
+      mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
+      dispose: () => {},
+    }
+
+    const mgr = new SessionManager({ sink: { send: () => {} }, openProject: () => project })
+    const a = await mgr.openSession(projDir)
+    await mgr.send(a.id, '第一轮')
+    check('第一轮打的是项目原来的地址', hit.at(-1) === 'http://127.0.0.1:9/v1', JSON.stringify(hit))
+    check('provider.model 是构造时的快照（所以换厂商必须刷会话模型）', project.provider.model === 'old-model', project.provider.model)
+
+    const ds = findVendor('deepseek')
+    const file = mgr.setVendor(projDir, ds)
+    const disk = JSON.parse(fs.readFileSync(file, 'utf8'))
+    check(
+      '切厂商把地址与模型一起写盘（只换地址会留着旧模型名，必 404）',
+      disk.provider.baseUrl === ds.baseUrl && disk.provider.model === ds.models[0],
+      JSON.stringify(disk.provider),
+    )
+    check('切厂商同步了内存里那份项目配置（否则已开的项目仍发往旧地址）', config.provider.baseUrl === ds.baseUrl, config.provider.baseUrl)
+    check(
+      '切厂商把活会话的模型也刷了',
+      a.config.provider.model === ds.models[0],
+      a.config.provider.model,
+    )
+    check('活会话的系统提示词里也换成新模型名', a.agent.messages[0].content.includes(ds.models[0]), a.agent.messages[0].content.slice(0, 300))
+
+    const opened = await mgr.openSession(projDir)
+    check('切完之后新建的会话直接用新模型', opened.config.provider.model === ds.models[0], opened.config.provider.model)
+
+    await mgr.send(a.id, '第二轮')
+    check('第二轮真的打到了新地址', hit.at(-1) === ds.baseUrl, JSON.stringify(hit))
+  } finally {
+    if (prevHome === undefined) delete process.env.CLAUDA_HOME
+    else process.env.CLAUDA_HOME = prevHome
+    fs.rmSync(home, { recursive: true, force: true })
+    fs.rmSync(projDir, { recursive: true, force: true })
+  }
+}
+
 // ------------------------------------------------------------------ 会话管理（协作）
 // 授权等待、MCP 开关、记忆写入这三件事都**跨会话**：
 // 「等用户点按钮」的 Promise 挂住会让整轮永不返回，MCP 开关只改当前会话等于没改，
@@ -2127,23 +2429,103 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   const body = app.el('settings-body')
   const modelText = textOf(body)
   check('模型页有标题', app.el('settings-title').textContent === '模型配置', app.el('settings-title').textContent)
-  check('模型页显示接口地址', modelText.includes('http://127.0.0.1:9/v1'))
   check('模型页的密钥是打码的', modelText.includes('····abcd') && !modelText.includes('sk-'), modelText)
   check('模型页显示温度与上下文窗口', modelText.includes('0.3') && modelText.includes('128000'))
   check('模型页显示权限规则', modelText.includes('Read') && modelText.includes('Bash(rm:*)'))
 
-  // 「默认模型」是可编辑的那一格，写回项目配置文件
-  const modelEdit = find(body, (n) => n.className === 'set-edit')
+  /** 取「设置页里 key 那一行」的右侧值节点 */
+  const rowValue = (key) =>
+    find(body, (n) => n.className === 'set-row' && n.children[0]?.textContent === key)?.children[1] ?? null
+  /**
+   * 编辑行**按 aria-label 定位**，不能取「文档序第一个 .set-edit」——
+   * 接口地址那行现在排在默认模型前面，按下标取会点到「存为接口地址」上去。
+   */
+  const editLineOf = (label) =>
+    find(body, (n) => n.className === 'set-edit' && n.children[0]?.getAttribute('aria-label') === label)
+
+  // 接口地址是可编辑的（各家的区域变体、公司自建网关都靠它）
+  const baseUrlEdit = editLineOf('接口地址')
+  check('接口地址那一格是可编辑的', baseUrlEdit !== null)
+  check('接口地址框里是当前生效的地址', baseUrlEdit?.children[0].value === 'http://127.0.0.1:9/v1', baseUrlEdit?.children[0].value)
+
+  // 厂商选择器：预置 + 自定义。fixture 的地址匹配不到任何预置，所以停在「自定义」
+  const vendorPick = find(body, (n) => n.tagName === 'select')
+  check('厂商那一格是个选择器', vendorPick !== null)
+  check(
+    '选项数 = 预置数 + 自定义',
+    vendorPick?.children.length === app.vendors.length + 1,
+    `${vendorPick?.children.length} vs ${app.vendors.length + 1}`,
+  )
+  check('匹配不到预置时选中「自定义」', vendorPick?.value === '__custom__', vendorPick?.value)
+  const keySourceText = textOf(rowValue('密钥来源'))
+  check('自定义地址的密钥来源指向通用变量', keySourceText.includes('CLAUDA_API_KEY'), keySourceText)
+
+  // 换厂商：一次写盘同时改地址和模型，页面还得立刻重画（指纹里漏了 baseUrl 就不动）
+  const deepseek = app.vendors.find((v) => v.key === 'deepseek')
+  vendorPick.value = 'deepseek'
+  vendorPick.fire('change')
+  await tick()
+  check(
+    '选厂商后发了 set-vendor，且带上了 cwd',
+    app.calls.includes('project/set-vendor') && app.savedVendors[0]?.cwd === 'C:/p',
+    JSON.stringify(app.savedVendors),
+  )
+  const repainted = find(body, (n) => n.tagName === 'select')
+  check('切完厂商选择器停在新的那一项上', repainted?.value === 'deepseek', repainted?.value)
+  check('切完厂商接口地址跟着变了', editLineOf('接口地址')?.children[0].value === deepseek.baseUrl, editLineOf('接口地址')?.children[0].value)
+  check(
+    '切完厂商「密钥来源」说得出该设哪个变量',
+    textOf(rowValue('密钥来源')).includes('DEEPSEEK_API_KEY'),
+    textOf(rowValue('密钥来源')),
+  )
+  check(
+    '切完厂商默认模型换成该厂商的',
+    editLineOf('默认模型')?.children[0].value === deepseek.models[0],
+    editLineOf('默认模型')?.children[0].value,
+  )
+
+  // 候选模型名：点一下只填输入框，**不写盘**
+  const modelEdit = editLineOf('默认模型')
   check('默认模型那一格是可编辑的', modelEdit !== null)
+  // children[0]=input / children[1]=按钮 是契约，插错顺序这条立刻红
+  check('编辑行的头两个孩子仍是 输入框 + 按钮', modelEdit.children[1].textContent === '存为默认', modelEdit.children[1].textContent)
+  const savedBefore = app.savedModels.length
+  // 候选挂在编辑行**外面**（`.set-edit` 是 flex 行，塞进去会被挤到输入框同一行），
+  // 所以从这一格（`.set-val`）找，而不是从编辑行找
+  const tag = find(rowValue('默认模型'), (n) => n.className === 'tag')
+  check('默认模型那行给出了候选', tag !== null)
+  tag.click()
+  await tick()
+  check('点候选只把模型名填进输入框', modelEdit.children[0].value === tag.textContent, modelEdit.children[0].value)
+  check('点候选不写盘', app.savedModels.length === savedBefore, String(app.savedModels.length))
+
   modelEdit.children[0].value = 'gpt-x'
   modelEdit.children[1].click()
   await tick()
   check(
     '点「存为默认」把模型写回了项目配置',
-    app.savedModels.length === 1 && app.savedModels[0].model === 'gpt-x',
+    app.savedModels.length === savedBefore + 1 && app.savedModels.at(-1).model === 'gpt-x',
     JSON.stringify(app.savedModels),
   )
   check('写完提示了写到哪个文件', textOf(app.el('notices')).includes('config.json'), textOf(app.el('notices')))
+
+  // 手填接口地址走另一条通道；「自定义」那一项本身不该发任何请求
+  const vendorCallsBefore = app.savedVendors.length
+  const select2 = find(body, (n) => n.tagName === 'select')
+  select2.value = '__custom__'
+  select2.fire('change')
+  await tick()
+  check('选中「自定义」不发任何请求（没有可写的地址）', app.savedVendors.length === vendorCallsBefore)
+
+  const urlInput = editLineOf('接口地址').children[0]
+  urlInput.value = 'http://localhost:8080'
+  editLineOf('接口地址').children[1].click()
+  await tick()
+  check(
+    '点「存为接口地址」发了 set-base-url 且带上了地址',
+    app.savedBaseUrls.at(-1)?.baseUrl === 'http://localhost:8080' && app.savedBaseUrls.at(-1)?.cwd === 'C:/p',
+    JSON.stringify(app.savedBaseUrls),
+  )
 
   app.el('nav-skills').click()
   await tick()

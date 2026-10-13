@@ -142,11 +142,28 @@
   同一处：`loadSession` 解析出来还要过 `isSessionRecord`，随便一个 `.json` 都能
   `JSON.parse` 成功，而恢复会话的人拿 `messages` 直接用（`persistSession` 读 `.length`）。
 - **写配置文件只能改磁盘上的原始文本，不许拿 `loadConfig()` 的结果回写**
-  （`config.ts` 的 `writeProjectModel`）。`loadConfig` 内部的 `expandEnvRefs` 已经把
-  `${MY_KEY}` 换成了真实密钥，拿它回写等于把密钥明文落盘 —— 这是数据泄露，不是格式问题。
-  同一处：改了默认模型还要**同步内存里的 `project.config`**，因为 `openSession` 走的是
-  `structuredClone(project.config)`，只写文件的话已开着的项目新建会话仍拿旧模型
-  （表现是「改了没生效」）；文件解析不了时**报错返回、不覆盖**，别为了容错丢掉整份配置。
+  （`config.ts` 的 `writeProjectProvider`，`writeProjectModel` 只是它的薄封装）。
+  `loadConfig` 内部的 `expandEnvRefs` 已经把 `${MY_KEY}` 换成了真实密钥，拿它回写等于把
+  密钥明文落盘 —— 这是数据泄露，不是格式问题。同一处：改了默认模型／接口地址还要**同步
+  内存里的 `project.config`**，因为 `openSession` 走的是 `structuredClone(project.config)`，
+  只写文件的话已开着的项目仍拿旧值（表现是「改了没生效」）；文件解析不了时**报错返回、
+  不覆盖**，别为了容错丢掉整份配置。
+- **切厂商必须「地址 + 模型」一次写完，并刷掉本项目所有活会话的模型**
+  （`SessionManager.setVendor`）。只换地址的话，当前会话会拿着旧模型名去问新端点
+  （`gpt-4o-mini` 问 DeepSeek），换来的只是一个费解的 404；而会话的 `model` 是 `openSession`
+  时克隆出来的旧值，不刷就是下一条消息必挂。语义记牢：**厂商定义「这个项目跟谁说话」
+  （传输层，项目级，立刻生效），默认模型定义「新会话用哪个脑子」（会话级默认）**。
+- **provider 的 client 在 `stream()` 开头跟 `cfg` 对一次**（`provider/openai.ts` 的
+  `syncClient`）。`project.ts` 把 `config.provider` 那**一个对象**交给了 provider，桌面端改的
+  就是它；但 `new OpenAI({ baseURL })` 是构造函数里建好的快照，不同步的话界面显示新地址、
+  请求发往旧地址，**且不报任何错**（症状是「改了没反应」）。`model` 不在此列 —— agent 每轮
+  现读 `config.provider.model`，别把两者混为一谈。
+- **厂商不存字段，由 `baseUrl` 反推**（`provider/vendors.ts` 的 `vendorByBaseUrl`；预置表里
+  每个地址互不相同，是单射）。存一个 label 只会多出「文件被手改了、label 与 baseUrl 对不上、
+  界面开始撒谎」这种状态。推导**必须在主进程做**：renderer 走 `app://` 协议，`main.js` 的
+  目录穿越检查不让它 import 到 `dist/`，所以 `ProjectInfo` 只下发结论（`provider.vendorKey`）
+  加整张表（`vendors`），renderer 按 key 查、不判。代价是那个 `'__custom__'` 字面量在
+  `session-manager.ts` / `app.js` / `renderer-dom.mjs` 里各有一份，改名要三处一起改。
 - **左侧导航条同时是状态脊**（`index.html` 的 `.rail`），四个视图 `sessions / model /
   skills / mcp` 由 `.app[data-view]` 驱动 grid 模板切换（会话视图四列，设置视图两列）。
   两条容易踩的：**每个子元素要写死 `grid-column`**（`display:none` 摘掉子元素后剩下的会

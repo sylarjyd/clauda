@@ -1,5 +1,13 @@
 import { Agent, type AgentOptions, type SessionSnapshot, type TurnOutcome } from '../agent/agent.js'
-import { configPath, writeProjectModel, type ClaudaConfig, type PermissionMode } from '../config.js'
+import {
+  configPath,
+  normalizeBaseUrl,
+  writeProjectModel,
+  writeProjectProvider,
+  type ClaudaConfig,
+  type PermissionMode,
+} from '../config.js'
+import { VENDORS, vendorByBaseUrl, type VendorPreset } from '../provider/vendors.js'
 import type { McpServerStatus } from '../mcp/manager.js'
 import { PermissionManager } from '../permissions.js'
 import type { Provider } from '../provider/types.js'
@@ -59,6 +67,12 @@ export interface SessionProject {
 }
 
 /**
+ * 「没认出是哪家厂商」的 key（用户手填了地址，或地址是自建网关/区域变体）。
+ * renderer 拿它当「自定义」那一项的值，所以两边必须串同一个常量。
+ */
+export const CUSTOM_VENDOR = '__custom__'
+
+/**
  * 桌面端「模型 / 技能 / MCP」三个设置页要的全部数据。
  *
  * 和 `SessionInfo` 一样是**可序列化快照**：renderer 拿到就能画，不用再问主进程。
@@ -70,6 +84,14 @@ export interface ProjectInfo {
   provider: {
     baseUrl: string
     /**
+     * 当前 baseUrl 对应的厂商 key，反查不到就是 `'__custom__'`（用户手填的地址）。
+     *
+     * **推导在主进程做**：renderer 走 `app://` 协议，`main.js` 的目录穿越检查
+     * 不让它 import 到 `dist/`，所以拿不到 `VENDORS` 表的推导逻辑。这里只下发结论，
+     * renderer 按 key 查下面那张表、不判 —— 否则两边各写一套判据就会互相矛盾。
+     */
+    vendorKey: string
+    /**
      * 密钥本身**不出主进程**，只回一段能认出「配没配、是不是这一把」的提示。
      * 渲染层拿到也不该有机会把它写进日志或截图。
      */
@@ -78,6 +100,8 @@ export interface ProjectInfo {
     temperature: number
     maxTokens: number
   }
+  /** 厂商预置表，原样下发给 renderer 画选择器 */
+  vendors: readonly VendorPreset[]
   context: {
     window: number
     autoCompact: boolean
@@ -280,11 +304,13 @@ export class SessionManager {
       configFile: configPath(project.cwd),
       provider: {
         baseUrl: cfg.provider.baseUrl,
+        vendorKey: vendorByBaseUrl(cfg.provider.baseUrl)?.key ?? CUSTOM_VENDOR,
         apiKeyHint: maskKey(cfg.provider.apiKey),
         model: cfg.provider.model,
         temperature: cfg.provider.temperature,
         maxTokens: cfg.provider.maxTokens,
       },
+      vendors: VENDORS,
       context: {
         window: cfg.contextWindow,
         autoCompact: cfg.autoCompact,
@@ -314,6 +340,53 @@ export class SessionManager {
     const file = writeProjectModel(cwd, model)
     const entry = this.projects.get(cwd)
     if (entry) entry.project.config.provider.model = model
+    return file
+  }
+
+  /**
+   * 改「接口地址」：写回项目配置文件，**并同步内存里那份 `project.config`**。
+   *
+   * 不双写就是「改了没生效」：provider 是在 `createProjectRuntime` 那一刻用
+   * `config.provider` 建的，已经开着的项目仍拿旧地址发请求（见 `provider/openai.ts`
+   * 的 `syncClient` —— 它盯的就是这份内存里的对象）。
+   */
+  setDefaultBaseUrl(cwd: string, rawBaseUrl: string): string {
+    // **这里也必须归一化**，不能只在 `loadConfig` 里做：内存里这一个对象是 provider
+    // 现读的那份（`syncClient`），漏掉的话刚改完的地址要等重启才生效 —— 表现是
+    // 「存为」点了没反应
+    const baseUrl = normalizeBaseUrl(rawBaseUrl)
+    const file = writeProjectProvider(cwd, { baseUrl })
+    const entry = this.projects.get(cwd)
+    if (entry) entry.project.config.provider.baseUrl = baseUrl
+    return file
+  }
+
+  /**
+   * 切厂商：**地址与模型一起原子写盘**，并把本项目所有活着的会话的模型刷成预置默认值。
+   *
+   * 两件事必须一起做，否则换来的只会是一个费解的 404：
+   * - 切到 DeepSeek 却留着 `gpt-4o-mini` → 模型名在新端点不存在；
+   * - 端点立刻生效（桌面端选的就是这条），而会话的 `model` 是 `openSession` 时
+   *   `structuredClone` 出来的旧值 → 当前会话下一条消息就必 404。
+   *
+   * 语义是**自洽**的，不是两种作用范围打架：厂商定义「这个项目跟谁说话」（传输层，
+   * 项目级，立刻生效）；默认模型定义「新会话用哪个脑子」（会话级默认）。
+   */
+  setVendor(cwd: string, preset: VendorPreset): string {
+    const model = preset.models[0]
+    const file = writeProjectProvider(cwd, { baseUrl: preset.baseUrl, model })
+
+    const entry = this.projects.get(cwd)
+    if (entry) {
+      entry.project.config.provider.baseUrl = preset.baseUrl
+      if (model) entry.project.config.provider.model = model
+    }
+    for (const session of this.sessions.values()) {
+      if (session.cwd !== cwd) continue
+      if (model) session.config.provider.model = model
+      // 系统提示词里写着当前模型名，不重建的话会话会自报旧模型
+      session.agent.refreshSystemPrompt()
+    }
     return file
   }
 

@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import dotenv from 'dotenv'
+import { findVendor, VENDORS, vendorByBaseUrl } from './provider/vendors.js'
 import type { ToolPermission } from './types.js'
 
 export type PermissionMode = 'default' | 'auto' | 'plan'
@@ -210,36 +211,82 @@ export function loadConfig(cwd: string, overrides: CliOverrides = {}): ClaudaCon
   if (overrides.contextWindow) cfg.contextWindow = overrides.contextWindow
   if (overrides.permissionMode) cfg.permissions.mode = overrides.permissionMode
 
-  cfg.provider.baseUrl = cfg.provider.baseUrl.replace(/\/+$/, '')
+  cfg.provider.baseUrl = normalizeBaseUrl(cfg.provider.baseUrl)
+
+  // 厂商专属环境变量回退：只在**一个 key 都没配到**时生效 —— 配置文件里写了 key 的永远赢。
+  // 没有这条，界面上那句「该厂商读 DEEPSEEK_API_KEY」就是假的：用户照设了照样 401。
+  // 本地部署那条 envKey 是空串，天然跳过。
+  if (!cfg.provider.apiKey) {
+    const envKey = vendorByBaseUrl(cfg.provider.baseUrl)?.envKey
+    if (envKey) cfg.provider.apiKey = process.env[envKey] ?? ''
+  }
   return cfg
+}
+
+/**
+ * 归一化接口地址：**只补一种情况** —— 路径为空或恰好是 `/` 时补 `/v1`。
+ *
+ * 凭空补全绝不碰已经有 path 的地址（`/compatible-mode/v1`、`/api/v3`、`/paas/v4`
+ * 一律原样），却能救掉最常见的手填错误：`http://localhost:11434` → `…/v1`。
+ * 补错的代价很大 —— 把方舟的 `/api/v3` 拼成 `/v3/v1` 是真实事故。
+ *
+ * **只在 `loadConfig` 解析时归一，绝不写回用户的文件原文** —— 和 `${VAR}` 只在解析时
+ * 展开是同一条规矩。解析不了（不是 URL）就原样返回。
+ */
+export function normalizeBaseUrl(url: string): string {
+  const trimmed = url.trim()
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return trimmed
+  }
+  if (parsed.pathname === '' || parsed.pathname === '/') parsed.pathname = '/v1'
+  // `URL.toString()` 会给带 path 的地址补尾斜杠，统一去掉（老行为就是去尾斜杠）
+  return parsed.toString().replace(/\/+$/, '')
 }
 
 export function configPath(cwd: string): string {
   return path.join(cwd, '.clauda', 'config.json')
 }
 
+export interface ProjectProviderPatch {
+  baseUrl?: string
+  model?: string
+}
+
 /**
- * 把默认模型写进项目配置文件，返回写到了哪个文件。
+ * 把「接口地址 / 默认模型」写进项目配置文件，返回写到了哪个文件。
  *
  * **必须操作磁盘上的原始文本，不能拿 `loadConfig()` 的结果回写。** 那个结果已经过
  * `expandEnvRefs`，`${MY_KEY}` 在那儿是真实密钥 —— 回写等于把密钥明文落盘。
+ * 这里的值只可能来自 `VENDORS` 常量或界面上的手填，从不经过 `loadConfig`。
  *
+ * 只改 `provider` 里给定的键，`provider` 的其它键和文件里别的内容一律原样保留。
  * 文件存在但解析不了时**报错返回、不覆盖**：手滑写坏一个逗号就丢掉整份配置，
  * 比「改了没生效」难受得多。
  */
-export function writeProjectModel(cwd: string, model: string): string {
+export function writeProjectProvider(cwd: string, patch: ProjectProviderPatch): string {
   const file = configPath(cwd)
   const raw = readJsonObjectForWrite(file)
+
+  // 没给值的键不要碰：`{ model: undefined }` 展开进去会把磁盘上原有的 model 抹掉
+  const given = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined))
 
   const provider = raw.provider
   raw.provider =
     provider && typeof provider === 'object' && !Array.isArray(provider)
-      ? { ...(provider as Record<string, unknown>), model }
-      : { model }
+      ? { ...(provider as Record<string, unknown>), ...given }
+      : { ...given }
 
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8')
   return file
+}
+
+/** 改「默认模型」的薄封装 —— 性质见 `writeProjectProvider` */
+export function writeProjectModel(cwd: string, model: string): string {
+  return writeProjectProvider(cwd, { model })
 }
 
 /** 读一份「准备原样写回去」的 JSON 对象。和 `readJsonIfExists` 不同，这里解析不了要抛 */
@@ -261,11 +308,13 @@ function readJsonObjectForWrite(file: string): Record<string, unknown> {
 export function writeConfigTemplate(cwd: string): string {
   const file = configPath(cwd)
   fs.mkdirSync(path.dirname(file), { recursive: true })
+  // 模板默认给 DeepSeek —— 地址与模型名从预置表取，别在这里手抄一份（抄了就会跟表脱节）
+  const preset = findVendor('deepseek') ?? VENDORS[0]
   const tpl = {
     provider: {
-      baseUrl: 'https://api.deepseek.com/v1',
+      baseUrl: preset.baseUrl,
       apiKey: 'sk-替换成你的 key',
-      model: 'deepseek-chat',
+      model: preset.models[0],
       temperature: 0,
       maxTokens: 8192,
     },

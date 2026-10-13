@@ -20,7 +20,8 @@ clauda -p "解释 src/agent/loop.ts" --output-format json   # 无头模式，适
 - **技能**：把成套的操作指引写进 `SKILL.md`，模型按需载入，也可用 `/技能名` 手动触发
 - **记忆库**：模型在会话里学到的事实自己存下来，跨会话复用；只注入索引，正文按需取
 - **MCP**：接上 Model Context Protocol 服务器，工具集在运行时长出来，`/mcp` 可随时启停
-- **不锁死厂商**：任何 OpenAI 兼容端点，改个环境变量就换模型
+- **不锁死厂商**：任何 OpenAI 兼容端点；常见厂商（DeepSeek、豆包/火山方舟、通义千问/百炼、
+  Kimi、MiniMax、智谱 GLM、硅基流动、OpenAI、本地部署）的接口地址与候选模型名已内置
 
 ## 安装
 
@@ -84,7 +85,26 @@ export CLAUDA_API_KEY=ollama
 export CLAUDA_MODEL=qwen2.5-coder:14b
 ```
 
-也兼容 `OPENAI_BASE_URL` / `OPENAI_API_KEY` 的写法。注意地址一般要以 `/v1` 结尾。
+也兼容 `OPENAI_BASE_URL` / `OPENAI_API_KEY` 的写法。
+
+**地址的路径各家不一样，不是一律以 `/v1` 结尾** —— 百炼是 `/compatible-mode/v1`、
+方舟是 `/api/v3`、智谱是 `/api/paas/v4`。常见厂商的完整前缀与候选模型名都内置在
+`src/provider/vendors.ts`，桌面端的「设置 → 模型 → 厂商」直接选。手填时只写主机名
+（`http://localhost:11434`）会自动补上 `/v1`，已经带路径的一律原样保留。
+
+只要地址命中内置的那一家，密钥可以只写厂商专属的变量名，不必再配 `CLAUDA_API_KEY`：
+
+| 厂商 | 变量 |
+| --- | --- |
+| DeepSeek | `DEEPSEEK_API_KEY` |
+| 豆包 · 火山方舟 | `ARK_API_KEY` |
+| 通义千问 · 百炼 | `DASHSCOPE_API_KEY` |
+| Kimi · 月之暗面 | `MOONSHOT_API_KEY` |
+| MiniMax | `MINIMAX_API_KEY` |
+| 智谱 GLM | `ZHIPU_API_KEY` |
+| 硅基流动 | `SILICONFLOW_API_KEY` |
+
+这条回退只在**一个密钥都没配到**时生效：配置文件里写了 `apiKey` 的永远赢。本地部署不需要密钥。
 
 写配置文件的话：
 
@@ -418,6 +438,7 @@ src/
   permissions.ts      权限闸门：模式 + 规则匹配
   provider/
     types.ts          Provider 接口与流式事件定义
+    vendors.ts        常见厂商预置：接口地址、密钥变量名、候选模型与坑位提醒
     openai.ts         OpenAI 兼容实现，负责 tool_calls 分片拼装
   agent/
     agent.ts          主循环：流式 → 工具调用 → 回填结果 → 再流式；含上下文压缩

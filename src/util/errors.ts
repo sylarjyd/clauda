@@ -16,7 +16,9 @@ export function describeError(err: unknown, config?: ClaudaConfig): string {
     return `认证失败（HTTP ${e.status}）。请检查 API Key 是否有效。${endpoint}`
   }
   if (e?.status === 404) {
-    return `接口返回 404。请确认接口地址是否正确，大多数 OpenAI 兼容服务需要以 /v1 结尾。${endpoint}`
+    // 两个 404 的常见来源，都会在换厂商时撞上：地址的**路径前缀**不对，或者模型名在
+    // 这个端点上根本不存在（拿 gpt-4o-mini 去问 DeepSeek 就是这一类）
+    return `接口返回 404。请确认接口地址与模型名都对得上：路径各家不同 —— 百炼是 /compatible-mode/v1、方舟是 /api/v3、智谱是 /api/paas/v4，不是一律 /v1；模型名也要是这一家的。${endpoint}`
   }
   if (e?.status === 429) {
     return '触发限流（HTTP 429）。稍等片刻再试，或换用其他模型。'

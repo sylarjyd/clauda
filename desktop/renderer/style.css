@@ -791,6 +791,42 @@ select:focus {
   max-width: 320px;
 }
 
+/* 厂商选择器。坑位提醒（preset.note）挂在它下面，换行显示 */
+.vendor-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+.set-val select {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 3px 6px;
+  color: inherit;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  max-width: 320px;
+}
+
+/* 候选模型名：点一下填进输入框。**别给全局 .tag 加 cursor** —— 权限规则那种不是按钮 */
+.tag-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.tag-pick .tag {
+  cursor: pointer;
+}
+
+.tag-pick .tag:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .tag {
   display: inline-block;
   padding: 0 6px;

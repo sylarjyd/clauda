@@ -18,20 +18,35 @@ export class OpenAICompatibleProvider implements Provider {
   /** 后端若不支持 stream_options，第一次失败后永久降级 */
   private usageSupported: boolean
 
+  /** 建 client 时的 baseUrl / apiKey，用来判 `syncClient` 要不要重建 */
+  private clientBaseUrl: string
+  private clientApiKey: string
+
   constructor(cfg: ProviderConfig) {
     this.cfg = cfg
     this.model = cfg.model
     this.usageSupported = cfg.includeUsage
-    this.client = new OpenAI({
-      apiKey: cfg.apiKey || 'not-needed',
-      baseURL: cfg.baseUrl,
-      timeout: cfg.timeoutMs,
-      maxRetries: 0, // 自己的退避逻辑，避免双层重试放大等待
-      defaultHeaders: cfg.extraHeaders,
-    })
+    this.client = buildClient(cfg)
+    this.clientBaseUrl = cfg.baseUrl
+    this.clientApiKey = cfg.apiKey
+  }
+
+  /**
+   * `this.cfg` 是项目运行时那**一个**对象（`project.ts` 把 `config.provider` 直接传了进来），
+   * 桌面端改「接口地址 / 厂商」改的就是它。client 却只在构造时按当时的 baseUrl 建好了一次 ——
+   * 不同步的话，界面显示新端点、请求发往旧地址，而且**不报任何错**。
+   */
+  private syncClient(): void {
+    if (this.clientBaseUrl === this.cfg.baseUrl && this.clientApiKey === this.cfg.apiKey) return
+    this.client = buildClient(this.cfg)
+    this.clientBaseUrl = this.cfg.baseUrl
+    this.clientApiKey = this.cfg.apiKey
+    // 顺带复位「后端不认 stream_options」那次降级：换了厂商，新东家支持与否是另一回事
+    this.usageSupported = this.cfg.includeUsage
   }
 
   async *stream(opts: StreamOptions): AsyncGenerator<StreamEvent> {
+    this.syncClient()
     let attempt = 0
     // 重试只能覆盖「连接建立到首个 chunk」阶段；一旦已经吐字给用户就不能重来
     for (;;) {
@@ -129,6 +144,22 @@ export class OpenAICompatibleProvider implements Provider {
 
     yield { type: 'done', finishReason }
   }
+}
+
+/**
+ * 按当前配置建一个 client。抽出来是为了 `syncClient` 能重建 —— 见那边的注释。
+ *
+ * `includeUsage` **不**参与判定：切厂商后让它重置成初始值，正好把「后端不认
+ * stream_options」那次降级也一并复位，新厂商支持的话就能重新统计 token。
+ */
+function buildClient(cfg: ProviderConfig): OpenAI {
+  return new OpenAI({
+    apiKey: cfg.apiKey || 'not-needed',
+    baseURL: cfg.baseUrl,
+    timeout: cfg.timeoutMs,
+    maxRetries: 0, // 自己的退避逻辑，避免双层重试放大等待
+    defaultHeaders: cfg.extraHeaders,
+  })
 }
 
 function buildCall(p: PendingCall, idx: number): ToolCall {

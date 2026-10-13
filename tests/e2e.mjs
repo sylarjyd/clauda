@@ -518,8 +518,8 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
   if (d) {
     check('驱动正常跑完', d.ok === true, `${d.error ?? ''}\n${stderr.slice(0, 800)}`)
     check('退出码为 0', code === 0, `code=${code}\n${stderr.slice(0, 800)}`)
-    // 三个：并发跑的那两个，外加下面验「默认模型只影响新会话」时新开的一个
-    check('开出了三个会话', d.sessionIds.length === 3, JSON.stringify(d.sessionIds))
+    // 四个：并发跑的那两个，外加下面验「默认模型只影响新会话」和「切厂商换新会话模型」时各新开的一个
+    check('开出了四个会话', d.sessionIds.length === 4, JSON.stringify(d.sessionIds))
 
     // 并发：两边都跑完了，A 读到项目名、B 写完文件
     check('会话 A 的回合成功', d.send.a?.ok === true, JSON.stringify(d.send.a))
@@ -646,6 +646,44 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
     )
     check('落盘的是合法 JSON 且带着新模型', JSON.parse(d.configOnDisk).provider.model === 'desk-model-2', d.configOnDisk)
     check('新会话拿到了新的默认模型', d.openedAfterModel?.model === 'desk-model-2', d.openedAfterModel?.model)
+
+    // ---- 切厂商：地址与模型原子写入，且**只**动这两个键
+    const after = d.configAfterVendor ? JSON.parse(d.configAfterVendor) : {}
+    check(
+      '切厂商把接口地址与模型一起写回了项目配置',
+      after.provider?.baseUrl === 'https://api.deepseek.com/v1' && after.provider?.model === 'deepseek-chat',
+      JSON.stringify(after.provider),
+    )
+    check(
+      '写回时只碰被指定的键（provider 其它键与 mcpServers 一字未动）',
+      after.provider?.timeoutMs === 20000 && after.mcpServers !== undefined && Object.keys(after.mcpServers).length === 0,
+      JSON.stringify(after),
+    )
+    // 这条是这次改动里最容易出事的不变式：`loadConfig()` 会把 `${CLAUDA_API_KEY}` 换成
+    // 真实密钥，拿它的结果回写就是把密钥明文落盘
+    check(
+      '写回的是磁盘原文，${CLAUDA_API_KEY} 没被展开成明文',
+      d.configAfterVendor?.includes('${CLAUDA_API_KEY}') === true && d.configAfterVendor.includes('"mock"') === false,
+      d.configAfterVendor,
+    )
+    check(
+      '设置页回来的 vendorKey 与新地址一致（界面不会显示旧厂商）',
+      d.projectInfoAfterVendor?.info?.provider?.vendorKey === 'deepseek',
+      d.projectInfoAfterVendor?.info?.provider?.vendorKey,
+    )
+    check('切完厂商后新建的会话用新厂商的默认模型', d.openedAfterVendor?.model === 'deepseek-chat', d.openedAfterVendor?.model)
+    check(
+      '未知厂商被 channel 层挡下，且没动文件',
+      d.badVendor?.ok === false && String(d.badVendor.reason).includes('nope') && d.configAfterBadVendor === d.configAfterVendor,
+      JSON.stringify(d.badVendor),
+    )
+    check(
+      '下发的厂商表非空且 key 唯一（renderer 的选择器直接照着它画）',
+      Array.isArray(d.projectInfoAfterVendor?.info?.vendors) &&
+        d.projectInfoAfterVendor.info.vendors.length >= 9 &&
+        new Set(d.projectInfoAfterVendor.info.vendors.map((v) => v.key)).size === d.projectInfoAfterVendor.info.vendors.length,
+      JSON.stringify(d.projectInfoAfterVendor?.info?.vendors?.map((v) => v.key)),
+    )
 
     // 会话 id 来自 renderer 的 IPC 载荷，而它会一路流到写路径（persist.ts 用同一个 id 续写），
     // 所以 `../../x` 是任意路径写。边界上必须挡掉，而不是等 session.ts 兜底

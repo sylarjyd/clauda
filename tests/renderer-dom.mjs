@@ -118,19 +118,30 @@ export async function bootRenderer() {
   const opened = new Map()
   let seq = 0
 
+  // 厂商表直接用**真的那一份**（dist 里的）：写死在 fixture 里的话，表改了界面测试
+  // 还是绿的，就测不出「选择器少画了一项」这类错
+  const { VENDORS, vendorByBaseUrl } = await import(
+    new URL('../dist/provider/vendors.js', import.meta.url).href
+  )
+
   // 用例可以改它，模拟「配错了的服务器连不上」。默认成功
   const mcp = { fail: null }
   const savedModels = []
+  const savedVendors = []
+  const savedBaseUrls = []
   const projectInfo = {
     cwd: 'C:/p',
     configFile: 'C:/p/.clauda/config.json',
     provider: {
+      // 故意是不是任何预置的地址：默认状态下厂商应该是「自定义」
       baseUrl: 'http://127.0.0.1:9/v1',
+      vendorKey: '__custom__',
       apiKeyHint: '····abcd',
       model: 'desk-model',
       temperature: 0.3,
       maxTokens: 4096,
     },
+    vendors: VENDORS,
     context: { window: 128000, autoCompact: true, compactThreshold: 0.8, maxSteps: 40 },
     permissions: { mode: 'default', allow: ['Read'], deny: ['Bash(rm:*)'] },
     skills: [
@@ -182,6 +193,24 @@ export async function bootRenderer() {
           savedModels.push(payload)
           return { ok: true, file: projectInfo.configFile }
         }
+        if (channel === 'project/set-base-url') {
+          savedBaseUrls.push(payload)
+          // 真后端写完会把内存里那份 config 一起改掉，随后的 project/info 就是新地址。
+          // 桩里也只改地址 —— 厂商该跟着变成什么，是主进程按 baseUrl 推导的
+          projectInfo.provider.baseUrl = payload.baseUrl
+          projectInfo.provider.vendorKey = vendorByBaseUrl(payload.baseUrl)?.key ?? '__custom__'
+          return { ok: true, file: projectInfo.configFile }
+        }
+        if (channel === 'project/set-vendor') {
+          savedVendors.push(payload)
+          const preset = VENDORS.find((v) => v.key === payload.vendorKey)
+          if (!preset) return { ok: false, reason: `未知厂商：${payload.vendorKey}` }
+          // 地址与模型一起变 —— 这正是「切厂商」与「改默认模型」的区别
+          projectInfo.provider.baseUrl = preset.baseUrl
+          projectInfo.provider.vendorKey = preset.key
+          projectInfo.provider.model = preset.models[0]
+          return { ok: true, file: projectInfo.configFile }
+        }
         // 连不上的服务器：`McpManager.setEnabled` 会抛，channel 层翻成 `{ok:false, reason}`。
         // 界面必须把这个 reason 显示出来，不能报成功
         if (channel === 'mcp/set-enabled') {
@@ -208,6 +237,9 @@ export async function bootRenderer() {
     opened,
     mcp,
     savedModels,
+    savedVendors,
+    savedBaseUrls,
+    vendors: VENDORS,
     projectInfo,
     /** 侧边栏第 n 个会话行。组的第 0 个孩子是标题，行从 1 开始 */
     row: (n) => byId.get('session-list').children[0].children[n],

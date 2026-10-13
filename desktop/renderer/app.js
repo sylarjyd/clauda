@@ -63,7 +63,7 @@ const MCP_STATE = { connected: '已连接', failed: '失败', disabled: '未启�
 const SETTINGS_META = {
   model: {
     title: '模型配置',
-    sub: '当前项目解析后的生效配置。改「默认模型」会写回项目配置文件，只影响之后新建的会话；当前会话的模型在中栏顶栏上改。',
+    sub: '当前项目解析后的生效配置。厂商与接口地址是**项目级**的，改完立刻对本项目的所有会话生效（切厂商会连默认模型一起换成该厂商的）；「默认模型」只决定之后新建的会话用哪个，当前会话的模型在中栏顶栏上改。',
   },
   skills: {
     title: '技能',
@@ -265,7 +265,14 @@ function renderSettings() {
     return
   }
 
-  const key = [state.view, project.cwd, project.provider.model, mcpFingerprint(project)].join('|')
+  // baseUrl 必须并进指纹：切厂商改的就是它，漏了就变成「点完厂商页面纹丝不动」
+  const key = [
+    state.view,
+    project.cwd,
+    project.provider.baseUrl,
+    project.provider.model,
+    mcpFingerprint(project),
+  ].join('|')
   els.settingsTitle.textContent = meta.title
   els.settingsSub.textContent = meta.sub
   if (key === settingsKey) return
@@ -285,12 +292,15 @@ function mcpFingerprint(project) {
 
 function modelSections(project) {
   const { provider, context, permissions } = project
+  const preset = vendorOf(project)
 
   return [
     section('供应商', [
-      row('接口地址', mono(provider.baseUrl)),
+      row('厂商', vendorSelect(project)),
+      row('接口地址', editBaseUrl(provider)),
       row('密钥', provider.apiKeyHint ? mono(provider.apiKeyHint) : dim('没有可用的密钥')),
-      row('默认模型', editModel(provider.model)),
+      row('密钥来源', keySource(preset)),
+      row('默认模型', editModel(provider.model, preset ? preset.models : [])),
     ]),
     section('推理', [
       row('温度', mono(String(provider.temperature))),
@@ -313,24 +323,152 @@ function modelSections(project) {
   ]
 }
 
-function editModel(current) {
+/**
+ * 当前厂商。**主进程按 baseUrl 推导好 key 才下发**（renderer 走 `app://`，
+ * import 不到 `dist/provider/vendors.js`），这里只按 key 查表、不自己判 ——
+ * 两边各写一套判据，迟早互相矛盾。
+ */
+function vendorOf(project) {
+  return (project.vendors ?? []).find((v) => v.key === project.provider.vendorKey) ?? null
+}
+
+/** 厂商选择器。选了就**立刻写盘**（地址 + 模型原子写入），没有二次确认 */
+function vendorSelect(project) {
+  const box = document.createElement('div')
+  box.className = 'vendor-pick'
+
+  const select = document.createElement('select')
+  select.setAttribute('aria-label', '厂商')
+  for (const vendor of project.vendors ?? []) {
+    const option = document.createElement('option')
+    option.value = vendor.key
+    option.textContent = vendor.label
+    select.append(option)
+  }
+  // 「自定义」排最后，兜住手填的地址（各家的区域变体、公司自建网关）
+  const custom = document.createElement('option')
+  custom.value = '__custom__'
+  custom.textContent = '自定义（自己填接口地址）'
+  select.append(custom)
+  // **全部 append 完再设 value**：顺序反了选项还不存在，真浏览器里相当于没选中
+  select.value = project.provider.vendorKey
+  select.addEventListener('change', () => void saveVendor(project, select.value))
+  box.append(select)
+
+  // 各家的坑（豆包要 /api/coding/v3、智谱是 /v4…）由预置表出，界面只负责摆位置
+  const preset = vendorOf(project)
+  if (preset?.note) box.append(dim(preset.note))
+  return box
+}
+
+function editBaseUrl(provider) {
+  return editLine('接口地址', provider.baseUrl, '存为接口地址', '写回项目配置文件，立刻对本项目的所有会话生效', saveBaseUrl)
+}
+
+function editModel(current, models) {
+  const box = document.createElement('div')
+  box.append(
+    editLine('默认模型', current, '存为默认', '写回项目配置文件，只影响之后新建的会话', saveDefaultModel),
+  )
+  // 候选挂在编辑行**下面**（外层多包一个 div，别塞进 `.set-edit` —— 那是个 flex 行，
+  // 多一个孩子会把候选挤到输入框同一行上）
+  const input = box.children[0].children[0]
+  if (models.length > 0) box.append(modelTags(models, input))
+  return box
+}
+
+/**
+ * 输入框 + 「存为…」按钮。`children[0]` 是 input、`children[1]` 是按钮，**顺序是契约**，
+ * 测试按这个形状取；多一个孩子得挂在外面（见 `editModel`）。
+ */
+function editLine(label, value, action, hint, save) {
   const wrap = document.createElement('div')
   wrap.className = 'set-edit'
 
   const input = document.createElement('input')
   input.type = 'text'
   input.spellcheck = false
-  input.value = current
-  input.setAttribute('aria-label', '默认模型')
+  input.value = value
+  input.setAttribute('aria-label', label)
 
   const button = document.createElement('button')
   button.type = 'button'
-  button.textContent = '存为默认'
-  button.title = '写回项目配置文件，只影响之后新建的会话'
-  button.addEventListener('click', () => void saveDefaultModel(input))
+  button.textContent = action
+  button.title = hint
+  button.addEventListener('click', () => void save(input))
 
   wrap.append(input, button)
   return wrap
+}
+
+/**
+ * 候选模型名，点一下填进输入框 —— **不写盘**，写盘是「存为默认」的活。
+ * 不复用 `tags()`：那个是权限页的只读标签，别把点击行为加给所有 `.tag`。
+ */
+function modelTags(models, input) {
+  const box = document.createElement('div')
+  box.className = 'tag-pick'
+  for (const model of models) {
+    const tag = document.createElement('span')
+    tag.className = 'tag'
+    tag.textContent = model
+    tag.title = '点一下填进输入框（还要点「存为默认」才写盘）'
+    tag.addEventListener('click', () => {
+      input.value = model
+    })
+    box.append(tag)
+  }
+  return box
+}
+
+/**
+ * 「密钥来源」只能是真话：`loadConfig` 认哪个变量，这里就得说哪个。
+ * 说不出真话的后果不是难看，是用户照着设了变量、然后对着 401 不知道哪儿错了。
+ */
+function keySource(preset) {
+  if (!preset) return dim('未识别厂商：密钥按 CLAUDA_API_KEY / OPENAI_API_KEY 读取')
+  if (!preset.envKey) return dim('不需要密钥')
+  return mono(`${preset.envKey}（在 .env 或环境变量里设）`)
+}
+
+async function saveVendor(project, key) {
+  // 「自定义」没有可写的地址：留着用户手填的那一份，什么都不发
+  if (key === '__custom__') return
+  const res = await invoke('project/set-vendor', { cwd: project.cwd, vendorKey: key })
+  if (!res.ok) {
+    notice('error', `切换厂商失败：${res.reason}`)
+    // 失败时地址没变，指纹也就不变 —— 作废缓存强制重建，否则选择器停在新那一项上
+    // 而实际还是旧端点（和 MCP 开关那个谎同一个坑）
+    settingsKey = null
+    await refreshProjectInfo(activeSession()?.id)
+    return
+  }
+  const label = (project.vendors ?? []).find((v) => v.key === key)?.label ?? key
+  notice('info', `已切到 ${label}，接口地址与模型一起写入了 ${res.file}`)
+  await refreshProjectInfo(activeSession()?.id)
+  // 会话的模型被一起换掉了，顶栏和导航徽标得跟着走
+  const session = activeSession()
+  if (session) await refreshSession(session.id)
+}
+
+async function saveBaseUrl(input) {
+  const projectCwd = state.project?.cwd
+  const baseUrl = input.value.trim()
+  if (!projectCwd) {
+    notice('warn', '先选一个项目目录')
+    return
+  }
+  if (!baseUrl) {
+    notice('warn', '接口地址不能为空')
+    return
+  }
+  const res = await invoke('project/set-base-url', { cwd: projectCwd, baseUrl })
+  if (!res.ok) {
+    notice('error', `接口地址没写进去：${res.reason}`)
+    return
+  }
+  notice('info', `接口地址已写入 ${res.file}，立刻对本项目的会话生效`)
+  await refreshProjectInfo(activeSession()?.id)
 }
 
 async function saveDefaultModel(input) {
