@@ -644,25 +644,68 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
       String(d.setDefaultModel?.file).endsWith(path.join('.clauda', 'config.json')),
       d.setDefaultModel?.file,
     )
-    check('落盘的是合法 JSON 且带着新模型', JSON.parse(d.configOnDisk).provider.model === 'desk-model-2', d.configOnDisk)
+    // 模型落在**当前那份档案**上（旧的 `provider.model` 那个位置已经不存在了）
+    check(
+      '落盘的是合法 JSON 且带着新模型',
+      JSON.parse(d.configOnDisk).profiles?.default?.model === 'desk-model-2',
+      d.configOnDisk,
+    )
     check('新会话拿到了新的默认模型', d.openedAfterModel?.model === 'desk-model-2', d.openedAfterModel?.model)
 
-    // ---- 切厂商：地址与模型原子写入，且**只**动这两个键
-    const after = d.configAfterVendor ? JSON.parse(d.configAfterVendor) : {}
+    // ---- 加一份档案：**添加 ≠ 切过去**
+    const added = d.configAfterAdd ? JSON.parse(d.configAfterAdd) : {}
     check(
-      '切厂商把接口地址与模型一起写回了项目配置',
-      after.provider?.baseUrl === 'https://api.deepseek.com/v1' && after.provider?.model === 'deepseek-chat',
-      JSON.stringify(after.provider),
+      '加一份档案把地址与模型一起写进了新档案',
+      added.profiles?.deepseek?.baseUrl === 'https://api.deepseek.com/v1' &&
+        added.profiles?.deepseek?.model === 'deepseek-chat',
+      JSON.stringify(added.profiles?.deepseek),
     )
     check(
-      '写回时只碰被指定的键（provider 其它键与 mcpServers 一字未动）',
-      after.provider?.timeoutMs === 20000 && after.mcpServers !== undefined && Object.keys(after.mcpServers).length === 0,
-      JSON.stringify(after),
+      '加一份档案不会顺手换掉当前使用那份',
+      added.activeProvider === 'default' && added.profiles?.default?.model === 'desk-model-2',
+      JSON.stringify({ activeProvider: added.activeProvider, def: added.profiles?.default }),
+    )
+    check(
+      '写回时只碰被指定的键（provider 段里那些旋钮与 mcpServers 一字未动）',
+      added.provider?.timeoutMs === 20000 &&
+        added.provider?.baseUrl === undefined &&
+        Object.keys(added.mcpServers ?? {}).length === 0,
+      JSON.stringify(added.provider),
     )
     // 这条是这次改动里最容易出事的不变式：`loadConfig()` 会把 `${CLAUDA_API_KEY}` 换成
     // 真实密钥，拿它的结果回写就是把密钥明文落盘
     check(
       '写回的是磁盘原文，${CLAUDA_API_KEY} 没被展开成明文',
+      d.configAfterAdd?.includes('${CLAUDA_API_KEY}') === true && d.configAfterAdd.includes('"mock"') === false,
+      d.configAfterAdd,
+    )
+    const infoAfterAdd = d.projectInfoAfterAdd?.info
+    check(
+      '快照里两份档案都在，新那份标着「不是当前使用」',
+      infoAfterAdd?.profiles?.length === 2 &&
+        infoAfterAdd.profiles.find((p) => p.key === 'deepseek')?.isActive === false &&
+        infoAfterAdd.activeProvider === 'default',
+      JSON.stringify(infoAfterAdd?.profiles?.map((p) => `${p.key}:${p.isActive}`)),
+    )
+    check('加一份档案不动当前生效的地址', infoAfterAdd?.provider?.baseUrl?.includes('localhost'), infoAfterAdd?.provider?.baseUrl)
+
+    // ---- 切当前使用：换的是 activeProvider，档案本身一个字没动
+    const after = d.configAfterVendor ? JSON.parse(d.configAfterVendor) : {}
+    check('切当前使用落在 activeProvider 上', after.activeProvider === 'deepseek', String(after.activeProvider))
+    check(
+      '两份档案都还在（是并存，不是替换）',
+      after.profiles?.default?.model === 'desk-model-2' && after.profiles?.deepseek?.model === 'deepseek-chat',
+      JSON.stringify(Object.keys(after.profiles ?? {})),
+    )
+    check(
+      '写回时只碰被指定的键（provider 段里那些旋钮与 mcpServers 一字未动）',
+      after.provider?.timeoutMs === 20000 &&
+        after.provider?.baseUrl === undefined &&
+        Object.keys(after.mcpServers ?? {}).length === 0,
+      JSON.stringify(after.provider),
+    )
+    check(
+      '切完之后原文里的 ${CLAUDA_API_KEY} 仍是原文',
       d.configAfterVendor?.includes('${CLAUDA_API_KEY}') === true && d.configAfterVendor.includes('"mock"') === false,
       d.configAfterVendor,
     )
@@ -673,9 +716,16 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
     )
     check('切完厂商后新建的会话用新厂商的默认模型', d.openedAfterVendor?.model === 'deepseek-chat', d.openedAfterVendor?.model)
     check(
-      '未知厂商被 channel 层挡下，且没动文件',
+      '未知档案被 channel 层挡下，且没动文件',
       d.badVendor?.ok === false && String(d.badVendor.reason).includes('nope') && d.configAfterBadVendor === d.configAfterVendor,
       JSON.stringify(d.badVendor),
+    )
+    check(
+      '当前使用那份删不掉（删了配置会静默退回内置默认值）',
+      d.removeActive?.ok === false &&
+        String(d.removeActive.reason).includes('当前使用') &&
+        d.configAfterRemoveActive === d.configAfterVendor,
+      JSON.stringify(d.removeActive),
     )
     check(
       '下发的厂商表非空且 key 唯一（renderer 的选择器直接照着它画）',

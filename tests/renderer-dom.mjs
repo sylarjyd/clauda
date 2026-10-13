@@ -145,13 +145,20 @@ export async function bootRenderer() {
    */
   const sendBehavior = { fail: null, dropped: 0 }
   const savedModels = []
-  const savedVendors = []
+  const savedProfileAdds = []
   const savedBaseUrls = []
+  const savedActive = []
+  const savedRemovals = []
+  /**
+   * 两份档案，**当前使用的那份不是列表里的第一份**（顺序按 key 排，`custom` 在前）——
+   * 这样「选中」和「当前使用」混成一套判据时，界面测试立刻能抓到。
+   *
+   * `custom` 的地址故意不是任何预置：默认状态下厂商应该认成「自定义」。
+   */
   const projectInfo = {
     cwd: 'C:/p',
     configFile: 'C:/p/.clauda/config.json',
     provider: {
-      // 故意是不是任何预置的地址：默认状态下厂商应该是「自定义」
       baseUrl: 'http://127.0.0.1:9/v1',
       vendorKey: '__custom__',
       apiKeyHint: '····abcd',
@@ -159,6 +166,31 @@ export async function bootRenderer() {
       temperature: 0.3,
       maxTokens: 4096,
     },
+    profiles: [
+      {
+        key: 'custom',
+        label: 'custom',
+        vendorKey: '__custom__',
+        baseUrl: 'http://127.0.0.1:9/v1',
+        model: 'desk-model',
+        temperature: 0.3,
+        maxTokens: 4096,
+        apiKeyHint: '····abcd',
+        isActive: true,
+      },
+      {
+        key: 'kimi',
+        label: 'Kimi（月之暗面）',
+        vendorKey: 'kimi',
+        baseUrl: 'https://api.moonshot.cn/v1',
+        model: 'kimi-k2.6',
+        temperature: 0,
+        maxTokens: 8192,
+        apiKeyHint: '',
+        isActive: false,
+      },
+    ],
+    activeProvider: 'custom',
     vendors: VENDORS,
     context: { window: 128000, autoCompact: true, compactThreshold: 0.8, maxSteps: 40 },
     permissions: { mode: 'default', allow: ['Read'], deny: ['Bash(rm:*)'] },
@@ -233,26 +265,69 @@ export async function bootRenderer() {
           }
         }
         if (channel === 'project/info') return { ok: true, info: projectInfo }
-        if (channel === 'project/set-default-model') {
-          savedModels.push(payload)
+        if (channel === 'project/set-default-model' || channel === 'project/set-base-url') {
+          if (channel === 'project/set-default-model') savedModels.push(payload)
+          else savedBaseUrls.push(payload)
+          // 真后端写的是**选中的那份档案**（`profileKey`），写完内存里那份模板跟着变，
+          // 随后的 project/info 就是新值。桩里照做 —— 只改那一份，别的一份都不碰：
+          // 这正是「改 B 的地址会不会顺手动了 A」的判据
+          const profile = projectInfo.profiles.find((p) => p.key === payload.profileKey)
+          if (!profile) return { ok: false, reason: `未知档案：${payload.profileKey}` }
+          if (channel === 'project/set-base-url') {
+            profile.baseUrl = payload.baseUrl
+            profile.vendorKey = vendorByBaseUrl(payload.baseUrl)?.key ?? '__custom__'
+            profile.label = vendorByBaseUrl(payload.baseUrl)?.label ?? profile.key
+          } else {
+            profile.model = payload.model
+          }
+          // 当前使用的那份，`provider` 那个解析视图也跟着变
+          if (profile.isActive) Object.assign(projectInfo.provider, {
+            baseUrl: profile.baseUrl,
+            vendorKey: profile.vendorKey,
+            model: profile.model,
+          })
           return { ok: true, file: projectInfo.configFile }
         }
-        if (channel === 'project/set-base-url') {
-          savedBaseUrls.push(payload)
-          // 真后端写完会把内存里那份 config 一起改掉，随后的 project/info 就是新地址。
-          // 桩里也只改地址 —— 厂商该跟着变成什么，是主进程按 baseUrl 推导的
-          projectInfo.provider.baseUrl = payload.baseUrl
-          projectInfo.provider.vendorKey = vendorByBaseUrl(payload.baseUrl)?.key ?? '__custom__'
-          return { ok: true, file: projectInfo.configFile }
-        }
-        if (channel === 'project/set-vendor') {
-          savedVendors.push(payload)
+        if (channel === 'project/add-profile') {
+          savedProfileAdds.push(payload)
           const preset = VENDORS.find((v) => v.key === payload.vendorKey)
-          if (!preset) return { ok: false, reason: `未知厂商：${payload.vendorKey}` }
-          // 地址与模型一起变 —— 这正是「切厂商」与「改默认模型」的区别
-          projectInfo.provider.baseUrl = preset.baseUrl
-          projectInfo.provider.vendorKey = preset.key
-          projectInfo.provider.model = preset.models[0]
+          // 认不出的 key 按「自定义」处理，和主进程一致（`__custom__` 走的就是这条）
+          const key = preset ? preset.key : 'custom-2'
+          if (projectInfo.profiles.some((p) => p.key === key)) return { ok: false, reason: `已经有一份叫「${key}」的档案了` }
+          projectInfo.profiles.push({
+            key,
+            label: preset?.label ?? key,
+            vendorKey: preset?.key ?? '__custom__',
+            baseUrl: preset?.baseUrl ?? '',
+            model: preset?.models[0] ?? '',
+            temperature: 0,
+            maxTokens: 8192,
+            apiKeyHint: '',
+            isActive: false,
+          })
+          return { ok: true, file: projectInfo.configFile, key }
+        }
+        if (channel === 'project/set-active-provider') {
+          savedActive.push(payload)
+          const profile = projectInfo.profiles.find((p) => p.key === payload.profileKey)
+          if (!profile) return { ok: false, reason: `没有这个厂商档案：${payload.profileKey}` }
+          if (!profile.baseUrl || !profile.model) return { ok: false, reason: '这份档案还缺参数' }
+          for (const p of projectInfo.profiles) p.isActive = p.key === profile.key
+          projectInfo.activeProvider = profile.key
+          Object.assign(projectInfo.provider, {
+            baseUrl: profile.baseUrl,
+            vendorKey: profile.vendorKey,
+            model: profile.model,
+            apiKeyHint: profile.apiKeyHint,
+          })
+          return { ok: true, file: projectInfo.configFile }
+        }
+        if (channel === 'project/remove-profile') {
+          savedRemovals.push(payload)
+          const at = projectInfo.profiles.findIndex((p) => p.key === payload.profileKey)
+          if (at < 0) return { ok: false, reason: `没有这个厂商档案：${payload.profileKey}` }
+          if (projectInfo.profiles[at].isActive) return { ok: false, reason: '这是当前使用的厂商，先切到别家再删' }
+          projectInfo.profiles.splice(at, 1)
           return { ok: true, file: projectInfo.configFile }
         }
         // 连不上的服务器：`McpManager.setEnabled` 会抛，channel 层翻成 `{ok:false, reason}`。
@@ -297,8 +372,10 @@ export async function bootRenderer() {
     opened,
     mcp,
     savedModels,
-    savedVendors,
+    savedProfileAdds,
     savedBaseUrls,
+    savedActive,
+    savedRemovals,
     vendors: VENDORS,
     projectInfo,
     /** 送给 `attachment/ingest` 的每一份 payload，断言 renderer 报了些什么 */

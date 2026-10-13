@@ -28,14 +28,26 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-home-'))
 // 会话的 cwd 必须是个临时目录：write_file 会真落盘，写进仓库根目录就污染工作区了
 const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-proj-'))
 fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({ name: 'deskdemo' }), 'utf8')
-// 预先放一份项目配置，用来验「写回时只动 provider 里被指定的键」：
+// 预先放一份项目配置，用来验「写回时只动被指定的那个键」：
 //   - `${CLAUDA_API_KEY}` 是**原文**，写回后必须还是原文（展开了就成明文密钥落盘）
-//   - `timeoutMs` 是 provider 里不该被碰的键，`mcpServers` 在 provider 之外
+//   - `provider` 段里只剩传输旋钮（`timeoutMs`），端点字段住在档案里 —— 这正是
+//     这次改动之后的磁盘形状，写回时**不许**把旋钮一起搬进档案、也不许碰 `mcpServers`
 // 空对象 `mcpServers` 不会真的起服务器，所以下面的「MCP 列表为空」那条不受影响
 fs.mkdirSync(path.join(projectDir, '.clauda'), { recursive: true })
 fs.writeFileSync(
   path.join(projectDir, '.clauda', 'config.json'),
-  JSON.stringify({ provider: { apiKey: '${CLAUDA_API_KEY}', timeoutMs: 20000 }, mcpServers: {} }, null, 2) + '\n',
+  JSON.stringify(
+    {
+      profiles: {
+        default: { baseUrl: `http://localhost:${PORT}/v1`, apiKey: '${CLAUDA_API_KEY}', model: 'desk-model' },
+      },
+      activeProvider: 'default',
+      provider: { timeoutMs: 20000 },
+      mcpServers: {},
+    },
+    null,
+    2,
+  ) + '\n',
   'utf8',
 )
 
@@ -66,12 +78,17 @@ const out = {
   setDefaultModel: null,
   openedAfterModel: null,
   configOnDisk: null,
+  addProfile: null,
+  configAfterAdd: null,
+  projectInfoAfterAdd: null,
   setVendor: null,
   configAfterVendor: null,
   projectInfoAfterVendor: null,
   openedAfterVendor: null,
   badVendor: null,
   configAfterBadVendor: null,
+  removeActive: null,
+  configAfterRemoveActive: null,
   history: null,
   closed: null,
   resumed: null,
@@ -262,13 +279,20 @@ try {
   await app.handle('session/close', { sessionId: c.session.id })
   out.attachResumed = await app.handle('session/resume', { cwd: projectDir, id: c.session.id })
 
-  // 切厂商：**地址与模型一次写完**。只换地址的话，当前会话会拿着旧模型名去问新端点，
-  // 换来的只是个费解的 404。
+  // 加一份厂商档案：**添加 ≠ 切过去**。地址与模型一起落在**新那份档案**上，当前那份
+  // 一个字不动 —— 顺手换掉当前的话，「同时配好几家」就不成立了（配 B 之前得先把 B
+  // 变成当前）。
   //
-  // 必须排在读 `configOnDisk` 之后：提前切会改掉 `provider.model`，
+  // 必须排在读 `configOnDisk` 之后：提前动当前那份的 model，
   // 上面那条「新会话拿到了新的默认模型 = desk-model-2」就变成 deepseek-chat 了
   const configFile = path.join(projectDir, '.clauda', 'config.json')
-  out.setVendor = await app.handle('project/set-vendor', { cwd: projectDir, vendorKey: 'deepseek' })
+  out.addProfile = await app.handle('project/add-profile', { cwd: projectDir, vendorKey: 'deepseek' })
+  out.configAfterAdd = fs.readFileSync(configFile, 'utf8')
+  // 设置页读的就是这条：新那份得在列表里、且**不**是「当前使用」那一份
+  out.projectInfoAfterAdd = await app.handle('project/info', { sessionId: c.session.id })
+
+  // 显式切过去 —— 这是唯一会换厂商的动作
+  out.setVendor = await app.handle('project/set-active-provider', { cwd: projectDir, profileKey: 'deepseek' })
   out.configAfterVendor = fs.readFileSync(configFile, 'utf8')
   // 设置页读的就是这条：它回来的 `vendorKey` 必须与新地址一致，否则界面会显示旧厂商
   out.projectInfoAfterVendor = await app.handle('project/info', { sessionId: c.session.id })
@@ -276,10 +300,14 @@ try {
   out.openedAfterVendor = d.ok ? d.session : null
   if (d.ok) out.sessionIds.push(d.session.id)
 
-  // 未知厂商必须在 channel 层就被挡住：`setVendor` 只接受已解析的 preset，
-  // 于是不存在「写一个界面没提供过的地址」这条路径
-  out.badVendor = await app.handle('project/set-vendor', { cwd: projectDir, vendorKey: 'nope' })
+  // 未知档案必须在 channel 层就被挡住：不存在「写一个界面没提供过的地址」这条路径
+  out.badVendor = await app.handle('project/set-active-provider', { cwd: projectDir, profileKey: 'nope' })
   out.configAfterBadVendor = fs.readFileSync(configFile, 'utf8')
+
+  // 当前使用那份删不掉：删了 `activeProvider` 就指向一个不存在的名字，配置会静默
+  // 退回内置默认值（OpenAI + gpt-4o-mini）—— 那是「什么都没干，请求却换了一家」
+  out.removeActive = await app.handle('project/remove-profile', { cwd: projectDir, profileKey: 'deepseek' })
+  out.configAfterRemoveActive = fs.readFileSync(configFile, 'utf8')
 
   const tQuit = Date.now()
   await app.handle('app/quit')

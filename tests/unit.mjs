@@ -501,14 +501,14 @@ console.log('\n== 配置优先级 ==')
 
     // 写回「默认模型」。**这条是数据泄露的防线**：`loadConfig` 里的 `expandEnvRefs`
     // 会把 `${VAR}` 换成明文，拿它的结果回写等于把密钥落到磁盘上
-    const { writeProjectModel, configPath } = await import(`${dist}config.js`)
+    const { writeProjectProvider, configPath } = await import(`${dist}config.js`)
     const file = configPath(proj)
     process.env.CLAUDA_WRITE_KEY = 'sk-super-secret'
     writeCfg(path.join(proj, '.clauda'), {
       provider: { apiKey: '${CLAUDA_WRITE_KEY}', model: 'old' },
       permissions: { mode: 'auto', allow: [], deny: [] },
     })
-    const written = writeProjectModel(proj, 'new-model')
+    const written = writeProjectProvider(proj, { model: 'new-model' })
     const disk = fs.readFileSync(written, 'utf8')
     check('写回默认模型写在项目配置文件上', written === file, written)
     check('写回后模型真的变了', loadConfig(proj).provider.model === 'new-model', loadConfig(proj).provider.model)
@@ -522,7 +522,7 @@ console.log('\n== 配置优先级 ==')
     fs.writeFileSync(file, broken, 'utf8')
     let threw = ''
     try {
-      writeProjectModel(proj, 'y')
+      writeProjectProvider(proj, { model: 'y' })
     } catch (e) {
       threw = e.message
     }
@@ -592,9 +592,15 @@ console.log('\n== baseUrl 归一化 ==')
 
 console.log('\n== 写回接口地址 / 模型，以及厂商环境变量回退 ==')
 {
-  const { loadConfig, writeProjectProvider, writeProjectModel, configPath, writeConfigTemplate } = await import(
-    `${dist}config.js`
-  )
+  const {
+    loadConfig,
+    writeProjectProvider,
+    writeProjectProfile,
+    writeActiveProfile,
+    removeProjectProfile,
+    configPath,
+    writeConfigTemplate,
+  } = await import(`${dist}config.js`)
   const { findVendor } = await import(`${dist}provider/vendors.js`)
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vendor-home-'))
   const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-vendor-proj-'))
@@ -628,24 +634,59 @@ console.log('\n== 写回接口地址 / 模型，以及厂商环境变量回退 =
     })
     const ds = findVendor('deepseek')
     const written = writeProjectProvider(proj, { baseUrl: ds.baseUrl, model: ds.models[0] })
+    const onDisk = JSON.parse(fs.readFileSync(written, 'utf8'))
     const disk = fs.readFileSync(written, 'utf8')
     check('写回落在项目配置文件上', written === file, written)
     check('地址与模型同时写进去了', loadConfig(proj).provider.baseUrl === ds.baseUrl && loadConfig(proj).provider.model === ds.models[0])
     check('写回保留 ${VAR} 引用，没把密钥明文落盘', disk.includes('${CLAUDA_VENDOR_KEY}'), disk)
     check('写回没把明文密钥写进磁盘', !disk.includes('sk-super-secret'), disk)
-    check('写回不碰 provider 里别的键', JSON.parse(disk).provider.temperature === 7, disk)
-    check('写回不碰别的段落', JSON.parse(disk).permissions.mode === 'auto', disk)
-    check('写回不碰 mcpServers', !!JSON.parse(disk).mcpServers?.demo, disk)
+    // 老文件（端点还住在 `provider` 段里）第一次落笔会被**原样搬**进一份档案，段里只留传输旋钮
+    const key = onDisk.activeProvider
+    check('第一次落笔把端点字段搬进了档案', typeof key === 'string' && !!onDisk.profiles?.[key], disk)
+    check('搬完段里只剩传输旋钮（没有 baseUrl/model 了）', onDisk.provider.baseUrl === undefined && onDisk.provider.model === undefined, JSON.stringify(onDisk.provider))
+    check('搬的时候是整条搬的（temperature 也跟过去了）', onDisk.profiles[key].temperature === 7, disk)
+    check('写回不碰别的段落', onDisk.permissions.mode === 'auto', disk)
+    check('写回不碰 mcpServers', !!onDisk.mcpServers?.demo, disk)
     delete process.env.CLAUDA_VENDOR_KEY
 
     // 没给的键一个都不能碰 —— `{ model: undefined }` 展开进去会把磁盘上原有的抹掉
     const before = fs.readFileSync(file, 'utf8')
     writeProjectProvider(proj, { baseUrl: 'https://api.deepseek.com/v1' })
-    check('只给地址时不碰模型', JSON.parse(fs.readFileSync(file, 'utf8')).provider.model === ds.models[0], before)
+    check('只给地址时不碰模型', JSON.parse(fs.readFileSync(file, 'utf8')).profiles[key].model === ds.models[0], before)
 
-    // writeProjectModel 仍是薄封装，性质一条不少
-    const onlyModel = fs.readFileSync(writeProjectModel(proj, 'some-model'), 'utf8')
-    check('writeProjectModel 仍只改模型', JSON.parse(onlyModel).provider.model === 'some-model' && JSON.parse(onlyModel).provider.baseUrl === ds.baseUrl, onlyModel)
+    // 只给模型时同理，一条薄封装，性质一条不少
+    const onlyModel = JSON.parse(fs.readFileSync(writeProjectProvider(proj, { model: 'some-model' }), 'utf8'))
+    check('只给模型时不碰地址', onlyModel.profiles[key].model === 'some-model' && onlyModel.profiles[key].baseUrl === 'https://api.deepseek.com/v1', JSON.stringify(onlyModel.profiles[key]))
+    check('改完还是那份档案在用', onlyModel.activeProvider === key, String(onlyModel.activeProvider))
+
+    // ---- 多厂商：加一份 / 切当前 / 删一份
+    // 「添加一份」**绝不改当前厂商** —— 会改的话「同时配好几家」就不成立了
+    writeProjectProfile(proj, 'kimi', { baseUrl: 'https://api.moonshot.cn/v1', apiKey: '${KIMI_KEY}', model: 'kimi-k2.6' }, key)
+    const added = JSON.parse(fs.readFileSync(file, 'utf8'))
+    check('新档案写进去了', added.profiles.kimi?.model === 'kimi-k2.6', JSON.stringify(added.profiles))
+    check('加一份档案不会顺手换掉当前那份', added.activeProvider === key, String(added.activeProvider))
+    check('两份档案并存，老那份一个字没动', added.profiles[key].baseUrl === 'https://api.deepseek.com/v1', JSON.stringify(added.profiles[key]))
+    check('新档案的 ${VAR} 也原样保留', JSON.stringify(added.profiles.kimi).includes('${KIMI_KEY}'), JSON.stringify(added.profiles.kimi))
+    check('新档案能解析出来，且不继承老那份的地址', loadConfig(proj).profiles.kimi.baseUrl === 'https://api.moonshot.cn/v1', loadConfig(proj).profiles.kimi.baseUrl)
+    // 继承过来的症状是「切到 B 家，发出去的却是 A 家的 key」—— 拿两份的 key 直接比，
+    // 不去假设开发机上有没有挂着 MOONSHOT_API_KEY
+    check(
+      '新档案不继承老那份的密钥',
+      loadConfig(proj).profiles.kimi.apiKey !== loadConfig(proj).profiles[key].apiKey,
+      `${loadConfig(proj).profiles.kimi.apiKey} vs ${loadConfig(proj).profiles[key].apiKey}`,
+    )
+    check('当前那份仍是老的，没被新档案顶掉', loadConfig(proj).provider.baseUrl === 'https://api.deepseek.com/v1', loadConfig(proj).provider.baseUrl)
+
+    writeActiveProfile(proj, 'kimi')
+    check('切当前之后解析出的是新那份', loadConfig(proj).provider.baseUrl === 'https://api.moonshot.cn/v1', loadConfig(proj).provider.baseUrl)
+    check('切当前不搬家端点字段（档案本来就是它的）', JSON.parse(fs.readFileSync(file, 'utf8')).profiles[key].baseUrl === 'https://api.deepseek.com/v1')
+    check('切完 activeProvider 落在磁盘上', JSON.parse(fs.readFileSync(file, 'utf8')).activeProvider === 'kimi')
+
+    removeProjectProfile(proj, key)
+    const afterRemove = JSON.parse(fs.readFileSync(file, 'utf8'))
+    check('删掉的那份不在文件里了', afterRemove.profiles[key] === undefined, JSON.stringify(afterRemove.profiles))
+    check('删一份不碰别的那份', afterRemove.profiles.kimi?.model === 'kimi-k2.6', JSON.stringify(afterRemove.profiles))
+    check('删完剩下的照旧解析得出来', loadConfig(proj).provider.baseUrl === 'https://api.moonshot.cn/v1', loadConfig(proj).provider.baseUrl)
 
     // 手滑写坏一个逗号不能连累整份配置
     const broken = '{"provider": {"model": "x",}}'
@@ -682,11 +723,16 @@ console.log('\n== 写回接口地址 / 模型，以及厂商环境变量回退 =
     // 生成模板的那份地址与模型必须来自预置表，否则两边会脱节
     const tpl = writeConfigTemplate(proj)
     const tplText = fs.readFileSync(tpl, 'utf8')
+    const tplObj = JSON.parse(tplText)
     check(
       '配置模板的地址与模型来自预置表',
-      JSON.parse(tplText).provider.baseUrl === ds.baseUrl && JSON.parse(tplText).provider.model === ds.models[0],
+      tplObj.profiles?.deepseek?.baseUrl === ds.baseUrl && tplObj.profiles?.deepseek?.model === ds.models[0],
       tplText,
     )
+    // 模板必须自带 activeProvider：少了它，用户第一次打开就会落在「文件里第一个档案」上
+    check('模板声明了当前用的是哪一份', tplObj.activeProvider === 'deepseek', String(tplObj.activeProvider))
+    check('模板不往里塞明文密钥', !/sk-[a-zA-Z0-9]{8,}/.test(tplText), tplText)
+    check('模板能原样解析出预置地址', loadConfig(proj).provider.baseUrl === ds.baseUrl, loadConfig(proj).provider.baseUrl)
     // 模板里的密钥是占位串，不参与这条断言 —— 要验的是「模板能读出预置地址」，
     // 拿真 key 去比会把「模板过期」和「env 回退失效」两件事混在一起
     check('配置模板写在了这个项目的配置路径上', tpl === configPath(proj), tpl)
@@ -1718,6 +1764,18 @@ console.log('\n== 会话管理：切厂商写盘、活会话冻结 ==')
     const config = agentConfig()
     config.provider.baseUrl = 'http://127.0.0.1:9/v1'
     config.provider.model = 'old-model'
+    // 运行时那份 config 是 `loadConfig` 出来的，档案表与 activeProvider 一定在（`resolveProfiles`
+    // 补的）。手动拼的 fixture 得自己补上，否则「加一份档案」没有地方落
+    config.profiles = {
+      legacy: {
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'x',
+        model: 'old-model',
+        temperature: 0,
+        maxTokens: 100,
+      },
+    }
+    config.activeProvider = 'legacy'
 
     /** 每轮真正打到的地址。记的是**建 provider 时那份 config** 里的地址 */
     const hit = []
@@ -1750,14 +1808,26 @@ console.log('\n== 会话管理：切厂商写盘、活会话冻结 ==')
     check('第一轮打的是项目原来的地址', hit.at(-1) === 'http://127.0.0.1:9/v1', JSON.stringify(hit))
 
     const ds = findVendor('deepseek')
-    const file = mgr.setVendor(projDir, ds)
-    const disk = JSON.parse(fs.readFileSync(file, 'utf8'))
+    // 加一份档案：写盘 + 进内存档案表，但**不碰正在用的那份**
+    const added = mgr.addProfile(projDir, ds)
+    const afterAdd = JSON.parse(fs.readFileSync(added.file, 'utf8'))
     check(
-      '切厂商把地址与模型一起写盘（只换地址会留着旧模型名，必 404）',
-      disk.provider.baseUrl === ds.baseUrl && disk.provider.model === ds.models[0],
-      JSON.stringify(disk.provider),
+      '加一份档案把地址与模型一起写盘（只写地址会留着旧模型名，切过去必 404）',
+      afterAdd.profiles.deepseek.baseUrl === ds.baseUrl && afterAdd.profiles.deepseek.model === ds.models[0],
+      JSON.stringify(afterAdd.profiles),
     )
-    check('切厂商同步了内存里那份项目配置（新会话唯一的来源）', config.provider.baseUrl === ds.baseUrl, config.provider.baseUrl)
+    check('加一份档案不会顺手把它设为当前使用', afterAdd.activeProvider === 'legacy', String(afterAdd.activeProvider))
+    check('加一份档案不动内存里那份项目配置', config.provider.baseUrl === 'http://127.0.0.1:9/v1', config.provider.baseUrl)
+
+    // 显式切换：这才是唯一会换厂商的动作
+    const file = mgr.setActiveProfile(projDir, added.key)
+    const disk = JSON.parse(fs.readFileSync(file, 'utf8'))
+    check('切当前使用落在磁盘上', disk.activeProvider === added.key, String(disk.activeProvider))
+    check('切当前使用同步了内存里那份项目配置（新会话唯一的来源）', config.provider.baseUrl === ds.baseUrl, config.provider.baseUrl)
+    // 写这份文件时只写**这份文件里声明过的**档案，别把内存里那份（来自全局/内置层的）
+    // 顺手抄进来 —— 抄了就是把别的文件里的密钥复制到项目里
+    check('写一个档案不会把别的档案抄进这份文件', Object.keys(disk.profiles).join(',') === added.key, JSON.stringify(Object.keys(disk.profiles)))
+    check('内存里那份老档案还在（并存，不是替换）', Object.keys(config.profiles).join(',') === 'legacy,deepseek', JSON.stringify(Object.keys(config.profiles)))
     check(
       '切厂商不动活会话的模型（配置冻结）',
       a.config.provider.model === 'old-model',
@@ -1774,6 +1844,35 @@ console.log('\n== 会话管理：切厂商写盘、活会话冻结 ==')
       hit.at(-1) === 'http://127.0.0.1:9/v1',
       JSON.stringify(hit),
     )
+
+    // ---- 三条会把配置写坏的路径，一律拦在写盘之前
+    /** 跑一段应当抛错的代码，返回错误信息（没抛就是空串） */
+    const threw = (fn) => {
+      try {
+        fn()
+        return ''
+      } catch (e) {
+        return e.message
+      }
+    }
+
+    // 删掉当前那份，`activeProvider` 就指向一个不存在的名字，配置会静默退回内置默认值
+    const delActive = threw(() => mgr.removeProfile(projDir, added.key))
+    check('删当前使用那份会被拦下', delActive.includes('当前使用'), delActive)
+    check('被拦下时文件一字未动', JSON.parse(fs.readFileSync(file, 'utf8')).activeProvider === added.key)
+
+    // 空地址的档案设成当前使用 = 之后每个新会话都打到一个空 URL
+    const custom = mgr.addProfile(projDir, null)
+    check('自定义档案拿到一个不重名的 key', custom.key.length > 0 && custom.key !== added.key, custom.key)
+    const activateEmpty = threw(() => mgr.setActiveProfile(projDir, custom.key))
+    check('缺参数的档案不能设为当前使用', activateEmpty.includes('接口地址'), activateEmpty)
+    const dup = threw(() => mgr.addProfile(projDir, ds))
+    check('加过的 key 再加一次会被拦下', dup.includes('已经有一份'), dup)
+
+    // 删一份**不是当前**的档案是允许的，且不会连累当前那份
+    const removed = JSON.parse(fs.readFileSync(mgr.removeProfile(projDir, custom.key), 'utf8'))
+    check('删非当前那份会真的落盘', removed.profiles[custom.key] === undefined, JSON.stringify(Object.keys(removed.profiles)))
+    check('删非当前那份不碰当前那份', removed.activeProvider === added.key && !!removed.profiles[added.key], JSON.stringify(removed))
   } finally {
     if (prevHome === undefined) delete process.env.CLAUDA_HOME
     else process.env.CLAUDA_HOME = prevHome
@@ -2768,41 +2867,40 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   check('接口地址那一格是可编辑的', baseUrlEdit !== null)
   check('接口地址框里是当前生效的地址', baseUrlEdit?.children[0].value === 'http://127.0.0.1:9/v1', baseUrlEdit?.children[0].value)
 
-  // 厂商选择器：预置 + 自定义。fixture 的地址匹配不到任何预置，所以停在「自定义」
-  const vendorPick = find(body, (n) => n.tagName === 'select')
-  check('厂商那一格是个选择器', vendorPick !== null)
+  // ---- 左栏：所有档案都在，谁在用、正在改谁，三件事各说各的
+  const vendorRowOf = (key) => find(body, (n) => n.dataset?.key === key)
+  const rowsOf = () => (find(body, (n) => n.className === 'vendor-list')?.children ?? []).filter((n) => n.dataset?.key)
+  check('左栏列出了两份档案', rowsOf().length === 2, String(rowsOf().length))
   check(
-    '选项数 = 预置数 + 自定义',
-    vendorPick?.children.length === app.vendors.length + 1,
-    `${vendorPick?.children.length} vs ${app.vendors.length + 1}`,
+    '两份就是 fixture 里那两份（不是只剩当前那份）',
+    rowsOf().map((r) => r.dataset.key).join(',') === 'custom,kimi',
+    rowsOf().map((r) => r.dataset.key).join(','),
   )
-  check('匹配不到预置时选中「自定义」', vendorPick?.value === '__custom__', vendorPick?.value)
+  check('当前使用的那份带徽标', textOf(vendorRowOf('custom')).includes('当前使用'), textOf(vendorRowOf('custom')))
+  check('别的那份没有徽标', !textOf(vendorRowOf('kimi')).includes('当前使用'), textOf(vendorRowOf('kimi')))
+  // 「选中」与「当前使用」是两个状态：默认落在当前使用的 `custom` 上（它不在列表第一位，
+  // 判据混成一套的话这条立刻红）
+  check('默认选中的是当前使用那份', vendorRowOf('custom')?.className.includes('is-selected'), vendorRowOf('custom')?.className)
+  check('选中不靠「当前使用」那个徽标表示', !vendorRowOf('kimi')?.className.includes('is-selected'))
+
+  check('右栏画的是选中那份的接口地址', editLineOf('接口地址')?.children[0].value === 'http://127.0.0.1:9/v1', editLineOf('接口地址')?.children[0].value)
+  check('右栏画的是选中那份的模型', editLineOf('默认模型')?.children[0].value === 'desk-model', editLineOf('默认模型')?.children[0].value)
   const keySourceText = textOf(rowValue('密钥来源'))
   check('自定义地址的密钥来源指向通用变量', keySourceText.includes('CLAUDA_API_KEY'), keySourceText)
 
-  // 换厂商：一次写盘同时改地址和模型，页面还得立刻重画（指纹里漏了 baseUrl 就不动）
-  const deepseek = app.vendors.find((v) => v.key === 'deepseek')
-  vendorPick.value = 'deepseek'
-  vendorPick.fire('change')
+  // ---- 点左栏：只换「正在改谁」，一个请求都不该发
+  const callsBefore = app.calls.length
+  vendorRowOf('kimi').click()
   await tick()
-  check(
-    '选厂商后发了 set-vendor，且带上了 cwd',
-    app.calls.includes('project/set-vendor') && app.savedVendors[0]?.cwd === 'C:/p',
-    JSON.stringify(app.savedVendors),
-  )
-  const repainted = find(body, (n) => n.tagName === 'select')
-  check('切完厂商选择器停在新的那一项上', repainted?.value === 'deepseek', repainted?.value)
-  check('切完厂商接口地址跟着变了', editLineOf('接口地址')?.children[0].value === deepseek.baseUrl, editLineOf('接口地址')?.children[0].value)
-  check(
-    '切完厂商「密钥来源」说得出该设哪个变量',
-    textOf(rowValue('密钥来源')).includes('DEEPSEEK_API_KEY'),
-    textOf(rowValue('密钥来源')),
-  )
-  check(
-    '切完厂商默认模型换成该厂商的',
-    editLineOf('默认模型')?.children[0].value === deepseek.models[0],
-    editLineOf('默认模型')?.children[0].value,
-  )
+  check('点左栏不发任何写请求', app.calls.length === callsBefore, app.calls.slice(callsBefore).join(','))
+  check('点过之后高亮跟着走', vendorRowOf('kimi')?.className.includes('is-selected'), vendorRowOf('kimi')?.className)
+  check('上一份不再高亮', !vendorRowOf('custom')?.className.includes('is-selected'))
+  check('右栏换成了 Kimi 的接口地址', editLineOf('接口地址')?.children[0].value === 'https://api.moonshot.cn/v1', editLineOf('接口地址')?.children[0].value)
+  check('右栏换成了 Kimi 的模型', editLineOf('默认模型')?.children[0].value === 'kimi-k2.6', editLineOf('默认模型')?.children[0].value)
+  check('切换选中之后密钥提示也换了', textOf(rowValue('密钥来源')).includes('MOONSHOT_API_KEY'), textOf(rowValue('密钥来源')))
+  // 预置表里那句坑位提醒是这个表的**主要价值**，得画出来（`modelText` 是切之前抓的，得重取）
+  const kimiNote = app.vendors.find((v) => v.key === 'kimi').note
+  check('右栏带上了该厂商的坑位提醒', textOf(body).includes(kimiNote.slice(0, 12)), `找不到「${kimiNote.slice(0, 12)}」`)
 
   // 候选模型名：点一下只填输入框，**不写盘**
   const modelEdit = editLineOf('默认模型')
@@ -2827,25 +2925,91 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
     app.savedModels.length === savedBefore + 1 && app.savedModels.at(-1).model === 'gpt-x',
     JSON.stringify(app.savedModels),
   )
+  // 写的是**选中的那份**（kimi），不是当前使用的 `custom` —— 这是「同时配多家」的立足点
+  check('存模型带上了选中的档案名', app.savedModels.at(-1).profileKey === 'kimi', JSON.stringify(app.savedModels.at(-1)))
   check('写完提示了写到哪个文件', textOf(app.el('notices')).includes('config.json'), textOf(app.el('notices')))
+  check('改完别的那份（custom）的模型没被动', app.projectInfo.profiles.find((p) => p.key === 'custom').model === 'desk-model')
 
-  // 手填接口地址走另一条通道；「自定义」那一项本身不该发任何请求
-  const vendorCallsBefore = app.savedVendors.length
-  const select2 = find(body, (n) => n.tagName === 'select')
-  select2.value = '__custom__'
-  select2.fire('change')
-  await tick()
-  check('选中「自定义」不发任何请求（没有可写的地址）', app.savedVendors.length === vendorCallsBefore)
-
+  // 手填接口地址走另一条通道，同样带档案名
+  const customUrlBefore = app.projectInfo.profiles.find((p) => p.key === 'custom').baseUrl
+  const zhipu = app.vendors.find((v) => v.key === 'zhipu') ?? app.vendors[2]
   const urlInput = editLineOf('接口地址').children[0]
-  urlInput.value = 'http://localhost:8080'
+  urlInput.value = zhipu.baseUrl
   editLineOf('接口地址').children[1].click()
   await tick()
   check(
-    '点「存为接口地址」发了 set-base-url 且带上了地址',
-    app.savedBaseUrls.at(-1)?.baseUrl === 'http://localhost:8080' && app.savedBaseUrls.at(-1)?.cwd === 'C:/p',
+    '点「存为接口地址」发了 set-base-url、带上地址与档案名',
+    app.savedBaseUrls.at(-1)?.baseUrl === zhipu.baseUrl &&
+      app.savedBaseUrls.at(-1)?.cwd === 'C:/p' &&
+      app.savedBaseUrls.at(-1)?.profileKey === 'kimi',
     JSON.stringify(app.savedBaseUrls),
   )
+  // 厂商 key 由主进程按 baseUrl 反推后下发，界面只查表 —— 换成智谱的地址，密钥来源
+  // 那句真话得跟着变（认错就是「照着设了变量然后对着 401 不知道哪儿错了」）
+  check('换地址后密钥来源跟着推导结果走', textOf(rowValue('密钥来源')).includes('ZHIPU_API_KEY'), textOf(rowValue('密钥来源')))
+  check(
+    '改 kimi 的地址没顺手动了 custom 的',
+    app.projectInfo.profiles.find((p) => p.key === 'custom').baseUrl === customUrlBefore,
+    app.projectInfo.profiles.map((p) => `${p.key}:${p.baseUrl}`).join(' '),
+  )
+
+  // ---- 右栏那两个动作：切当前使用 / 删档案
+  const actionsOf = () => find(body, (n) => n.className === 'vendor-actions')
+  const activateBtn = () => actionsOf().children[0]
+  const removeBtn = () => actionsOf().children[1]
+  check('右栏有「设为当前使用的厂商」', activateBtn().textContent === '设为当前使用的厂商', activateBtn().textContent)
+  check('非当前使用的那份，这个按钮是能点的', activateBtn().disabled === false)
+
+  activateBtn().click()
+  await tick()
+  check('点它发了 set-active-provider 且带上了档案名', app.savedActive.at(-1)?.profileKey === 'kimi', JSON.stringify(app.savedActive))
+  check('切完徽标落到 kimi 上', textOf(vendorRowOf('kimi')).includes('当前使用'), textOf(vendorRowOf('kimi')))
+  check('原来那份的徽标撤了', !textOf(vendorRowOf('custom')).includes('当前使用'), textOf(vendorRowOf('custom')))
+  check('已经是当前使用，按钮就该禁用', activateBtn().disabled === true)
+
+  // ---- 「+ 添加厂商」只列还没配过的那几家
+  const addSelect = find(body, (n) => n.getAttribute('aria-label') === '添加厂商')
+  check('添加厂商那一格是个选择器', addSelect !== null)
+  const addValues = addSelect.children.map((o) => o.value)
+  check('配过的厂商不再出现在添加列表里', !addValues.includes('kimi') && !addValues.includes('custom'), addValues.join(','))
+  check('没配过的那几家在列表里', addValues.includes('deepseek'), addValues.join(','))
+  check('「自定义」排在最后', addValues.at(-1) === '__custom__', addValues.join(','))
+  check('首项是那句占位提示', addValues[0] === '' && addSelect.children[0].textContent === '+ 添加厂商')
+
+  addSelect.value = 'deepseek'
+  addSelect.fire('change')
+  await tick()
+  check('选完发了 add-profile', app.savedProfileAdds.at(-1)?.vendorKey === 'deepseek', JSON.stringify(app.savedProfileAdds))
+  check('下拉自己归位到占位项（它不是个状态）', find(body, (n) => n.getAttribute('aria-label') === '添加厂商').value === '')
+  check('新加的那份出现在左栏', rowsOf().map((r) => r.dataset.key).join(',') === 'custom,kimi,deepseek', rowsOf().map((r) => r.dataset.key).join(','))
+  check('新加的那份被选中（用户接着要填它的地址）', vendorRowOf('deepseek')?.className.includes('is-selected'), vendorRowOf('deepseek')?.className)
+  // 加一份 ≠ 切过去：正在用的还是 kimi
+  check('加一份档案不会顺手把正在用的换掉', textOf(vendorRowOf('kimi')).includes('当前使用'), textOf(vendorRowOf('kimi')))
+
+  // ---- 删档案：两步确认；当前使用那份删不掉
+  check('新加的那份可以删', removeBtn().disabled === false, String(removeBtn().disabled))
+  check('第一步是「删除」两个字', removeBtn().textContent === '删除', removeBtn().textContent)
+  removeBtn().click()
+  await tick()
+  check('点第一下还没删，只换成确认那一对', app.savedRemovals.length === 0, JSON.stringify(app.savedRemovals))
+  const confirmBox = actionsOf().children[1]
+  check('确认那一对是「确认删除 + 取消」', confirmBox.className === 'vendor-confirm' && confirmBox.children.length === 2, confirmBox.className)
+  check('「取消」和「确认删除」一样显眼（都在）', confirmBox.children[1].textContent === '取消', confirmBox.children[1].textContent)
+  confirmBox.children[1].click()
+  await tick()
+  check('点「取消」不发任何请求', app.savedRemovals.length === 0, JSON.stringify(app.savedRemovals))
+  check('取消之后按钮回到「删除」', removeBtn().textContent === '删除', removeBtn().textContent)
+
+  removeBtn().click()
+  await tick()
+  actionsOf().children[1].children[0].click()
+  await tick()
+  check('点「确认删除」才真的删', app.savedRemovals.at(-1)?.profileKey === 'deepseek', JSON.stringify(app.savedRemovals))
+  check('删掉的那份从左栏消失了', rowsOf().map((r) => r.dataset.key).join(',') === 'custom,kimi', rowsOf().map((r) => r.dataset.key).join(','))
+  check('删完之后选中落回当前使用那份', vendorRowOf('kimi')?.className.includes('is-selected'), vendorRowOf('kimi')?.className)
+  // 删掉当前使用那份会让 activeProvider 指向一个不存在的名字，配置会静默退回内置默认值
+  check('当前使用那份的删除按钮是禁用的', removeBtn().disabled === true, String(removeBtn().disabled))
+  check('禁用原因写在 title 上，不是干脆不画', removeBtn().title.includes('当前使用'), removeBtn().title)
 
   app.el('nav-skills').click()
   await tick()

@@ -1,12 +1,17 @@
 import { Agent, type AgentOptions, type SessionSnapshot, type TurnOutcome } from '../agent/agent.js'
 import {
+  completeProfile,
   configPath,
   normalizeBaseUrl,
-  writeProjectModel,
+  removeProjectProfile,
+  writeActiveProfile,
+  writeProjectProfile,
   writeProjectProvider,
   type ClaudaConfig,
   type PermissionMode,
+  type ProjectProviderPatch,
   type ProviderConfig,
+  type ProviderProfile,
 } from '../config.js'
 import { VENDORS, vendorByBaseUrl, type VendorPreset } from '../provider/vendors.js'
 import type { McpServerStatus } from '../mcp/manager.js'
@@ -78,6 +83,30 @@ export interface SessionProject {
 export const CUSTOM_VENDOR = '__custom__'
 
 /**
+ * 一份厂商档案在界面上的样子。设置页左栏按它画列表，右栏按它填参数。
+ *
+ * 和 `ProjectInfo.provider` 的关系：那个是「**当前生效**的那一份」的解析视图（会话与
+ * 顶栏在用），这个是**每一份各自**的视图 —— 两者都是 `config.profiles` 的投影。
+ */
+export interface ProfileInfo {
+  /** 档案名，写进 config.json 的就是它；界面上的操作一律按它定位 */
+  key: string
+  /**
+   * 显示用的名字。认得出厂商就用厂商的 label（「DeepSeek」「豆包（火山方舟）」），
+   * 认不出就用 key —— 名字**由 baseUrl 反推**，不是存下来的（见 `provider/vendors.ts`）。
+   */
+  label: string
+  vendorKey: string
+  baseUrl: string
+  model: string
+  temperature: number
+  maxTokens: number
+  /** 同 `provider.apiKeyHint`：每个档案各遮各的，密钥本身不出主进程 */
+  apiKeyHint: string
+  isActive: boolean
+}
+
+/**
  * 桌面端「模型 / 技能 / MCP」三个设置页要的全部数据。
  *
  * 和 `SessionInfo` 一样是**可序列化快照**：renderer 拿到就能画，不用再问主进程。
@@ -105,6 +134,13 @@ export interface ProjectInfo {
     temperature: number
     maxTokens: number
   }
+  /**
+   * 全部厂商档案，**同时保存了好几份**。`provider` 是其中 `isActive` 那一份的视图，
+   * 这里连别的几份一起给，设置页才能「左选厂商、右配参数」。
+   */
+  profiles: ProfileInfo[]
+  /** 当前用的是哪一份（`profiles` 里的某个 `key`）。**切换 ≠ 选中**，见类注释 */
+  activeProvider: string
   /** 厂商预置表，原样下发给 renderer 画选择器 */
   vendors: readonly VendorPreset[]
   context: {
@@ -173,6 +209,10 @@ interface ProjectEntry {
  *
  * 由此得到一条贯穿设置页的规则：**改配置只对之后新建的会话生效**。「接口地址」「厂商」
  * 「默认模型」三个入口都是这个语义，项目配置在这里只当模板。
+ *
+ * 多厂商把「改哪一份」和「用哪一份」分成了两件事：**选中**（界面上左栏点谁）只决定
+ * 编辑哪一份档案，**当前使用**（`activeProvider`）才决定新会话跟谁说话。两者混成一件
+ * 的话，「同时配置多个厂商」就不成立了 —— 配 B 之前得先把 B 变成正在用的。
  */
 export class SessionManager {
   private readonly sessions = new Map<string, Session>()
@@ -332,6 +372,10 @@ export class SessionManager {
         temperature: cfg.provider.temperature,
         maxTokens: cfg.provider.maxTokens,
       },
+      profiles: Object.entries(cfg.profiles).map(([key, profile]) =>
+        profileInfoOf(key, profile, cfg.activeProvider),
+      ),
+      activeProvider: cfg.activeProvider,
       vendors: VENDORS,
       context: {
         window: cfg.contextWindow,
@@ -352,56 +396,138 @@ export class SessionManager {
   }
 
   /**
-   * 改「默认模型」：写回项目配置文件，**并同步内存里那份 `project.config`**。
+   * 改**某一份档案**的「接口地址 / 默认模型」：写回项目配置文件，并同步内存里那份模板。
+   * 只影响之后新建的会话（已经在跑的会话端点冻在创建那一刻，见 `openSession`）。
    *
-   * 少了后一半就是「改了没生效」：`openSession` 走的是 `structuredClone(project.config)`，
-   * 而它在 `createProjectRuntime` 那一刻就加载完了。项目已经开着时，用户新建的会话仍会拿到
-   * 旧模型 —— 从界面上看和「没改」一模一样。
-   */
-  setDefaultModel(cwd: string, model: string): string {
-    const file = writeProjectModel(cwd, model)
-    const entry = this.projects.get(cwd)
-    if (entry) entry.project.config.provider.model = model
-    return file
-  }
-
-  /**
-   * 改「接口地址」：写回项目配置文件，**并同步内存里那份 `project.config`**，只影响之后
-   * 新建的会话。已经在跑的会话各有自己的 provider，端点冻在创建那一刻（见 `openSession`）。
+   * `profileKey` 是设置页左栏**选中的**那一份，不填则落到当前使用的那份上。
    *
-   * 但内存那份模板**必须**双写：它是新会话唯一的来源，漏了就成了「改了没生效」。
+   * 内存那份模板**必须**双写：它是新会话唯一的来源，而它在 `createProjectRuntime` 那一刻
+   * 就加载完了 —— 漏了这一步就成了「改了没生效」。
    */
-  setDefaultBaseUrl(cwd: string, rawBaseUrl: string): string {
-    // **这里也必须归一化**，不能只在 `loadConfig` 里做：内存里这份模板是新会话唯一的来源，
-    // 留着未归一的原文，新建的会话拿到的地址就和重启后的不一致 —— 表现是「存为」点了，
+  setProfileField(cwd: string, patch: ProjectProviderPatch, profileKey?: string): string {
+    const key = this.profileKeyOf(cwd, profileKey)
+    // **地址在这里也必须归一化**，不能只在 `loadConfig` 里做：内存里这份模板是新会话唯一的
+    // 来源，留着未归一的原文，新建的会话拿到的地址就和重启后的不一致 —— 表现是「存为」点了，
     // 重启前后行为不一样
-    const baseUrl = normalizeBaseUrl(rawBaseUrl)
-    const file = writeProjectProvider(cwd, { baseUrl })
-    const entry = this.projects.get(cwd)
-    if (entry) entry.project.config.provider.baseUrl = baseUrl
+    const normalized: ProjectProviderPatch = { ...patch }
+    if (normalized.baseUrl !== undefined) normalized.baseUrl = normalizeBaseUrl(normalized.baseUrl)
+
+    const file = writeProjectProvider(cwd, normalized, key)
+    this.patchTemplate(cwd, key, normalized)
     return file
   }
 
   /**
-   * 切厂商：**地址与模型一起原子写盘**，只对之后新建的会话生效。
+   * 新增一份厂商档案。地址与模型从**预置表**取（自定义那份留空由用户手填），
+   * 于是和从前一样不存在「写一个界面没提供过的地址」这条路径。
    *
-   * 地址和模型必须一起写：切到 DeepSeek 却留着 `gpt-4o-mini`，换来的只会是一个费解的 404。
+   * **绝不顺手把它切成当前使用的那一份** —— 那正是「同时配置多个厂商」不成立的开始
+   * （配 B 之前得先把 B 变成正在用的）。真要换是 `setActiveProfile` 的事。
    *
-   * 活会话**不跟着换**（和「接口地址」「默认模型」同一条规则，见类注释）。所以这里没有
-   * 刷 `session.config` + `refreshSystemPrompt()` 那一步 —— 那会让「切厂商」变成一个会
-   * 打断正在跑的会话的动作，而它本该只是「以后新建的会话跟谁说话」。
+   * key 由这里定而不是界面给：它要判「已经有哪些档案」，那是主进程才知道的事。
+   * 预置厂商用厂商 key，自定义的用 `custom` / `custom-2`…—— 名字只是给人看的，
+   * **认厂商靠 baseUrl 反推**（`vendorByBaseUrl`），所以不需要用户输入名字。
    */
-  setVendor(cwd: string, preset: VendorPreset): string {
-    const model = preset.models[0]
-    const file = writeProjectProvider(cwd, { baseUrl: preset.baseUrl, model })
-
-    // 同步内存里那份模板配置：它是新会话唯一的来源，不同步就还是旧厂商 —— 与「改了没生效」无异
+  addProfile(cwd: string, preset: VendorPreset | null): { file: string; key: string } {
     const entry = this.projects.get(cwd)
-    if (entry) {
-      entry.project.config.provider.baseUrl = preset.baseUrl
-      if (model) entry.project.config.provider.model = model
-    }
+    if (!entry) throw new Error('项目运行时还没就绪，加不了厂商档案')
+    const cfg = entry.project.config
+
+    const key = preset ? preset.key : freeKey(cfg.profiles, 'custom')
+    if (cfg.profiles[key]) throw new Error(`已经有一份叫「${key}」的档案了`)
+
+    const profile: Partial<ProviderProfile> = preset
+      ? { baseUrl: preset.baseUrl, model: preset.models[0] }
+      : // 自定义那份**故意不填地址**：填个内置默认地址就成了「静默指向 OpenAI」。
+        // 空地址的档案切不过去（见 `setActiveProfile`），也就不会跑到一个没人配过的地方去
+        { baseUrl: '', apiKey: '', model: '' }
+
+    const file = writeProjectProfile(cwd, key, profile, cfg.activeProvider)
+    // 补成完整的再放进模板：`projectInfo` 拿到就能画，不用再猜哪个字段可能是 undefined
+    cfg.profiles[key] = completeProfile(profile)
+    return { file, key }
+  }
+
+  /**
+   * 把某一份档案切成「当前使用」。写盘 + 同步模板，只影响之后新建的会话。
+   *
+   * 参数不合法就**抛**：调用方是 IPC 通道，外层那个 catch 会把消息翻成 `{ok:false, reason}`，
+   * 用户看到的就是一句人话。
+   */
+  setActiveProfile(cwd: string, key: string): string {
+    const entry = this.projects.get(cwd)
+    const profile = entry?.project.config.profiles[key]
+    if (!entry || !profile) throw new Error(`没有这个厂商档案：${key}`)
+    // 缺地址或模型时切过去，换来的只是一串连不上的报错 / 400。挡住，并说清缺什么
+    const missing: string[] = []
+    if (!profile.baseUrl) missing.push('接口地址')
+    if (!profile.model) missing.push('默认模型')
+    if (missing.length > 0) throw new Error(`这份档案还缺${missing.join('和')}，填好了才能设为当前使用`)
+
+    const file = writeActiveProfile(cwd, key)
+    entry.project.config.activeProvider = key
+    this.syncTemplate(cwd)
     return file
+  }
+
+  /**
+   * 删掉一份档案。**当前使用的那份不许删**：删了 `activeProvider` 就指向一个不存在的名字，
+   * 配置会静默退回内置默认值（OpenAI + gpt-4o-mini）—— 那是个「配置里写着 DeepSeek，
+   * 跑起来打的是 OpenAI」的坑，`config.ts` 把「调用方先确认」写进了契约，这里是那个调用方。
+   */
+  removeProfile(cwd: string, key: string): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，删不了厂商档案')
+    const cfg = entry.project.config
+    if (!cfg.profiles[key]) throw new Error(`没有这个厂商档案：${key}`)
+    if (key === cfg.activeProvider) throw new Error('这是当前使用的厂商，先切到别家再删')
+
+    const file = removeProjectProfile(cwd, key)
+    delete cfg.profiles[key]
+    return file
+  }
+
+  /**
+   * 往哪个档案上写：界面给的那个（左栏选中的）> 当前使用的那份。
+   *
+   * 不写成「只认当前那份」是因为多厂商下这两者**经常不是一回事** —— 用户在左栏选了
+   * DeepSeek 改地址，改的必须是 DeepSeek 那份，而不是此刻正在用的 Kimi。
+   */
+  private profileKeyOf(cwd: string, profileKey?: string): string {
+    return profileKey || this.projects.get(cwd)?.project.config.activeProvider || ''
+  }
+
+  /**
+   * 改完盘上的档案之后，把内存里那份**模板配置**补成一样的 —— 它是新会话唯一的来源
+   * （`openSession` 走 `structuredClone`），漏一步就表现成「改了没生效」。
+   *
+   * 这里**不重新 `loadConfig`**：那条路会跑 dotenv，而 dotenv 改的是全局 `process.env`
+   * 且不覆盖已存在的键 —— `project.ts` 把 `loadConfig` 包在 env 快照里正是为了挡它
+   * （同时开着 A、B 两个项目时，先加载的那个会把键留在环境里，后加载的静默继承）。
+   * 在这里重跑一遍等于把那个坑重新挖开。
+   */
+  private patchTemplate(cwd: string, key: string, patch: Partial<ProviderProfile>): void {
+    const entry = this.projects.get(cwd)
+    if (!entry) return
+    const cfg = entry.project.config
+    cfg.profiles[key] = completeProfile({ ...cfg.profiles[key], ...patch })
+    this.syncTemplate(cwd)
+  }
+
+  /**
+   * 把当前档案的字段刷进 `cfg.provider`。规则与 `loadConfig` 的 `resolveProfiles` 同源：
+   * **端点类字段一概以当前档案为准**，`provider` 段只剩传输旋钮（`timeoutMs` 那些）。
+   *
+   * 一份同步实现，省得每个改动点各写一遍「顺便把 provider 也改了」—— 漏一处的症状是
+   * 「切过去了，但新会话打的是旧地址」。
+   */
+  private syncTemplate(cwd: string): void {
+    const entry = this.projects.get(cwd)
+    if (!entry) return
+    const cfg = entry.project.config
+    const active = cfg.profiles[cfg.activeProvider]
+    // 只覆盖档案那五个字段：`Object.assign` 进来的是完整的 `ProviderProfile`
+    if (active) Object.assign(cfg.provider, active)
   }
 
   setModel(sessionId: string, model: string): void {
@@ -498,4 +624,34 @@ export class SessionManager {
 /** 密钥只回末尾四位。空串原样返回，好让 UI 分得清「没配」和「配了」 */
 function maskKey(key: string): string {
   return key ? `····${key.slice(-4)}` : ''
+}
+
+function profileInfoOf(key: string, profile: ProviderProfile, activeKey: string): ProfileInfo {
+  const preset = vendorByBaseUrl(profile.baseUrl)
+  return {
+    key,
+    // 厂商名由 baseUrl 反推，反推不到才用档案名 —— 界面不自己判（见 `vendors.ts` 的注释）
+    label: preset?.label ?? key,
+    vendorKey: preset?.key ?? CUSTOM_VENDOR,
+    baseUrl: profile.baseUrl,
+    model: profile.model,
+    temperature: profile.temperature,
+    maxTokens: profile.maxTokens,
+    apiKeyHint: maskKey(profile.apiKey),
+    isActive: key === activeKey,
+  }
+}
+
+/**
+ * 挑一个没被占用的档案名：先试 `custom`，被占了就 `custom-2`、`custom-3`…
+ *
+ * 为什么不让用户起名字：名字对**认厂商**毫无作用（那边靠 baseUrl 反推），多一个输入框
+ * 只会多一种「填了个不存在的名字然后找不到自己那家」的状态。
+ */
+function freeKey(existing: Record<string, unknown>, base: string): string {
+  if (!existing[base]) return base
+  for (let i = 2; ; i++) {
+    const key = `${base}-${i}`
+    if (!existing[key]) return key
+  }
 }

@@ -974,12 +974,94 @@ button.new-session:hover:not(:disabled) {
   max-width: 320px;
 }
 
-/* 厂商选择器。坑位提醒（preset.note）挂在它下面，换行显示 */
-.vendor-pick {
+/* ---- 供应商：左栏选档案、右栏配参数 ----
+   两栏而不是一个下拉框：多厂商要同时回答「我配过哪几家」「现在用哪家」「正在改哪家」，
+   一个下拉框只能答最后一个。 */
+
+.vendor-pane {
+  display: grid;
+  grid-template-columns: minmax(150px, 200px) minmax(0, 1fr);
+}
+
+.vendor-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  align-items: flex-start;
+  gap: 2px;
+  padding: 8px;
+  border-right: 1px solid var(--line);
+  background: var(--bg-sunken);
+}
+
+/* 「选中」和「当前使用」是两件事，样式也必须分开：
+   选中 = 右边正在编辑谁（实底），当前使用 = 新会话跟谁说话（徽标） */
+.vendor-row.is-selected {
+  background: var(--bg-raise);
+  border-color: var(--line-strong);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.vendor-row .rail-badge.is-active {
+  color: var(--accent);
+}
+
+/* 徽标位不放东西时也别让行高跳一下 */
+.vendor-row .rail-badge:empty::after {
+  content: '\200b';
+}
+
+.vendor-add {
+  padding: 4px 0 0;
+}
+
+.vendor-add select {
+  width: 100%;
+  font-size: 11.5px;
+  padding: 3px 4px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px dashed var(--line-strong);
+  border-radius: 6px;
+}
+
+.vendor-add select:hover {
+  color: var(--text);
+  border-style: solid;
+}
+
+.vendor-config {
+  min-width: 0;
+}
+
+/* 右栏的行沿用 `.set-row` 的两列网格（测试也是按 `.set-row` 找行的），
+   但分隔线要自己补 —— `.set-row + .set-row` 只管 `.set-rows` 的直接孩子 */
+.vendor-config .set-row + .set-row {
+  border-top: 1px solid var(--line);
+}
+
+/* 坑位提醒（豆包要 /api/coding/v3、智谱是 /v4…）铺满右栏 */
+.vendor-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.vendor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.vendor-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .set-val select {

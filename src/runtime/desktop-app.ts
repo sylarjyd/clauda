@@ -137,12 +137,16 @@ export class DesktopApp {
             return info ? { ok: true, info } : { ok: false, reason: '项目运行时还没就绪' }
           })
 
+        /**
+         * 改**某一份档案**的接口地址 / 默认模型。`profileKey` 是设置页左栏选中的那份，
+         * 不带就落到当前使用的那份上。
+         */
         case 'project/set-default-model': {
           const model = str(payload, 'model').trim()
           if (!model) return { ok: false, reason: '模型名不能为空' }
           return withStr(payload, 'cwd', (cwd) => ({
             ok: true,
-            file: this.manager.setDefaultModel(cwd, model),
+            file: this.manager.setProfileField(cwd, { model }, str(payload, 'profileKey')),
           }))
         }
 
@@ -151,26 +155,44 @@ export class DesktopApp {
           if (!baseUrl) return { ok: false, reason: '接口地址不能为空' }
           return withStr(payload, 'cwd', (cwd) => ({
             ok: true,
-            file: this.manager.setDefaultBaseUrl(cwd, baseUrl),
+            file: this.manager.setProfileField(cwd, { baseUrl }, str(payload, 'profileKey')),
           }))
         }
 
         /**
-         * 切厂商：地址与模型一次写完（理由见 `SessionManager.setVendor`）。
+         * 添加一份厂商档案。地址与模型从预置表取，于是和从前一样不存在「写一个界面没
+         * 提供过的地址」这条路径；自定义那份地址留空，由用户手填（走 `set-base-url`）。
          *
-         * **候选集校验就放在这一层**：`setVendor` 只接受已解析的 preset，于是不存在
-         * 「写一个界面没提供过的地址」这条路径。
+         * **认不出的 key 一律按自定义处理** —— `__custom__` 走的就是这条（`findVendor`
+         * 里没有它）。真要做成「未知厂商报错」，那个哨兵值就得在这一层再认一次。
          */
-        case 'project/set-vendor': {
+        case 'project/add-profile': {
           const key = str(payload, 'vendorKey')
-          const preset = findVendor(key)
-          // `__custom__` 也会走到这里：它没有可写的地址，只能是手动调这个通道的
-          if (!preset) return { ok: false, reason: `未知厂商：${key}` }
+          if (!key) return { ok: false, reason: '缺少参数 vendorKey' }
+          return withStr(payload, 'cwd', (cwd) => {
+            const added = this.manager.addProfile(cwd, findVendor(key) ?? null)
+            return { ok: true, file: added.file, key: added.key }
+          })
+        }
+
+        /**
+         * 切换当前使用的档案。**这条才是「换厂商」**，`project/add-profile` 只加不改。
+         *
+         * 参数不合法由 `setActiveProfile` 抛，外层 catch 翻成 `{ok:false, reason}` ——
+         * 「档案不存在」「还缺接口地址」那几句人话就是用户看到的提示。
+         */
+        case 'project/set-active-provider':
           return withStr(payload, 'cwd', (cwd) => ({
             ok: true,
-            file: this.manager.setVendor(cwd, preset),
+            file: this.manager.setActiveProfile(cwd, str(payload, 'profileKey')),
           }))
-        }
+
+        /** 删掉一份档案。当前使用的那份删不了（理由见 `SessionManager.removeProfile`） */
+        case 'project/remove-profile':
+          return withStr(payload, 'cwd', (cwd) => ({
+            ok: true,
+            file: this.manager.removeProfile(cwd, str(payload, 'profileKey')),
+          }))
 
         case 'app/quit':
           await this.manager.disposeAll()

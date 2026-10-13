@@ -142,20 +142,31 @@
   同一处：`loadSession` 解析出来还要过 `isSessionRecord`，随便一个 `.json` 都能
   `JSON.parse` 成功，而恢复会话的人拿 `messages` 直接用（`persistSession` 读 `.length`）。
 - **写配置文件只能改磁盘上的原始文本，不许拿 `loadConfig()` 的结果回写**
-  （`config.ts` 的 `writeProjectProvider`，`writeProjectModel` 只是它的薄封装）。
+  （`config.ts` 的 `writeProjectProvider` / `writeProjectProfile` / `writeActiveProfile` /
+  `removeProjectProfile`，一律经 `readJsonObjectForWrite` 读原文）。
   `loadConfig` 内部的 `expandEnvRefs` 已经把 `${MY_KEY}` 换成了真实密钥，拿它回写等于把
   密钥明文落盘 —— 这是数据泄露，不是格式问题。同一处：改了默认模型／接口地址还要**同步
   内存里的 `project.config`**，因为它是新建会话**唯一**的来源（`openSession` 走的是
   `structuredClone(project.config)`），漏了就成了「改了没生效」；文件解析不了时**报错返回、
-  不覆盖**，别为了容错丢掉整份配置。
+  不覆盖**，别为了容错丢掉整份配置。同步**不许图省事重跑 `loadConfig`** —— 它内部的
+  `dotenv.config` 会改全局 `process.env`（见下面 `createProjectRuntime` 那条），
+  `SessionManager.patchTemplate` + `syncTemplate` 就是在内存里做 `resolveProfiles` 那一件事。
+- **厂商档案是唯一真源，`provider` 段只剩传输旋钮**（`profiles` + `activeProvider`，
+  见 `resolveProfiles`）。`cfg.provider` 是「当前生效那份」的解析视图，所以十来处
+  `cfg.provider.model` 的读取点一个字都不用改。遗留字段（老文件里端点还住在 `provider` 段）
+  只在内存里**折进同名档案**，绝不写盘；真落笔时由 `ensureProfileShape` 把它们**原样搬**
+  进新档案（搬的是磁盘原文，`"${DEEPSEEK_API_KEY}"` 搬过去还是占位符）。
 - **改配置一律只对之后新建的会话生效**（`SessionManager` 的类注释）。端点、密钥、模型在
   `openSession` 那一刻就定死了：每个会话有**自己的 provider 实例**，而 `Agent.opts.provider`
-  构造后不可变。设置页三个入口（接口地址 / 厂商 / 默认模型）全是这个语义，活会话一个都不动。
-  其中 **`setVendor` 必须「地址 + 模型」一次写完**（`SessionManager.setVendor`）：只换地址的话，
-  新会话会拿着旧模型名去问新端点（`gpt-4o-mini` 问 DeepSeek），换来的只是一个费解的 404。
-  历史：2026-10 之前端点与厂商是**项目级立刻生效**的（全项目共享一个 provider 实例，`setVendor`
-  还会刷所有活会话的模型 + 重建系统提示词）。那让「切厂商」变成一个会打断正在跑的会话的动作，
-  也让同一个设置页要同时讲两套作用范围，于是统一成了现在这一条。
+  构造后不可变。接口地址 / 默认模型 / 加档案三个入口全是这个语义，活会话一个都不动。
+  **加一份档案 ≠ 切过去**（`writeProjectProfile` 绝不改 `activeProvider`）：会改的话
+  「同时配好几家」就不成立了 —— 配 B 之前得先把 B 变成当前。真要换是 `writeActiveProfile`，
+  界面上对应一个显式按钮，且**缺地址或模型的档案不许设为当前**（否则之后每个新会话都打到
+  空 URL）。**当前使用那份也不许删**：删了 `activeProvider` 就指向一个不存在的名字，
+  配置会静默退回内置默认值（OpenAI + `gpt-4o-mini`），症状是「什么都没干，请求却换了一家」。
+  历史：2026-10 之前端点与厂商是**项目级立刻生效**的（全项目共享一个 provider 实例，
+  切厂商还会刷所有活会话的模型 + 重建系统提示词）。那让「切厂商」变成一个会打断正在跑的
+  会话的动作，也让同一个设置页要同时讲两套作用范围，于是统一成了现在这一条。
 - **provider 的 client 在 `stream()` 开头跟 `cfg` 对一次**（`provider/openai.ts` 的
   `syncClient`）。`new OpenAI({ baseURL })` 是构造函数里建好的快照，不同步的话 `cfg` 改了而请求
   发往旧地址，**且不报任何错**（症状是「改了没反应」）。当前这条**永远不会触发** —— 端点冻结在
@@ -227,6 +238,14 @@
   流式输出期间每一帧都会重画整块，「默认模型」输入框当场失焦。**反过来也有坑**：MCP
   开关失败时服务器状态没变、指纹就不变，光重拉会判定「无变化」直接返回，开关停在用户
   刚拨过去的那一侧 —— 正是这次要修的那个谎，所以失败路径要显式作废指纹。
+- **厂商那一块是左选右配，而「选中」不是「当前使用」**（`app.js` 的 `vendorPane`）。
+  左栏点一行只换**正在编辑哪一份**（`selectedProfile`，纯界面状态），一个请求都不发；
+  真正的切换只有右栏那个显式的「设为当前使用的厂商」。把两者合并（点谁就切谁）会让
+  「同时配好几家」立刻不成立 —— 想改 B 的地址得先把 B 变成当前。两个状态在指纹里各占
+  一格（`selectedProfile` **加上** `project.activeProvider`），少一个的症状是「点了左栏，
+  右栏纹丝不动」。指纹里那份 `profiles` 摘要要带上 `baseUrl`：只比对 key 的话，改完
+  地址界面不重画，看着像没保存。删档案走**两步内联确认**（`pendingRemove`，也进指纹），
+  不复用 `renderModal` —— 那个宿主被授权请求用 `dataset.key` 占着。
 - **展示文案不要在这里另造**：MCP 开销提示走 `src/runtime/mcp-cost.ts` 的
   `infoText` / `warnText`（纯文本、不含 ANSI，CLI 与桌面端共用），技能空态抄
   `repl.ts` 里 `/skills` 那句。两处各写一套的话，改了阈值或口径没人会想起来去对齐另一边。

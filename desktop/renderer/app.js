@@ -73,7 +73,7 @@ const MCP_STATE = { connected: '已连接', failed: '失败', disabled: '未启�
 const SETTINGS_META = {
   model: {
     title: '模型配置',
-    sub: '当前项目解析后的生效配置。这里改的厂商、接口地址、默认模型**只决定之后新建的会话**用哪个 —— 已经开着的会话在创建那一刻就把端点和模型定下来了，改这里动不了它们。当前会话的模型在中栏顶栏上改。',
+    sub: '同一个项目可以同时存好几家厂商的档案：左栏点一份来编辑，右栏改它的参数。徽标标出哪一份**当前使用**，加一份档案不会顺手把正在用的那份换掉。这里改的任何东西都**只决定之后新建的会话**用哪一家 —— 已经开着的会话在创建那一刻就把端点和模型定下来了，改这里动不了它们。当前会话的模型在中栏顶栏上改。',
   },
   skills: {
     title: '技能',
@@ -252,6 +252,15 @@ function renderView() {
  */
 let settingsKey = null
 
+/**
+ * 左栏**选中**要编辑的那份档案，以及正在等第二次确认的删除。
+ *
+ * 两个都是**纯界面状态**：「选中」不是「当前使用」（后者在主进程那边，只有点
+ * 「设为当前使用的厂商」才变），删除的两步确认也只是为了让不可逆的动作慢一格。
+ */
+let selectedProfile = null
+let pendingRemove = null
+
 function renderSettings() {
   const meta = SETTINGS_META[state.view]
   if (!meta) return
@@ -259,6 +268,8 @@ function renderSettings() {
 
   if (!project) {
     settingsKey = null
+    selectedProfile = null
+    pendingRemove = null
     els.settingsTitle.textContent = meta.title
     els.settingsSub.textContent = meta.sub
     els.settingsBody.replaceChildren(
@@ -267,12 +278,21 @@ function renderSettings() {
     return
   }
 
-  // baseUrl 必须并进指纹：切厂商改的就是它，漏了就变成「点完厂商页面纹丝不动」
+  // 选中那份落回真实存在的档案上：删掉、或者换了项目之后，`selectedProfile` 可能指向
+  // 一个已经没有的名字。写回解析结果，指纹才是稳定的
+  selectedProfile = selectedProfileOf(project)?.key ?? null
+
+  // 档案的每一份都要并进指纹（key/地址/模型/密钥提示任何一个变了都得重画），
+  // 选中的哪一份也要 —— 点了左栏不重画的话，右栏看起来纹丝不动，像点了个没用的东西
   const key = [
     state.view,
     project.cwd,
-    project.provider.baseUrl,
-    project.provider.model,
+    project.activeProvider,
+    selectedProfile,
+    pendingRemove,
+    (project.profiles ?? [])
+      .map((p) => `${p.key}:${p.baseUrl}:${p.model}:${p.apiKeyHint}`)
+      .join(','),
     mcpFingerprint(project),
   ].join('|')
   els.settingsTitle.textContent = meta.title
@@ -293,21 +313,12 @@ function mcpFingerprint(project) {
 // ------------------------------------------------------------ 模型配置页
 
 function modelSections(project) {
-  const { provider, context, permissions } = project
-  const preset = vendorOf(project)
+  const { context, permissions } = project
 
   return [
-    section('供应商', [
-      row('厂商', vendorSelect(project)),
-      row('接口地址', editBaseUrl(provider)),
-      row('密钥', provider.apiKeyHint ? mono(provider.apiKeyHint) : dim('没有可用的密钥')),
-      row('密钥来源', keySource(preset)),
-      row('默认模型', editModel(provider.model, preset ? preset.models : [])),
-    ]),
-    section('推理', [
-      row('温度', mono(String(provider.temperature))),
-      row('最大输出', mono(`${provider.maxTokens} token`)),
-    ]),
+    // 温度 / 最大输出不算独立一节：它们和地址、密钥一样是**某一份档案**的属性，
+    // 单列出去之后「这份档案的温度」和「那份档案的温度」就分不出来了
+    section('供应商', [vendorPane(project)]),
     section('上下文', [
       row('窗口大小', mono(`${context.window} token`)),
       row('自动压缩', mono(context.autoCompact ? `开启（占用超过 ${context.compactThreshold} 时触发）` : '关闭')),
@@ -326,51 +337,237 @@ function modelSections(project) {
 }
 
 /**
- * 当前厂商。**主进程按 baseUrl 推导好 key 才下发**（renderer 走 `app://`，
- * import 不到 `dist/provider/vendors.js`），这里只按 key 查表、不自己判 ——
- * 两边各写一套判据，迟早互相矛盾。
+ * 「供应商」那一整块：**左栏列出所有档案，右栏是选中那份的参数**。
+ *
+ * 一个下拉框回答不了多厂商下的三个问题 —— 我配过哪几家、现在用哪家、正在改哪家。
+ * 左栏把「有哪些」画出来，徽标标出「当前使用」，高亮标出「正在改」。
  */
-function vendorOf(project) {
-  return (project.vendors ?? []).find((v) => v.key === project.provider.vendorKey) ?? null
+function vendorPane(project) {
+  const profiles = project.profiles ?? []
+  const selected = selectedProfileOf(project)
+  const preset = selected ? presetOf(project, selected) : null
+
+  const list = document.createElement('div')
+  list.className = 'vendor-list'
+  for (const profile of profiles) list.append(vendorRow(profile, profile.key === selected?.key))
+  list.append(vendorAdd(project))
+
+  const config = document.createElement('div')
+  config.className = 'vendor-config'
+  if (selected) config.append(...vendorRows(project, selected, preset))
+
+  const pane = document.createElement('div')
+  pane.className = 'vendor-pane'
+  pane.append(list, config)
+  return pane
 }
 
-/** 厂商选择器。选了就**立刻写盘**（地址 + 模型原子写入），没有二次确认 */
-function vendorSelect(project) {
+/**
+ * 左栏一行。`dataset.key` 是**给测试用的把手**（按它精确点到某一份，不用按下标猜），
+ * 也让「这一行是哪份档案」在 DOM 上看得见。
+ */
+function vendorRow(profile, isSelected) {
+  const row = document.createElement('button')
+  row.type = 'button'
+  // 借 `rail-item` 的观感（同样的 flex 布局、hover、圆角），但**不用 `is-current`** ——
+  // 那个在左导航里是「当前视图」，这里的「选中」是另一回事
+  row.className = `rail-item vendor-row${isSelected ? ' is-selected' : ''}`
+  row.dataset.key = profile.key
+  row.title = profile.baseUrl || '（还没填接口地址）'
+
+  const name = document.createElement('span')
+  name.className = 'rail-label'
+  name.textContent = profile.label
+
+  // 徽标位只放状态，不占第二行
+  const badge = document.createElement('span')
+  badge.className = `rail-badge${profile.isActive ? ' is-active' : ''}`
+  badge.textContent = profile.isActive ? '当前使用' : profile.baseUrl ? '' : '未填地址'
+
+  row.append(name, badge)
+  row.addEventListener('click', () => {
+    // 换编辑目标 = 上一次的删除念头作废（那是个两步确认，见 `removeButton`）
+    selectedProfile = profile.key
+    pendingRemove = null
+    render()
+  })
+  return row
+}
+
+/**
+ * 「+ 添加厂商」。**这是一个命令，不是一个状态** —— 选完立刻归位到「+ 添加厂商」那一项，
+ * 失败时也不会停在刚选的那一项上装作已经加上了。
+ *
+ * 只列**还没有的**预置厂商：已经配过的那家该去左栏点它，而不是再添一份重名的。
+ */
+function vendorAdd(project) {
   const box = document.createElement('div')
-  box.className = 'vendor-pick'
+  box.className = 'vendor-add'
 
   const select = document.createElement('select')
-  select.setAttribute('aria-label', '厂商')
+  select.setAttribute('aria-label', '添加厂商')
+  const none = document.createElement('option')
+  none.value = ''
+  none.textContent = '+ 添加厂商'
+  select.append(none)
+
   for (const vendor of project.vendors ?? []) {
+    if ((project.profiles ?? []).some((p) => p.key === vendor.key)) continue
     const option = document.createElement('option')
     option.value = vendor.key
     option.textContent = vendor.label
     select.append(option)
   }
-  // 「自定义」排最后，兜住手填的地址（各家的区域变体、公司自建网关）
+  // 「自定义」排最后，兜住各家的区域变体、公司自建网关。它的地址留空，由用户自己填 ——
+  // 预先塞一个内置默认地址就成了「静默指向 OpenAI」
   const custom = document.createElement('option')
   custom.value = '__custom__'
   custom.textContent = '自定义（自己填接口地址）'
   select.append(custom)
-  // **全部 append 完再设 value**：顺序反了选项还不存在，真浏览器里相当于没选中
-  select.value = project.provider.vendorKey
-  select.addEventListener('change', () => void saveVendor(project, select.value))
-  box.append(select)
 
-  // 各家的坑（豆包要 /api/coding/v3、智谱是 /v4…）由预置表出，界面只负责摆位置
-  const preset = vendorOf(project)
-  if (preset?.note) box.append(dim(preset.note))
+  select.value = ''
+  select.addEventListener('change', () => {
+    const chosen = select.value
+    select.value = ''
+    void addProfile(project, chosen)
+  })
+  box.append(select)
   return box
 }
 
-function editBaseUrl(provider) {
-  return editLine('接口地址', provider.baseUrl, '存为接口地址', '写回项目配置文件，只影响之后新建的会话', saveBaseUrl)
+function vendorRows(project, profile, preset) {
+  return [
+    row(
+      '接口地址',
+      editLine('接口地址', profile.baseUrl, '存为接口地址', '写回项目配置文件，只影响之后新建的会话', (input) =>
+        saveBaseUrl(project, profile, input),
+      ),
+    ),
+    row('密钥', profile.apiKeyHint ? mono(profile.apiKeyHint) : dim('没有可用的密钥')),
+    row('密钥来源', keySource(preset)),
+    row('默认模型', editModel(project, profile, preset ? preset.models : [])),
+    row('温度', mono(String(profile.temperature))),
+    row('最大输出', mono(`${profile.maxTokens} token`)),
+    // 各家的坑（豆包要 /api/coding/v3、智谱是 /v4…）由预置表出，界面只负责摆位置
+    ...(preset?.note ? [noteLine(preset.note)] : []),
+    actionsRow(project, profile),
+  ]
 }
 
-function editModel(current, models) {
+/**
+ * 一个以按钮为值的「行」。不是 `.set-row`：那是个 132px + 1fr 的两列网格，按钮不需要
+ * 左边那一列，硬套上去反而要写一堆 `grid-column` 覆盖。
+ */
+function actionsRow(project, profile) {
+  const box = document.createElement('div')
+  box.className = 'vendor-actions'
+
+  const activate = document.createElement('button')
+  activate.type = 'button'
+  activate.textContent = '设为当前使用的厂商'
+  activate.disabled = profile.isActive || !profile.baseUrl || !profile.model
+  activate.title = profile.isActive
+    ? '已经是当前使用的厂商了'
+    : !profile.baseUrl || !profile.model
+      ? '先填好接口地址和默认模型'
+      : '之后的**新**会话会用它说话；已经开着的会话不受影响'
+  activate.addEventListener('click', () => void activateProfile(project, profile))
+  box.append(activate)
+
+  box.append(
+    pendingRemove === profile.key
+      ? confirmRemove(project, profile)
+      : removeButton(project, profile),
+  )
+  return box
+}
+
+function removeButton(project, profile) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'danger'
+  button.textContent = '删除'
+  // 当前使用的那份**删不了**：删了 activeProvider 就指向一个不存在的名字，配置会静默
+  // 退回内置默认值。按钮留着但禁用，原因写在 title 上 —— 干脆不画的话，用户会以为坏了
+  button.disabled = profile.isActive
+  button.title = profile.isActive
+    ? '当前使用的厂商不能删，先切到别家'
+    : `从 config.json 里删掉「${profile.key}」这份档案`
+  button.addEventListener('click', () => {
+    pendingRemove = profile.key
+    render()
+  })
+  return button
+}
+
+/**
+ * 删除的**第二步**。删一份档案是个不可逆的动作，所以要按两下：第一下把按钮换成这一对，
+ * 第二下才真的删。
+ *
+ * 用两步而不是弹窗：枪就架在这一行上，弹窗反而要把视线从「我要删的是哪一份」移开。
+ * 「取消」必须和「确认删除」一样显眼 —— 只留一个红按钮的话，第二下就成了必答题。
+ */
+function confirmRemove(project, profile) {
+  const box = document.createElement('span')
+  box.className = 'vendor-confirm'
+
+  const yes = document.createElement('button')
+  yes.type = 'button'
+  yes.className = 'danger'
+  yes.textContent = `确认删除「${profile.label}」`
+  yes.addEventListener('click', () => void removeProfile(project, profile))
+
+  const no = document.createElement('button')
+  no.type = 'button'
+  no.className = 'ghost'
+  no.textContent = '取消'
+  no.addEventListener('click', () => {
+    pendingRemove = null
+    render()
+  })
+
+  box.append(yes, no)
+  return box
+}
+
+function noteLine(text) {
+  const p = document.createElement('p')
+  p.className = 'vendor-note'
+  p.textContent = text
+  return p
+}
+
+/**
+ * 左栏该高亮哪一份：上次选的那份（还在就沿用它）> 当前使用那份 > 第一份。
+ *
+ * 后两个兜底不是可有可无的：删掉一份、或者切到另一个项目之后，「上次选的那份」很可能
+ * 已经不存在了 —— 不兜的话右栏会整块空掉，而文件里明明有档案。
+ */
+function selectedProfileOf(project) {
+  const profiles = project.profiles ?? []
+  return (
+    profiles.find((p) => p.key === selectedProfile) ??
+    profiles.find((p) => p.isActive) ??
+    profiles[0] ??
+    null
+  )
+}
+
+/**
+ * 选中的那份档案的厂商预置。**主进程按 baseUrl 推导好 key 才下发**（renderer 走
+ * `app://`，import 不到 `dist/provider/vendors.js`），这里只按 key 查表、不自己判 ——
+ * 两边各写一套判据，迟早互相矛盾。
+ */
+function presetOf(project, profile) {
+  return (project.vendors ?? []).find((v) => v.key === profile.vendorKey) ?? null
+}
+
+function editModel(project, profile, models) {
   const box = document.createElement('div')
   box.append(
-    editLine('默认模型', current, '存为默认', '写回项目配置文件，只影响之后新建的会话', saveDefaultModel),
+    editLine('默认模型', profile.model, '存为默认', '写回项目配置文件，只影响之后新建的会话', (input) =>
+      saveModel(project, profile, input),
+    ),
   )
   // 候选挂在编辑行**下面**（外层多包一个 div，别塞进 `.set-edit` —— 那是个 flex 行，
   // 多一个孩子会把候选挤到输入框同一行上）
@@ -433,61 +630,92 @@ function keySource(preset) {
   return mono(`${preset.envKey}（在 .env 或环境变量里设）`)
 }
 
-async function saveVendor(project, key) {
-  // 「自定义」没有可写的地址：留着用户手填的那一份，什么都不发
-  if (key === '__custom__') return
-  const res = await invoke('project/set-vendor', { cwd: project.cwd, vendorKey: key })
-  if (!res.ok) {
-    notice('error', `切换厂商失败：${res.reason}`)
-    // 失败时地址没变，指纹也就不变 —— 作废缓存强制重建，否则选择器停在新那一项上
-    // 而实际还是旧端点（和 MCP 开关那个谎同一个坑）
-    settingsKey = null
-    await refreshProjectInfo(activeSession()?.id)
-    return
-  }
-  const label = (project.vendors ?? []).find((v) => v.key === key)?.label ?? key
-  notice('info', `已切到 ${label}，接口地址与模型一起写入了 ${res.file}，只影响之后新建的会话`)
-  // 活会话不动（配置冻结）：它们的端点和模型冻在创建那一刻，所以这里既不用刷会话，
-  // 也不用动顶栏和徽标 —— 那两处显示的是**当前会话**，本来就没变
-  await refreshProjectInfo(activeSession()?.id)
-}
-
-async function saveBaseUrl(input) {
-  const projectCwd = state.project?.cwd
+/**
+ * 把「接口地址 / 默认模型」写进**选中的那份档案**（不是「当前生效那份」——多厂商下
+ * 这两者经常不是一回事）。
+ *
+ * 活会话不动（配置冻结）：它们的端点和模型冻在创建那一刻，所以写完既不用刷会话，
+ * 也不用动顶栏和徽标 —— 那两处显示的是**当前会话**，本来就没变。
+ */
+async function saveBaseUrl(project, profile, input) {
   const baseUrl = input.value.trim()
-  if (!projectCwd) {
-    notice('warn', '先选一个项目目录')
-    return
-  }
   if (!baseUrl) {
     notice('warn', '接口地址不能为空')
     return
   }
-  const res = await invoke('project/set-base-url', { cwd: projectCwd, baseUrl })
+  const res = await invoke('project/set-base-url', {
+    cwd: project.cwd,
+    baseUrl,
+    profileKey: profile.key,
+  })
   if (!res.ok) {
     notice('error', `接口地址没写进去：${res.reason}`)
     return
   }
-  notice('info', `接口地址已写入 ${res.file}，只影响之后新建的会话`)
-  await refreshProjectInfo(activeSession()?.id)
+  await savedNotice(`已把「${profile.label}」的接口地址写入 ${res.file}`)
 }
 
-async function saveDefaultModel(input) {
+async function saveModel(project, profile, input) {
   const model = input.value.trim()
-  if (!cwd) {
-    notice('warn', '先选一个项目目录')
-    return
-  }
   if (!model) {
     notice('warn', '模型名不能为空')
     return
   }
-  const res = await invoke('project/set-default-model', { cwd, model })
+  const res = await invoke('project/set-default-model', {
+    cwd: project.cwd,
+    model,
+    profileKey: profile.key,
+  })
   if (!res.ok) {
     notice('error', `默认模型没写进去：${res.reason}`)
     return
   }
-  notice('info', `默认模型已写入 ${res.file}，只影响之后新建的会话`)
+  await savedNotice(`已把「${profile.label}」的默认模型写入 ${res.file}`)
+}
+
+/** 添加一份档案。**添加 ≠ 切过去** —— 用户还得把它配好、再点「设为当前使用的厂商」 */
+async function addProfile(project, vendorKey) {
+  if (!vendorKey) return
+  const res = await invoke('project/add-profile', { cwd: project.cwd, vendorKey })
+  if (!res.ok) {
+    notice('error', `添加厂商失败：${res.reason}`)
+    return
+  }
+  // 新加的那份直接选中：用户接下来要做的就是填它的地址
+  selectedProfile = res.key
+  const label = (project.vendors ?? []).find((v) => v.key === vendorKey)?.label ?? '自定义'
+  notice('info', `已添加「${label}」档案，填好参数再点「设为当前使用的厂商」才会用上`)
+  await refreshProjectInfo(activeSession()?.id)
+}
+
+async function activateProfile(project, profile) {
+  const res = await invoke('project/set-active-provider', { cwd: project.cwd, profileKey: profile.key })
+  if (!res.ok) {
+    // 失败时快照没变、指纹也不变，界面照旧停在「设为当前使用」上 —— 那正是真实状态，
+    // 不需要像 MCP 开关那样作废缓存（那边是用户已经把手拨过去了）
+    notice('error', `没能切到「${profile.label}」：${res.reason}`)
+    return
+  }
+  notice('info', `已切到「${profile.label}」，之后新建的会话用它说话；正在跑的会话不受影响`)
+  await refreshProjectInfo(activeSession()?.id)
+}
+
+async function removeProfile(project, profile) {
+  const res = await invoke('project/remove-profile', { cwd: project.cwd, profileKey: profile.key })
+  pendingRemove = null
+  if (!res.ok) {
+    notice('error', `没能删掉「${profile.label}」：${res.reason}`)
+    return
+  }
+  // 删掉的那份可能正是选中的那份，让它落回「当前使用」那份上
+  if (selectedProfile === profile.key) selectedProfile = null
+  notice('info', `已从 ${res.file} 里删掉档案「${profile.key}」`)
+  await refreshProjectInfo(activeSession()?.id)
+}
+
+/** 写完一句提示，并重拉快照。三处写盘都收在这一句里，省得漏掉哪一处不刷新 */
+async function savedNotice(text) {
+  notice('info', `${text}，只影响之后新建的会话`)
   await refreshProjectInfo(activeSession()?.id)
 }
 
