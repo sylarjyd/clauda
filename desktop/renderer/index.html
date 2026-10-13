@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      CSP 收紧到「只有同源脚本」：模型输出会经 markdown.js 变成 innerHTML，
+      虽然那边已经先转义了，但再多一层兜底不亏。`unsafe-inline` 只留给样式。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
+    />
+    <title>clauda</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <header class="sidebar-head">
+          <span class="brand">clauda</span>
+          <button id="new-session" class="ghost" title="在选中的项目里新建会话">＋ 新会话</button>
+        </header>
+        <label class="project-picker">
+          <span>项目目录</span>
+          <button id="pick-project" class="ghost small">选择…</button>
+        </label>
+        <div id="project-path" class="project-path"></div>
+        <div id="session-list" class="session-list"></div>
+        <div id="notices" class="notices"></div>
+      </aside>
+
+      <main class="chat">
+        <header class="topbar">
+          <div class="topbar-title" id="chat-title">还没有打开的会话</div>
+          <div class="topbar-controls">
+            <label class="control">
+              <span>模型</span>
+              <input id="model-input" type="text" spellcheck="false" placeholder="模型名" />
+            </label>
+            <label class="control">
+              <span>模式</span>
+              <select id="mode-select">
+                <option value="default">default</option>
+                <option value="auto">auto</option>
+                <option value="plan">plan</option>
+              </select>
+            </label>
+            <div class="control context">
+              <span>上下文</span>
+              <div class="context-bar" title="上下文占用"><i id="context-fill"></i></div>
+            </div>
+          </div>
+        </header>
+
+        <div id="stream" class="stream"></div>
+
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <div class="composer-actions">
+            <button type="button" id="abort" class="ghost" hidden>停止</button>
+            <button type="submit" id="send">发送</button>
+          </div>
+        </form>
+      </main>
+
+      <aside class="panel">
+        <section class="panel-block">
+          <h2>改动文件</h2>
+          <ul id="changed-files" class="plain"></ul>
+        </section>
+        <section class="panel-block">
+          <h2>待办</h2>
+          <ul id="todos" class="plain"></ul>
+        </section>
+      </aside>
+    </div>
+
+    <div id="modal-host" class="modal-host" hidden></div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
