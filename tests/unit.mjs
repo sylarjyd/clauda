@@ -26,6 +26,16 @@ function check(name, cond, extra = '') {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-unit-'))
 const cwd = tmp
+
+// **入口就把 home 指到临时目录**：会话落盘（`persist.ts`）与记忆库都挂在 CLAUDA_HOME
+// 下，而下面一百多个检查块里只有一部分记得覆盖它 —— 漏掉的那几块会往用户真实的
+// `~/.clauda/` 里写会话文件。症状不显眼但很脏：每跑一次测试就多一个以临时 cwd 命名的
+// 孤儿项目目录（那台机器上攒了一百多个），而且桌面端启动时会恢复到那个**早已被删掉**
+// 的临时目录上。
+//
+// 用「哪个块忘了」的角度去补是治标的，新加一块忘了写就复发；在入口兜底才是治本的。
+// 需要验「没设 CLAUDA_HOME 时会怎样」的用例自己 delete 它（见下面的厂商回退那一段）。
+process.env.CLAUDA_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-unit-home-'))
 const todos = new TodoList()
 const config = {}
 
@@ -2915,6 +2925,21 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
 // 「Electron 只活在 desktop/ 里」是这次改动最容易被无声破坏的架构约束：某天有人在
 // src/runtime 里顺手 `import { app } from 'electron'`，本地能跑、测试全绿，只有真正
 // 打包或换外壳时才炸。把约束写成断言，破坏它的那一刻就红。
+// 会话落盘与记忆库都挂在 CLAUDA_HOME 下，单测**绝不能**写进用户真实的 `~/.clauda/`。
+// 入口那一行已经把它指到临时目录，这一条防的是「谁把它改掉 / 删掉，或者某个块中途改了
+// 没还原」—— 所以放在**所有块都跑完之后**看，而不是入口看一次就算了。
+console.log('\n== 自检：全程跑在临时 home 上 ==')
+{
+  const home = process.env.CLAUDA_HOME ?? ''
+  const real = path.join(os.homedir(), '.clauda')
+  check(
+    'CLAUDA_HOME 仍指着临时目录（而不是被谁改了、删了）',
+    home !== '' && path.resolve(home).startsWith(path.resolve(os.tmpdir())),
+    home || '(被删掉了)',
+  )
+  check('不是用户真实的 home', home === '' || path.resolve(home) !== path.resolve(real), home)
+}
+
 console.log('\n== 自检：Electron 不许漏进运行时 ==')
 {
   const root = fileURLToPath(new URL('../', import.meta.url))
