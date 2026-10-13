@@ -13,7 +13,7 @@
 const IDS = [
   'app',
   'nav-sessions', 'nav-model', 'nav-skills', 'nav-mcp',
-  'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp', 'rail-project',
+  'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp',
   'view-sessions', 'view-settings', 'settings-title', 'settings-sub', 'settings-body',
   'new-session', 'pick-project', 'project-path', 'session-list', 'notices', 'chat-title',
   'model-input', 'mode-select', 'context-fill', 'stream', 'composer', 'input', 'abort',

@@ -31,7 +31,6 @@ const els = {
   badgeModel: document.getElementById('badge-model'),
   badgeSkills: document.getElementById('badge-skills'),
   badgeMcp: document.getElementById('badge-mcp'),
-  railProject: document.getElementById('rail-project'),
 
   // 会话视图
   viewSessions: document.getElementById('view-sessions'),
@@ -203,7 +202,7 @@ function render() {
 }
 
 /**
- * 导航条。每一项的徽标都是**实时状态**，不是装饰：
+ * 左栏顶部的导航条。每一项的徽标都是**实时状态**，不是装饰：
  * 会话数 / 当前模型 / 技能数 / MCP 已连接比。
  *
  * 只写 `className` 和 `textContent`，不用 `setAttribute` —— `tests/renderer-dom.mjs`
@@ -212,9 +211,6 @@ function render() {
 function renderRail() {
   const session = activeSession()
   const project = state.project
-
-  els.railProject.textContent = cwd ? lastSegment(cwd) : '未选项目'
-  els.railProject.title = cwd || '还没选项目目录'
 
   paintNav(els.navSessions, els.badgeSessions, 'sessions', String(state.order.length), '进行中的会话')
   paintNav(els.navModel, els.badgeModel, 'model', session?.model ?? '', '当前会话使用的模型')
@@ -240,12 +236,6 @@ function mcpBadge(project) {
   if (servers.length === 0) return '0'
   const connected = servers.filter((s) => s.state === 'connected').length
   return `${connected}/${servers.length}`
-}
-
-/** 只取路径最后一段。Windows 上两种分隔符都可能出现 */
-function lastSegment(p) {
-  const parts = p.split(/[\\/]/).filter(Boolean)
-  return parts[parts.length - 1] ?? p
 }
 
 function renderView() {

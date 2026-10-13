@@ -3,8 +3,9 @@
  * 白天形态，不是另起一套配色。唯一被迫改的是 accent：`#c96f4a` 是给深底挑的，
  * 直接放白底上对比度只有 ~3:1，当正文色不合格，所以压深到 `#a94f28`（5.4:1）。
  *
- * 布局是四列 grid，靠 `.app[data-view]` 切换列数：会话视图四列都在，设置视图
- * 摘掉会话列表和右栏、把中栏拉满。
+ * 布局是三列 grid，靠 `.app[data-view]` 切换列数：会话视图三列都在，设置视图
+ * 摘掉右栏和左栏里的会话浏览区、把中栏拉满。**左栏本身不摘** —— 主导航在里面，
+ * 摘了就没有回会话视图的路。
  */
 :root {
   --bg: #f7f5f1;
@@ -26,7 +27,6 @@
   --warn: #8a6412;
   --danger: #ac3a33;
   --mono: Consolas, "Cascadia Mono", monospace;
-  --rail-w: 76px;
 }
 
 * {
@@ -113,54 +113,48 @@ select:focus {
 /* ---------------------------------------------------------------- 骨架 */
 
 /*
- * 每个子元素**必须**写死 grid-column。设置视图下靠 `display: none` 摘掉两列，
+ * 每个子元素**必须**写死 grid-column。设置视图下靠 `display: none` 摘掉一列，
  * 剩下的会自动往前补位 —— 不写死的话中栏会掉进那个 0 宽的列里，整个界面只剩
  * 一条竖线。
+ *
+ * 三列都在的会话视图下，中栏正好是第 2 列；设置视图下左栏不摘、只摘右栏，
+ * 所以中栏**仍然**是第 2 列，那两条 `.chat` 覆盖规则（原先用来把它从第 3 列
+ * 挪回来）就一起删掉了。
  */
 .app {
   display: grid;
-  grid-template-columns: var(--rail-w) 260px minmax(0, 1fr) 280px;
-  /* 第二行是通知栏，空的时候塌成 0 高。它通栏，所以四个主列都钉在第 1 行 */
+  grid-template-columns: 260px minmax(0, 1fr) 280px;
+  /* 第二行是通知栏，空的时候塌成 0 高。它通栏，所以三个主列都钉在第 1 行 */
   grid-template-rows: minmax(0, 1fr) auto;
   height: 100vh;
 }
 
-.rail {
+.sidebar {
   grid-row: 1;
   grid-column: 1;
 }
-.sidebar {
+.chat {
   grid-row: 1;
   grid-column: 2;
 }
-.chat {
-  grid-row: 1;
-  grid-column: 3;
-}
 .panel {
   grid-row: 1;
-  grid-column: 4;
+  grid-column: 3;
 }
 
 .app[data-view='model'],
 .app[data-view='skills'],
 .app[data-view='mcp'] {
-  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  grid-template-columns: 260px minmax(0, 1fr);
 }
 
-.app[data-view='model'] .sidebar,
-.app[data-view='skills'] .sidebar,
-.app[data-view='mcp'] .sidebar,
 .app[data-view='model'] .panel,
 .app[data-view='skills'] .panel,
-.app[data-view='mcp'] .panel {
+.app[data-view='mcp'] .panel,
+.app[data-view='model'] .browse,
+.app[data-view='skills'] .browse,
+.app[data-view='mcp'] .browse {
   display: none;
-}
-
-.app[data-view='model'] .chat,
-.app[data-view='skills'] .chat,
-.app[data-view='mcp'] .chat {
-  grid-column: 2;
 }
 
 .sidebar,
@@ -181,37 +175,35 @@ select:focus {
   overflow-y: auto;
 }
 
-/* ---------------------------------------------------------------- 导航条 */
+/* ---------------------------------------------------------------- 主导航 */
 
-/* 窄竖条，每一项 = 标签 + 实时徽标。它同时是全应用的状态脊，见 index.html */
+/*
+ * 合进左栏之后不再是独立的一窄条，而是整宽的行：标签在左、实时徽标在右 ——
+ * 260px 比原先那 76px 宽裕得多，标签和徽标总算能并排而不必上下叠着。它同时是
+ * 全应用的状态脊，见 index.html。
+ */
 .rail {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
   gap: 2px;
-  padding: 10px 6px;
-  background: var(--bg-soft);
-  border-right: 1px solid var(--line);
-  overflow: hidden;
-}
-
-.rail-mark {
-  color: var(--accent);
-  font-size: 15px;
-  text-align: center;
-  padding: 2px 0 12px;
+  padding: 8px 8px 10px;
+  /* 这一条不是装饰：上面四项是「看哪个视图」，下面整块是「这个视图里的内容」，
+     不给分隔线两者会连成一片，看着像八个平级的入口 */
+  border-bottom: 1px solid var(--line);
 }
 
 .rail-item {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 1px;
-  padding: 7px 2px;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--text-dim);
+  text-align: left;
 }
 
 .rail-item:hover:not(:disabled) {
@@ -228,13 +220,16 @@ select:focus {
   font-weight: 600;
 }
 
+/* `flex: none` + 徽标可缩：模型名可能很长（`glm-4.6-flash`），要让它先截断，
+   而不是把标签挤走 */
 .rail-label {
+  flex: none;
   font-size: 12px;
   line-height: 1.3;
 }
 
 .rail-badge {
-  max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -245,25 +240,6 @@ select:focus {
 
 .rail-item.is-current .rail-badge {
   color: var(--accent);
-}
-
-.rail-spacer {
-  flex: 1;
-  min-height: 8px;
-}
-
-/* 当前项目只显示最后一段目录名，全路径放 title —— 76px 里塞不下整条路径，
-   硬塞只会变成一团看不懂的截断 */
-.rail-project {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-  color: var(--text-faint);
-  font-family: var(--mono);
-  font-size: 10px;
-  text-align: center;
 }
 
 /* ---------------------------------------------------------------- 左栏 */
@@ -280,6 +256,18 @@ select:focus {
 .brand {
   font-weight: 600;
   letter-spacing: 0.04em;
+}
+
+/*
+ * 会话浏览区：项目选择 + 路径 + 会话列表。它自己也得是 flex 列并吃掉剩余高度 ——
+ * 多出中间这一层之后，`.session-list` 的 `flex: 1` 是相对 `.browse` 算的，
+ * 而 `.browse` 若没有被给定的高度，列表就不会滚动，只会把整列越撑越长。
+ */
+.browse {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .project-picker {

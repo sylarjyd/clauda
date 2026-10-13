@@ -164,19 +164,27 @@
   目录穿越检查不让它 import 到 `dist/`，所以 `ProjectInfo` 只下发结论（`provider.vendorKey`）
   加整张表（`vendors`），renderer 按 key 查、不判。代价是那个 `'__custom__'` 字面量在
   `session-manager.ts` / `app.js` / `renderer-dom.mjs` 里各有一份，改名要三处一起改。
-- **左侧导航条同时是状态脊**（`index.html` 的 `.rail`），四个视图 `sessions / model /
-  skills / mcp` 由 `.app[data-view]` 驱动 grid 模板切换（会话视图四列，设置视图两列）。
-  两条容易踩的：**每个子元素要写死 `grid-column`**（`display:none` 摘掉子元素后剩下的会
-  自动补位，`.chat` 会掉进那个 0 宽的列里）；`state.js` 里 `VIEWS` 既是视图名又是 CSS
-  选择器，拼错了不报错、只会让布局静默塌掉，所以归约时要挡一道。徽标（会话数 / 当前模型 /
-  技能数 / MCP 已连接比）编码的是后台状态，别把它退化成纯装饰。
+- **左栏只有一栏**（`index.html` 的 `<aside class="sidebar">`）：品牌 / 新会话 → 主导航
+  `.rail` → 会话浏览区 `.browse`。导航条早先是独立的一窄条（76px），2026-10 合了进来 ——
+  「看哪个视图」和「看哪个会话」本来就在同一列里点。四个视图 `sessions / model / skills /
+  mcp` 由 `.app[data-view]` 驱动 grid 模板切换（会话视图三列，设置视图两列 + 摘右栏）。
+  两条容易踩的：**设置视图下左栏不能整块摘掉**，否则进了设置页就没有回会话视图的路 ——
+  要摘的是 `.browse`（会话浏览区，见 `style.css` 里那组 `.app[data-view] … .browse` 规则）；
+  **每个子元素要写死 `grid-column`**（`display:none` 摘掉子元素后剩下的会自动补位，`.chat`
+  会掉进那个 0 宽的列里）。`state.js` 里 `VIEWS` 既是视图名又是 CSS 选择器，拼错了不报错、
+  只会让布局静默塌掉，所以归约时要挡一道。徽标（会话数 / 当前模型 / 技能数 / MCP 已连接比）
+  编码的是后台状态，别把它退化成纯装饰。
+- **会话浏览区 `.browse` 是 flex 列且 `flex: 1; min-height: 0`**：它自己不吃掉剩余高度的话，
+  里面 `.session-list` 的 `flex: 1` 就没有确定高度可分配，列表不会滚动，只会把整列越撑越长。
 - **通知栏（`#notices`）必须待在侧栏之外**，在 `.app` 网格的第二行通栏（`grid-row: 2;
   grid-column: 1 / -1`，空的时 `display:none` 让这一行塌掉）。它早先是侧栏底部的一条，
-  而侧栏在三个设置视图下都是 `display:none`，于是「MCP 开关接不上」这种**恰好发生在设置页
-  上**的报错会死在引发它的那一页，一个字都看不到 —— 那正是把通道改成 `{ok:false, reason}`
-  要解决的问题，白修了。别改成浮层：通知不自动消失也没有关闭按钮，浮层会常驻盖住输入框
-  （底部正是输入框），要盖住什么才能看见，得先想清楚。`tests/unit.mjs` 末尾有一条结构断言
-  钉着「它不在 `<aside class="sidebar">` 里」。
+  而侧栏当时在三个设置视图下是 `display:none`（现在换成 `.browse` 被摘），于是「MCP 开关
+  接不上」这种**恰好发生在设置页上**的报错会死在引发它的那一页，一个字都看不到 —— 那正是
+  把通道改成 `{ok:false, reason}` 要解决的问题，白修了。**放进 `.browse` 会重演这个 bug**：
+  那正是设置视图下唯一被 `display:none` 的那块。别改成浮层：通知不自动消失也没有关闭按钮，
+  浮层会常驻盖住输入框（底部正是输入框），要盖住什么才能看见，得先想清楚。`tests/unit.mjs`
+  末尾有一条结构断言钉着「它不在 `<aside class="sidebar">` 里」（比实际需要更严一档，
+  故意留着的余量）。
 - **`createProjectRuntime` 必须把 `loadConfig` 包在 `process.env` 快照里**。它内部的
   dotenv 改全局 env 且不覆盖已存在的键，同时开两个项目时后加载的那个 `.env` 会**静默失效**、
   继承前一个项目的配置。还原时只动这次多出来 / 被改写的键，整个替换 `process.env` 会抹掉
@@ -238,9 +246,9 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 
 ## 桌面端
 
-`npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是一条窄导航条加三栏：
-导航条（模型 / 技能 / MCP / 会话，每项带实时徽标）、左栏会话列表（按项目分组，状态点是
-空闲 / 运行中 / 等待授权）、中栏对话、右栏改动文件与待办。最底下还有一行通栏的通知栏，
+`npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是三栏：左栏自上而下是
+品牌 / 新会话、主导航（模型 / 技能 / MCP / 会话，每项带实时徽标）、当前项目与会话列表
+（按项目分组，状态点是空闲 / 运行中 / 等待授权）；中栏对话；右栏改动文件与待办。最底下还有一行通栏的通知栏，
 没通知时整行塌掉。灰阶是浅色暖调，赤陶 accent 沿用了原来暗色版的家族（白底上压深了一档）。
 斜杠命令不做成输入框 —— `/model` 和 `/mode` 是中栏顶栏的控件，`/compact` 自动触发。
 
@@ -249,7 +257,7 @@ desktop/                    薄壳，纯 JS，不在 tsconfig 的 rootDir 覆盖
   main.js                   建窗口 / 注册 IPC / webContents → EventSink
   preload.cjs               contextBridge 暴露 window.clauda（必须 CJS）
   renderer/
-    index.html  style.css   四列骨架（导航条 + 三栏 + 底部通知行），靠 data-view 切列数
+    index.html  style.css   三列骨架（左栏含主导航 + 中栏 + 右栏 + 底部通知行），靠 data-view 切列数
     state.js                纯归约 reduce(state, action)，单测直接 import
     markdown.js             最小 markdown → HTML（先转义再套标签）
     app.js                  DOM 绑定 + 流式增量更新

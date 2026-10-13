@@ -23,45 +23,57 @@
     -->
     <div class="app" id="app" data-view="sessions">
       <!--
-        导航条同时是「状态脊」：每一项自带一个实时徽标（会话数 / 当前模型 /
-        技能数 / MCP 已连接数）。这些是后台状态，不该逼用户点进去才知道。
+        左侧只有这一栏：身份 / 动作 → 主导航 → 当前项目与会话列表。
+
+        导航条（模型 / 技能 / MCP / 会话）早先是独立的一窄条，只有 76px 宽、标签
+        压在徽标上方。它和会话列表其实是同一件事的两半 —— 「看哪个视图」和「看哪个
+        会话」都在这一列里点，分成两栏只是多一道竖线、再让每项少掉一半可用宽度。
       -->
-      <nav class="rail" aria-label="主导航">
-        <div class="rail-mark" title="clauda">◆</div>
-
-        <!-- 四项同级，顺序是「配置 → 内容」：前三项是会话要用到的资源，会话自己压轴 -->
-        <button type="button" class="rail-item" id="nav-model">
-          <span class="rail-label">模型</span>
-          <span class="rail-badge mono" id="badge-model"></span>
-        </button>
-        <button type="button" class="rail-item" id="nav-skills">
-          <span class="rail-label">技能</span>
-          <span class="rail-badge" id="badge-skills"></span>
-        </button>
-        <button type="button" class="rail-item" id="nav-mcp">
-          <span class="rail-label">MCP</span>
-          <span class="rail-badge" id="badge-mcp"></span>
-        </button>
-        <button type="button" class="rail-item" id="nav-sessions">
-          <span class="rail-label">会话</span>
-          <span class="rail-badge" id="badge-sessions"></span>
-        </button>
-
-        <div class="rail-spacer"></div>
-        <div class="rail-project" id="rail-project"></div>
-      </nav>
-
       <aside class="sidebar">
         <header class="sidebar-head">
           <span class="brand">clauda</span>
           <button id="new-session" class="ghost" title="在选中的项目里新建会话">＋ 新会话</button>
         </header>
-        <label class="project-picker">
-          <span>项目目录</span>
-          <button id="pick-project" class="ghost small">选择…</button>
-        </label>
-        <div id="project-path" class="project-path"></div>
-        <div id="session-list" class="session-list"></div>
+
+        <!--
+          导航条同时是「状态脊」：每一项自带一个实时徽标（会话数 / 当前模型 /
+          技能数 / MCP 已连接数）。这些是后台状态，不该逼用户点进去才知道。
+
+          四项同级，顺序是「配置 → 内容」：前三项是会话要用到的资源，会话自己压轴
+          —— 它就贴在下面那张会话列表的顶上，起一个分节标题的作用。
+        -->
+        <nav class="rail" aria-label="主导航">
+          <button type="button" class="rail-item" id="nav-model">
+            <span class="rail-label">模型</span>
+            <span class="rail-badge mono" id="badge-model"></span>
+          </button>
+          <button type="button" class="rail-item" id="nav-skills">
+            <span class="rail-label">技能</span>
+            <span class="rail-badge" id="badge-skills"></span>
+          </button>
+          <button type="button" class="rail-item" id="nav-mcp">
+            <span class="rail-label">MCP</span>
+            <span class="rail-badge" id="badge-mcp"></span>
+          </button>
+          <button type="button" class="rail-item" id="nav-sessions">
+            <span class="rail-label">会话</span>
+            <span class="rail-badge" id="badge-sessions"></span>
+          </button>
+        </nav>
+
+        <!--
+          会话浏览区。设置视图下整块隐藏（见 style.css）：那时中栏是设置页，
+          而这里点一行只会换会话、**不会切回会话视图**，留着就是一块点不出结果的
+          区域。导航条本身不隐藏，否则进了设置页就没有回去的路。
+        -->
+        <div class="browse">
+          <label class="project-picker">
+            <span>项目目录</span>
+            <button id="pick-project" class="ghost small">选择…</button>
+          </label>
+          <div id="project-path" class="project-path"></div>
+          <div id="session-list" class="session-list"></div>
+        </div>
       </aside>
 
       <main class="chat">
