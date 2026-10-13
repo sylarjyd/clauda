@@ -46,6 +46,9 @@ const out = {
   tools: {},
   projectInfo: null,
   mcpToggle: null,
+  badResume: null,
+  badOpen: null,
+  strayFile: null,
   setDefaultModel: null,
   openedAfterModel: null,
   configOnDisk: null,
@@ -152,6 +155,16 @@ try {
   // `{ok:false, reason}`。这条通道早先是无条件 `{ok:true}` 的，界面显示「已接入」
   // 而工具一个没多 —— 这是那次的回归点
   out.mcpToggle = await app.handle('mcp/set-enabled', { cwd: projectDir, name: 'nope', enabled: true })
+
+  // 会话 id 会拼进文件路径，而且一路流到写路径（`persist.ts` 用同一个 id 续写）。
+  // 这两个参数是从 renderer 的 IPC 载荷直接来的，边界上必须挡掉 ——
+  // 挡不住的话 `id: '../../x'` 就是一次任意路径写
+  out.badResume = await app.handle('session/resume', { cwd: projectDir, id: '../../被穿越出来的' })
+  out.badOpen = await app.handle('session/open', { cwd: projectDir, id: '../被穿越出来的' })
+  // 穿越要是生效了，落到 home 下的就是这个文件（真实路径，别拿假想的去查）
+  out.strayFile = [path.join(home, '被穿越出来的.json'), path.join(home, 'projects', '被穿越出来的.json')].filter(
+    (f) => fs.existsSync(f),
+  )
 
   // 轮次跑完要落盘，否则关掉窗口这一轮就没了；侧边栏的「历史会话」也正是读这份文件
   out.history = await app.handle('session/list', { cwd: projectDir })

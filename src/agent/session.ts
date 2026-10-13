@@ -35,19 +35,50 @@ export function newSessionId(): string {
   return `${stamp}-${rand}`
 }
 
+/**
+ * 会话 id 直接拼进文件路径，所以它必须是「生成得出、也验证得了」的形状。
+ * 这里是 `newSessionId()` 的宽松版本：字母数字开头，后面允许 `-` / `_`。
+ *
+ * 关键不是收紧到什么规范，而是**挡掉路径分隔符、`.` 开头和绝对路径** ——
+ * 也就是挡掉 `..` 穿越。id 有三个来源，都不能信：
+ * - 桌面端 `session/resume` 的 IPC 载荷（renderer 给什么就是什么）；
+ * - CLI 的 `--resume <id>` 与 repl 的 `/resume <id>`（用户手输）；
+ * - **会话文件里的 `id` 字段**（`index.ts` 恢复后会接管它，磁盘上被改过就穿帮）。
+ * 最后一条是为什么这道闸放在这里而不是只堵 IPC 口。
+ */
+const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
+
+export function isSafeSessionId(id: string): boolean {
+  return SAFE_SESSION_ID.test(id)
+}
+
+/** id 合法就给出会话文件路径，否则 `null`。**不合法时绝不能拼出一个路径**。 */
+function sessionFile(cwd: string, id: string): string | null {
+  if (!isSafeSessionId(id)) return null
+  return path.join(projectDir(cwd), `${id}.json`)
+}
+
 export function saveSession(cwd: string, rec: SessionRecord): string {
-  const dir = projectDir(cwd)
-  fs.mkdirSync(dir, { recursive: true })
-  const file = path.join(dir, `${rec.id}.json`)
+  const file = sessionFile(cwd, rec.id)
+  // 抛而不是静默跳过：返回一个「写好了」的路径却没写，调用方没法知道。
+  // 正常流程走不到这里（id 是 newSessionId() 造的），到了就是有人在喂路径。
+  if (!file) throw new Error(`非法会话 id：${rec.id}`)
+
+  fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(rec, null, 2), 'utf8')
   return file
 }
 
 export function loadSession(cwd: string, id: string): SessionRecord | null {
-  const file = path.join(projectDir(cwd), `${id}.json`)
+  const file = sessionFile(cwd, id)
+  if (!file) return null
   try {
     if (!fs.existsSync(file)) return null
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as SessionRecord
+    const rec: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+    // 光解析成功不够：随便一个 `.json` 都能解析出来。形状不对就当没有 ——
+    // 恢复会话的人拿 `messages` 直接用（`persistSession` 会读 `.length`），
+    // 少一个字段就是运行期崩溃。
+    return isSessionRecord(rec) ? rec : null
   } catch {
     return null
   }

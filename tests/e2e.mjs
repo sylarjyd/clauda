@@ -647,6 +647,20 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
     check('落盘的是合法 JSON 且带着新模型', JSON.parse(d.configOnDisk).provider.model === 'desk-model-2', d.configOnDisk)
     check('新会话拿到了新的默认模型', d.openedAfterModel?.model === 'desk-model-2', d.openedAfterModel?.model)
 
+    // 会话 id 来自 renderer 的 IPC 载荷，而它会一路流到写路径（persist.ts 用同一个 id 续写），
+    // 所以 `../../x` 是任意路径写。边界上必须挡掉，而不是等 session.ts 兜底
+    check(
+      'session/resume 拒绝穿越型 id',
+      d.badResume?.ok === false && String(d.badResume.reason).includes('非法'),
+      JSON.stringify(d.badResume),
+    )
+    check(
+      'session/open 拒绝穿越型 id',
+      d.badOpen?.ok === false && String(d.badOpen.reason).includes('非法'),
+      JSON.stringify(d.badOpen),
+    )
+    check('穿越尝试真的没写出文件', Array.isArray(d.strayFile) && d.strayFile.length === 0, JSON.stringify(d.strayFile))
+
     check('退出后会话真的没了', d.afterQuit?.ok === false, JSON.stringify(d.afterQuit))
     check('退出不卡死（MCP 该关的都关了）', elapsed < 30_000, `耗时 ${elapsed}ms`)
   }

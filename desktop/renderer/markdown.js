@@ -8,7 +8,10 @@
  * 别为了「少转义一点」开后门。
  *
  * 代价是代码块和行内代码得先用占位符摘出来，否则里面的 `**` / `#` 会被当成语法。
- * 占位符借 NUL / SOH 两个控制字符：转义过的正文里不可能出现，撞不了车。
+ * 占位符借 NUL / SOH 两个控制字符。**输入里要先把这两个字符删掉**：`escape` 不动它们，
+ * 所以「转义过的正文里不可能出现」这句本身不成立 —— 模型直接吐一个 ` 0 ` 就能伪造出
+ * 一个占位符。伪造的后果只是内容被重复或挪位置（换进去的 `blocks[i]` / `codes[i]` 都是
+ * 转义过的字符串，注不进标签），但这套保证是靠占位符的唯一性撑着的，前提不成立就不该留。
  */
 
 const BLOCK_MARK = '\u0000'
@@ -17,7 +20,7 @@ const BLOCK_LINE_RE = new RegExp(`^${BLOCK_MARK}(\\d+)${BLOCK_MARK}$`)
 const CODE_RE = new RegExp(`${CODE_MARK}(\\d+)${CODE_MARK}`, 'g')
 
 export function markdown(src) {
-  const text = escape(String(src ?? ''))
+  const text = escape(String(src ?? '').replace(/[\u0000\u0001]/g, ''))
   const blocks = []
 
   // 先把围栏代码块整个摘走，正文里只留一个占位符

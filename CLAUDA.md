@@ -132,6 +132,15 @@
   而且**必须 `await` 并把异常放出去**：`McpManager.setEnabled` 在连不上时会抛，早先
   这个 Promise 被直接丢掉，于是「接入一个配错了的服务器」既不报错、工具也没接上，
   界面还显示成功。`mcp/set-enabled` 因此不能再无条件返回 `{ok:true}`。
+- **会话 id 必须先过 `isSafeSessionId` 再拼路径**（`session.ts`）。它直接进
+  `` path.join(dir, `${id}.json`) ``，而且**一路流到写路径** —— `persist.ts` 用同一个 id
+  续写文件，所以 `id: '../../x'` 不是「读错文件」，是「写到别处去」（`.json` 后缀、
+  内容是会话记录）。三个来源都不能信：桌面端 `session/resume` 的 IPC 载荷、
+  CLI 的 `--resume <id>`、以及**会话文件里的 `id` 字段**（`index.ts` 恢复后会接管它）。
+  最后一条决定了这道闸放在 `session.ts` 而不是只堵 IPC 口 —— 只堵 IPC 挡不住磁盘上
+  被改过的文件。`desktop-app.ts` 里那两道是为了给人话错误，不是主防线。
+  同一处：`loadSession` 解析出来还要过 `isSessionRecord`，随便一个 `.json` 都能
+  `JSON.parse` 成功，而恢复会话的人拿 `messages` 直接用（`persistSession` 读 `.length`）。
 - **写配置文件只能改磁盘上的原始文本，不许拿 `loadConfig()` 的结果回写**
   （`config.ts` 的 `writeProjectModel`）。`loadConfig` 内部的 `expandEnvRefs` 已经把
   `${MY_KEY}` 换成了真实密钥，拿它回写等于把密钥明文落盘 —— 这是数据泄露，不是格式问题。

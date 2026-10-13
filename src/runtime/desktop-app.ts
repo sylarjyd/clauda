@@ -1,4 +1,4 @@
-import { listProjects, listSessionSummaries, loadSession } from '../agent/session.js'
+import { isSafeSessionId, listProjects, listSessionSummaries, loadSession } from '../agent/session.js'
 import type { PermissionMode } from '../config.js'
 import type { PermissionDecision } from './permission-bridge.js'
 import { SessionManager, type EventSink, type Session, type SessionProject } from './session-manager.js'
@@ -146,6 +146,9 @@ export class DesktopApp {
     const cwd = str(payload, 'cwd')
     if (!cwd) return { ok: false, reason: 'session/open 需要 cwd' }
     const id = str(payload, 'id')
+    // 这层拦一道是为了给出人话错误。真正的兜底在 session.ts —— 那边的 id 还可能
+    // 来自会话文件内容，只堵 IPC 是堵不住的
+    if (id && !isSafeSessionId(id)) return { ok: false, reason: `非法会话 id：${id}` }
     const session = await this.manager.openSession(cwd, id ? { id } : {})
     return { ok: true, session: infoOf(session) }
   }
@@ -161,6 +164,9 @@ export class DesktopApp {
     const cwd = str(payload, 'cwd')
     const id = str(payload, 'id')
     if (!cwd || !id) return { ok: false, reason: 'session/resume 需要 cwd 和 id' }
+    // id 会一路流到 `saveSession` 的写路径（`persist.ts` 用同一个 id 续写文件），
+    // 所以这里挡的不是「读错文件」，是「写到别处去」
+    if (!isSafeSessionId(id)) return { ok: false, reason: `非法会话 id：${id}` }
 
     const rec = loadSession(cwd, id)
     if (!rec) return { ok: false, reason: `找不到会话：${id}` }

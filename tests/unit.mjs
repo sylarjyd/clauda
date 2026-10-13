@@ -947,9 +947,8 @@ console.log('\n== 记忆库 ==')
 // 之前 sort 写在 try/catch 外面，一条缺 updatedAt 的记录就能把 /sessions 打挂。
 console.log('\n== 会话文件 ==')
 {
-  const { saveSession, loadSession, listSessions, latestSessionId, deriveTitle } = await import(
-    `${dist}agent/session.js`
-  )
+  const { saveSession, loadSession, listSessions, latestSessionId, deriveTitle, newSessionId } =
+    await import(`${dist}agent/session.js`)
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-session-'))
   const prevHome = process.env.CLAUDA_HOME
   process.env.CLAUDA_HOME = home
@@ -992,6 +991,46 @@ console.log('\n== 会话文件 ==')
 
   check('deriveTitle 取第一条用户消息', deriveTitle([{ role: 'user', content: '修个 bug\n详细说明' }]) === '修个 bug')
   check('deriveTitle 空会话给占位', deriveTitle([]) === '(空会话)')
+
+  // 会话 id 直接拼进文件路径。它不是只有内部 generate 一个来源：桌面端 IPC 的
+  // `session/resume` 载荷、CLI 的 `--resume <id>`、以及**会话文件里的 id 字段**
+  // （恢复后会被接管）都能喂进来。而且它一路流到 `saveSession` 的写路径 ——
+  // `persist.ts` 用同一个 id 续写，所以穿越出去的不是「读错文件」，是「写到别处」。
+  {
+    const { isSafeSessionId, saveSession: save, loadSession: load } = await import(`${dist}agent/session.js`)
+    const outside = path.join(home, '被穿越出来的.json')
+
+    for (const bad of [
+      '../被穿越出来的',
+      '..\\被穿越出来的',
+      '../../../../tmp/evil',
+      '/abs/evil',
+      'C:/abs/evil',
+      '',
+      '.hidden',
+      '-leading-dash',
+      `a${'/'.repeat(3)}b`,
+    ]) {
+      check(`拒绝非法会话 id：${JSON.stringify(bad)}`, !isSafeSessionId(bad), bad)
+    }
+    check('newSessionId 造出来的 id 一定过闸', isSafeSessionId(newSessionId()), newSessionId())
+    check('旧数据里的下划线 id 仍然认', isSafeSessionId('s_1-a2'), 's_1-a2')
+
+    check('loadSession 拒绝穿越', load(cwd, '../../被穿越出来的') === null)
+    let threw = null
+    try {
+      save(cwd, { ...rec(9), id: '../../被穿越出来的' })
+    } catch (e) {
+      threw = e
+    }
+    check('saveSession 拒绝穿越（抛而不是静默跳过）', threw !== null, threw?.message ?? '没抛')
+    check('被穿越的路径上确实没写出文件', !fs.existsSync(outside), outside)
+
+    // 形状不对的 `.json` 不能当成会话喂回去：恢复会话的人直接读 `messages`，
+    // 少一个字段就是运行期崩溃（`persistSession` 会读 `.length`）
+    fs.writeFileSync(path.join(dir, 'shapeless.json'), JSON.stringify({ hello: 'world' }), 'utf8')
+    check('loadSession 不把形状不对的 JSON 当会话', load(cwd, 'shapeless') === null)
+  }
 
   if (prevHome === undefined) delete process.env.CLAUDA_HOME
   else process.env.CLAUDA_HOME = prevHome
@@ -1918,6 +1957,22 @@ console.log('\n== 桌面端渲染层：markdown ==')
   const list = markdown('- 甲\n- 乙')
   check('无序列表合成一个 <ul>', list.includes('<ul><li>甲</li><li>乙</li></ul>'), list)
   check('空输入不炸', markdown('') === '' && markdown(null) === '' && markdown(undefined) === '')
+
+  // 占位符借 NUL / SOH 两个控制字符，而 `escape` 不动它们 —— 模型直接吐一个占位符
+  // 就能伪造，`blocks[i]` / `codes[i]` 被顶到别的位置上。换进去的都是转义过的字符串，
+  // 注不进标签，但输入里先删掉这两个字符，唯一性才是真的成立的。
+  const NUL = String.fromCharCode(0)
+  const SOH = String.fromCharCode(1)
+  const count = (s, sub) => s.split(sub).length - 1
+
+  // 输入里那段 `${NUL}0${NUL}` 正好是代码块占位符的写法。没删控制字符的话它会和
+  // 真的占位符撞车，同一个代码块被吐出来两次。删掉之后它只是个普通的 0。
+  const forged = markdown(`\`\`\`\n代码\n\`\`\`\n${NUL}0${NUL}`)
+  check('伪造的块占位符不会让代码块出现两次', count(forged, '代码') === 1, forged)
+  check('输出里不留占位符控制字符', !forged.includes(NUL) && !forged.includes(SOH), JSON.stringify(forged))
+
+  const forgedInline = markdown(`\`x\`${SOH}0${SOH}`)
+  check('伪造的行内占位符不会让代码出现两次', count(forgedInline, '<code>x</code>') === 1, forgedInline)
 }
 
 // 消息流是增量画的（全量重绘会在流式输出时整块闪），于是就有了「哪个 DOM 节点该重画」
