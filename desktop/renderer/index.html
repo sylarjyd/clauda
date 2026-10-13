@@ -32,7 +32,6 @@
       <aside class="sidebar">
         <header class="sidebar-head">
           <span class="brand">clauda</span>
-          <button id="new-session" class="ghost" title="在选中的项目里新建会话">＋ 新会话</button>
         </header>
 
         <!--
@@ -72,6 +71,14 @@
             <button id="pick-project" class="ghost small">选择…</button>
           </label>
           <div id="project-path" class="project-path"></div>
+          <!--
+            「新会话」贴在这一列会话的顶上，而不是品牌那一行：它属于**这个项目**的会话
+            列表，不是属于整个窗口，放这儿之后「在哪个项目里新建」一目了然，不必回头去
+            看上面那行路径。
+            顺带也修了一处别扭：它同样不切视图（`openNewSession` 只开会话、不动 `view`），
+            留在设置页上点它和点一行会话一样点不出结果，跟着 `.browse` 一起收起正合适。
+          -->
+          <button id="new-session" class="new-session" title="在选中的项目里新建会话">＋ 新会话</button>
           <div id="session-list" class="session-list"></div>
         </div>
       </aside>

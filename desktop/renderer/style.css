@@ -244,11 +244,10 @@ select:focus {
 
 /* ---------------------------------------------------------------- 左栏 */
 
+/* 品牌那一行现在只剩品牌了（「新会话」搬到了会话列表顶上，见下） */
 .sidebar-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
 }
@@ -285,6 +284,29 @@ select:focus {
   font-size: 12px;
   /* 长路径要能从中间断，否则会把左栏撑出横向滚动条 */
   overflow-wrap: anywhere;
+}
+
+/*
+ * 「会话列表顶上那个新建按钮」。左右各 8px 和 `.session-list` 的内边距对上，
+ * 于是它和下面的会话行左起在同一个位置 —— 看着就是这张列表的第一项。
+ *
+ * 边是**虚线**的，这是它和会话行唯一的区别，也是刻意的：实线的是「行」（点开一个
+ * 已有的会话），虚线的是「造一个新的」。`.browse` 是 flex 列、`align-items` 默认
+ * stretch，所以不必写 `width`，它自己就撑满。
+ */
+.new-session {
+  margin: 0 8px 8px;
+  padding: 6px 8px;
+  text-align: left;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px dashed var(--line-strong);
+}
+
+/* 悬停的描边和字色由全局的 `button:hover` 给（accent）；这里只补一个底色，
+   和 `.session-row:hover` 保持一致 */
+button.new-session:hover:not(:disabled) {
+  background: var(--bg-raise);
 }
 
 .session-list {
