@@ -9,7 +9,15 @@
  * 其余一律 `textContent`，工具结果和报错里可能有模型输出，不能当 HTML 塞。
  */
 import { markdown } from './markdown.js'
-import { changedFiles, createState, reduce, streamPlan, todoItems } from './state.js'
+import {
+  attachmentPayload,
+  changedFiles,
+  createState,
+  MAX_IMAGE_BYTES,
+  reduce,
+  streamPlan,
+  todoItems,
+} from './state.js'
 
 const els = {
   app: document.getElementById('app'),
@@ -45,6 +53,9 @@ const els = {
   stream: document.getElementById('stream'),
   composer: document.getElementById('composer'),
   input: document.getElementById('input'),
+  attachList: document.getElementById('attach-list'),
+  attach: document.getElementById('attach'),
+  dropHint: document.getElementById('drop-hint'),
   abort: document.getElementById('abort'),
   changedFiles: document.getElementById('changed-files'),
   todos: document.getElementById('todos'),
@@ -184,6 +195,7 @@ function render() {
   renderView()
   renderSidebar()
   renderTopbar()
+  renderAttachments()
   renderStream()
   renderPanel()
   renderModal()
@@ -744,7 +756,133 @@ function renderTopbar() {
   els.modelInput.disabled = off
   els.modeSelect.disabled = off
   els.input.disabled = off
+  els.attach.disabled = off
   els.abort.hidden = !(session && session.status === 'running')
+}
+
+// ------------------------------------------------------------ 附件
+
+/** 和 `src/util/text.ts` 的 `formatBytes` 同一套口径。renderer 拿不到 dist，只能抄一份 */
+function fileSize(bytes) {
+  const n = Number(bytes) || 0
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+/**
+ * 待发附件那一条。空列表时整条 `hidden`，`.composer` 靠它占的那行也就跟着收起来。
+ *
+ * 缩略图用 `<img>` + data URL：CSP 的 `img-src` 放行了 `data:`，而这些字节是
+ * **主进程读出来的**（`attachment/ingest` 的返回），不是用户敲进来的内容。
+ */
+function renderAttachments() {
+  const list = state.attachments
+  if (list.length === 0) {
+    els.attachList.hidden = true
+    els.attachList.replaceChildren()
+    return
+  }
+  els.attachList.hidden = false
+
+  els.attachList.replaceChildren(
+    ...list.map((att, index) => {
+      const chip = document.createElement('div')
+      chip.className = 'attach-chip'
+
+      if (att.kind === 'image' && att.dataUrl) {
+        const thumb = document.createElement('img')
+        thumb.src = att.dataUrl
+        thumb.alt = att.name
+        chip.append(thumb)
+      } else {
+        const glyph = document.createElement('span')
+        glyph.className = 'attach-glyph'
+        glyph.textContent = '📄'
+        chip.append(glyph)
+      }
+
+      const label = document.createElement('span')
+      label.className = 'attach-name'
+      label.textContent = att.name
+      label.title = att.path || att.name
+
+      const size = document.createElement('span')
+      size.className = 'attach-size'
+      size.textContent = fileSize(att.bytes)
+
+      const remove = document.createElement('button')
+      remove.type = 'button'
+      remove.className = 'remove'
+      remove.textContent = '×'
+      remove.title = '移除'
+      remove.setAttribute('aria-label', `移除 ${att.name}`)
+      remove.addEventListener('click', () => dispatch({ type: 'detach', index }))
+
+      chip.append(label, size, remove)
+      return chip
+    }),
+  )
+}
+
+/**
+ * 拖进来 / 粘上来的 File 们 → 原始描述符。
+ *
+ * `pathForFile` 是**同步**的，且对**没有磁盘来源**的 File 返回空串 —— 截图工具和
+ * 浏览器里复制的图片都是这一类，这时只能由渲染层自己读成 data URL 兜底（它本来拿不到
+ * fs，这是唯一一处渲染层碰字节的地方）。
+ */
+async function collectFromFiles(files) {
+  const items = []
+  for (const file of files ?? []) {
+    const filePath = window.clauda.pathForFile(file)
+    if (filePath) {
+      items.push({ path: filePath, name: file.name, mime: file.type })
+      continue
+    }
+    if (typeof file.type === 'string' && file.type.startsWith('image/')) {
+      // 先判大小再编码：不然一张 50MB 的图会先在渲染进程里转一遍 base64，界面直接卡住
+      if (file.size > MAX_IMAGE_BYTES) {
+        notice('warn', `${file.name || '这张图片'}太大（${fileSize(file.size)}），上限 4 MB`)
+        continue
+      }
+      try {
+        const dataUrl = await readAsDataUrl(file)
+        items.push({ dataUrl, name: file.name || '剪贴板图片', mime: file.type })
+      } catch {
+        notice('error', `${file.name || '这张图片'}读不出来`)
+      }
+      continue
+    }
+    notice('warn', `${file.name || '这个文件'}没有磁盘路径，先另存到磁盘再拖进来`)
+  }
+  return items
+}
+
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(new Error('read failed'))
+    reader.readAsDataURL(file)
+  })
+}
+
+/**
+ * 三条入口（拖拽 / 粘贴 / 选文件）的最后一段。字节在主进程读，被拒的原因在这里报出来
+ * —— 用户拖了一个 8MB 的图，得当场知道为什么 chip 没出现。
+ */
+async function ingestItems(items) {
+  if (!items || items.length === 0) return
+  const res = await invoke('attachment/ingest', { items })
+  if (!res.ok) {
+    notice('error', res.reason ?? '附件读不进来')
+    return
+  }
+  for (const reason of res.rejected ?? []) notice('warn', reason)
+  if ((res.attachments ?? []).length > 0) {
+    dispatch({ type: 'attach', attachments: res.attachments })
+  }
 }
 
 /**
@@ -797,8 +935,16 @@ function paint(node, item) {
   if (item.kind === 'user') {
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
-    // 用户自己打的字不当 markdown，原样显示
-    bubble.textContent = item.text
+    // 用户自己打的字不当 markdown，原样显示。先写字再插图 —— textContent 会把
+    // 已有的子节点整批换掉，顺序反了图就没了
+    if (item.text) bubble.textContent = item.text
+    for (const url of item.images ?? []) {
+      const img = document.createElement('img')
+      img.className = 'bubble-img'
+      img.src = url
+      img.alt = '附件图片'
+      bubble.append(img)
+    }
     node.replaceChildren(bubble)
     return
   }
@@ -989,6 +1135,65 @@ els.input.addEventListener('input', () => {
   els.input.style.height = `${Math.min(200, els.input.scrollHeight)}px`
 })
 
+/**
+ * 拖拽。**挂在 `els.app` 上，不能挂 `window`**：`tests/renderer-dom.mjs` 的假 DOM
+ * 没有 `window.addEventListener`，而这里的监听是在模块顶层注册的 —— 挂 window 上
+ * 整份渲染层单测当场跑不起来。
+ *
+ * `dragenter` / `dragleave` 会在子元素之间反复触发（鼠标每跨过一次边界就来一轮），
+ * 所以用一个进入计数器。不计数的话遮罩会在拖动过程中疯狂闪烁。
+ */
+let dragDepth = 0
+
+/** 只接管**文件**。不判这一下的话，把选中的一段文字拖进输入框也会被吃掉 */
+function draggingFiles(event) {
+  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
+}
+
+els.app.addEventListener('dragenter', (event) => {
+  if (!draggingFiles(event)) return
+  event.preventDefault()
+  dragDepth += 1
+  els.dropHint.hidden = false
+})
+
+els.app.addEventListener('dragover', (event) => {
+  // **必须 preventDefault**：不调的话浏览器认为这里不接受放置，drop 事件根本不会来。
+  // 这是拖拽最容易写成「看着对但什么都不发生」的一处
+  if (!draggingFiles(event)) return
+  event.preventDefault()
+})
+
+els.app.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) els.dropHint.hidden = true
+})
+
+els.app.addEventListener('drop', (event) => {
+  dragDepth = 0
+  els.dropHint.hidden = true
+  if (!draggingFiles(event)) return
+  event.preventDefault()
+  void collectFromFiles(event.dataTransfer?.files).then(ingestItems)
+})
+
+els.input.addEventListener('paste', (event) => {
+  const files = event.clipboardData?.files
+  // 剪贴板里没有文件就不干预 —— 那是正常粘一段文字
+  if (!files || files.length === 0) return
+  // 有文件就必须拦：不拦的话 Chromium 会把文件名当纯文本插进 textarea
+  event.preventDefault()
+  void collectFromFiles(files).then(ingestItems)
+})
+
+els.attach.addEventListener('click', async () => {
+  const paths = await window.clauda.pickFiles()
+  if (!paths || paths.length === 0) return
+  // 只报路径，文件名由主进程按 path.basename 定 —— 渲染层没有 path 模块，
+  // 自己切分隔符迟早会在某个平台或某个奇怪的文件名上出错
+  await ingestItems(paths.map((path) => ({ path })))
+})
+
 els.abort.addEventListener('click', async () => {
   const session = activeSession()
   if (session) await invoke('session/abort', { sessionId: session.id })
@@ -1013,15 +1218,29 @@ els.modeSelect.addEventListener('change', async () => {
 async function submit() {
   const session = activeSession()
   const text = els.input.value.trim()
-  if (!session || !text) return
+  const attachments = state.attachments
+  // **光有附件、一个字没打也要能发**。这一条不加的话，「只丢一张图给模型看」
+  // 这个最常见的用法会静默什么都不发生（旧代码在这里靠 `!text` 提前返回）
+  if (!session || (!text && attachments.length === 0)) return
 
+  const images = attachments.filter((a) => a.kind === 'image').map((a) => a.dataUrl)
   els.input.value = ''
   els.input.style.height = 'auto'
-  dispatch({ type: 'user-send', sessionId: session.id, text })
+  dispatch({ type: 'user-send', sessionId: session.id, text, images })
 
   // 这条会一直等到整轮结束。中途的流式输出靠事件推过来
-  const res = await invoke('session/send', { sessionId: session.id, text })
-  if (!res.ok) dispatch({ type: 'error', sessionId: session.id, msg: res.reason })
+  const res = await invoke('session/send', {
+    sessionId: session.id,
+    text,
+    attachments: attachmentPayload(attachments),
+  })
+  if (!res.ok) {
+    // 失败时**保留附件**：清空 + 报错会让用户白拖一遍
+    dispatch({ type: 'error', sessionId: session.id, msg: res.reason })
+    return
+  }
+  dispatch({ type: 'clear-attachments' })
+  if (res.dropped) notice('warn', `有 ${res.dropped} 个附件不合规，没有随这条消息发出去`)
 }
 
 // ------------------------------------------------------------------ 启动

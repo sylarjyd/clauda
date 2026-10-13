@@ -13,6 +13,22 @@
 const MAX_NOTICES = 50
 
 /**
+ * 待发附件上限。和主进程 `src/runtime/attachment.ts` 的 `MAX_ATTACHMENTS` 是同一个数，
+ * 但**只能各写一份** —— renderer 走 `app://` 拿不到 `dist/`，那边也有同样的手抄
+ * （`UserAttachment` 的形状）。改一个记得改另一个。
+ */
+export const MAX_ATTACHMENTS = 8
+
+/**
+ * 单张图片上限，同样和 `src/runtime/attachment.ts` 的 `MAX_IMAGE_BYTES` 对齐。
+ *
+ * 渲染层判这一下不是重复劳动：粘上来的截图没有磁盘路径，得先在**这里**用 FileReader
+ * 读成 base64 再送过去 —— 不先判大小的话，一张 50MB 的图会先在渲染进程里编码一遍
+ * （卡住整个界面、内存翻三倍），然后才被主进程丢掉。
+ */
+export const MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+/**
  * 左导航的四个视图。**视图名同时是 CSS 选择器**（`.app[data-view="…"]`），所以
  * 拼错了不会报错、只会让三栏布局静默塌掉 —— 归约时挡一道，别指望肉眼发现。
  */
@@ -34,6 +50,14 @@ export function createState() {
     opens: 0,
     /** 左导航选中的视图，见 `VIEWS` */
     view: 'sessions',
+    /**
+     * 挂在输入框上、还没发出去的附件。
+     *
+     * **按整个界面一份，不按会话分** —— 界面上只有一个 `#composer`。也**不在切换会话时
+     * 清空**：`#input` 里没发出去的字在切会话时本来就跟着走，只清附件的话，用户会在
+     * 新会话里看到自己的半句话还在、以为附件也在，于是发出一封没有附件的信。
+     */
+    attachments: [],
     /**
      * `project/info` 的结果，模型 / 技能 / MCP 三个设置页共用这一份。
      * null 表示还没拉到（没有会话、或者刚切完会话正在重新拉）。
@@ -92,6 +116,12 @@ export function reduce(state, action) {
       return VIEWS.includes(action.view) ? { ...state, view: action.view } : state
     case 'project-info':
       return { ...state, project: action.info ?? null }
+    case 'attach':
+      return { ...state, attachments: addAttachments(state.attachments, action.attachments ?? []) }
+    case 'detach':
+      return { ...state, attachments: state.attachments.filter((_, i) => i !== action.index) }
+    case 'clear-attachments':
+      return { ...state, attachments: [] }
     case 'app-notice':
       return { ...state, notices: [...state.notices, { level: action.level, text: action.text }].slice(-MAX_NOTICES) }
     default:
@@ -131,7 +161,8 @@ function routeToSession(state, action) {
 function applyToSession(session, action) {
   switch (action.type) {
     case 'user-send':
-      return push(session, { kind: 'user', text: action.text })
+      // `images` 是本地预览（data URL）：气泡立刻把图显示出来，不等主进程那一圈回来
+      return push(session, { kind: 'user', text: action.text, images: action.images ?? [] })
 
     case 'assistant-start':
       return push(session, { kind: 'assistant', text: '', streaming: true })
@@ -222,6 +253,42 @@ function mergeSnapshot(session, patch) {
   return changed ? next : session
 }
 
+/**
+ * 并入新附件。
+ *
+ * 按**来源**去重：同一个文件拖两次是个很自然的动作，不去重的话发出去就是同一张图两遍，
+ * 白付一份 token、还占掉一个名额。图片没有磁盘路径，就只能靠「文件名 + 字节数」认。
+ */
+function addAttachments(current, incoming) {
+  const out = current.slice()
+  const seen = new Set(out.map(attachmentKey))
+  for (const att of incoming) {
+    const key = attachmentKey(att)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(att)
+    if (out.length >= MAX_ATTACHMENTS) break
+  }
+  return out
+}
+
+function attachmentKey(att) {
+  return att?.path ? `p:${att.path}` : `n:${att?.name ?? ''}:${att?.bytes ?? 0}`
+}
+
+/**
+ * 送给 `session/send` 的那份。**一字段不多带** —— 主进程的 `sanitizeAttachments`
+ * 是按归一化形状重新验一遍的，这里多塞的字段到那边只会被丢掉（图片的 `bytes` 还是
+ * 它自己按 data URL 长度重算的，不认这份）。
+ */
+export function attachmentPayload(attachments) {
+  return (attachments ?? []).map((a) =>
+    a.kind === 'image'
+      ? { kind: 'image', name: a.name, dataUrl: a.dataUrl, bytes: a.bytes }
+      : { kind: 'file', name: a.name, path: a.path, bytes: a.bytes },
+  )
+}
+
 function isKind(kind) {
   return (item) => item.kind === kind
 }
@@ -261,6 +328,35 @@ export function todoItems(session) {
 }
 
 /**
+ * 用户气泡里该显示的字 —— **只取第一个 text 块**。
+ *
+ * 带图的消息 content 是数组，形状是 `[用户打的字, …图片, 附件清单]`。最后那段清单是
+ * 主进程追加给模型看的（见 `src/util/message.ts` 的 `buildUserContent`），用户没必要
+ * 在气泡里再看一遍自己刚拖进去的路径。纯文本消息只有一个块，行为与从前一字不差。
+ *
+ * 这段逻辑在 `src/util/message.ts` 的 `messageText` 里有一份更全的（那边要拼上清单，
+ * 摘要和标题用），**两边不能合并**：renderer 走 `app://` 拿不到 `dist/`。
+ */
+export function userText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  for (const part of content) {
+    if (part?.type === 'text') return typeof part.text === 'string' ? part.text : ''
+  }
+  return ''
+}
+
+/** 消息里所有图片的 data URL。恢复历史时气泡要重画出图片，靠的就是它 */
+export function imageUrls(content) {
+  if (!Array.isArray(content)) return []
+  const out = []
+  for (const part of content) {
+    if (part?.type === 'image_url' && typeof part.image_url?.url === 'string') out.push(part.image_url.url)
+  }
+  return out
+}
+
+/**
  * 把落盘的 `WireMessage[]` 还原成消息流条目，用于打开历史会话。
  *
  * 两件必须知道的事：
@@ -277,7 +373,7 @@ export function toItems(messages) {
 
   for (const message of messages ?? []) {
     if (message.role === 'user') {
-      items.push({ kind: 'user', text: message.content ?? '' })
+      items.push({ kind: 'user', text: userText(message.content), images: imageUrls(message.content) })
       continue
     }
 

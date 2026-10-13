@@ -17,12 +17,42 @@ export interface WireToolCall {
   }
 }
 
+/**
+ * 多模态内容块，用 OpenAI 自己的叫法（content part）。
+ *
+ * **只声明我们真正会产生的那两种**：用户消息里的一段文字、用户附上来的一张图片。
+ * 别处一律仍然是纯字符串 —— 模型返回方向、工具结果、系统提示词、压缩摘要都不碰它，
+ * 那几条路径因此一行都不用改。
+ */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  /** `url` 是 `data:image/...;base64,...`。CSP 已放行 data:（见 index.html） */
+  | { type: 'image_url'; image_url: { url: string } }
+
 export interface WireMessage {
   role: Role
-  content: string
+  /**
+   * 纯文本时**仍然是字符串**，不是「长度为 1 的数组」。
+   *
+   * 这是本次改动能这么小的根本原因：老会话文件、压缩摘要、工具结果、系统提示词
+   * 全都落在 `string` 那一支上，读回、落盘、比较一个字都不用动。数组只有一种来源
+   * —— 用户消息里带了图片。
+   */
+  content: string | ContentPart[]
   tool_calls?: WireToolCall[]
   tool_call_id?: string
 }
+
+/**
+ * 用户附带的一个文件，**已经归一化过**的形状（renderer 报上来的是另一种原始形状，
+ * 见 `src/runtime/attachment.ts`）。state.js 里对应的是同一份形状 —— renderer 走
+ * `app://` 拿不到 dist，那份只能手抄，注释互相指一下。
+ */
+export type UserAttachment =
+  /** 图片：字节已经读成 data URL，随消息一起留在历史里 */
+  | { kind: 'image'; name: string; dataUrl: string; bytes: number }
+  /** 图片之外的一切：**只有路径**，要看内容得模型自己 read_file */
+  | { kind: 'file'; name: string; path: string; bytes: number }
 
 /** 解析后的工具调用，供内部执行使用 */
 export interface ToolCall {

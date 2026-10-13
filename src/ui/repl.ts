@@ -11,6 +11,7 @@ import type { SkillRegistry } from '../skills/registry.js'
 import type { SkillMeta } from '../skills/types.js'
 import type { Tool } from '../tools/types.js'
 import { describeError } from '../util/errors.js'
+import { messageText } from '../util/message.js'
 import { decodeInput } from './input-decoder.js'
 import { style, sym } from './theme.js'
 
@@ -356,9 +357,13 @@ export class Repl {
         break
       }
 
-      case 'memory':
-        this.info(this.opts.agent.messages[0]?.content.split('## 项目记忆')[1]?.split('## 会话配置')[0]?.trim() ?? '(无)')
+      case 'memory': {
+        // messages[0] 是系统提示词，按约定永远是字符串；过一道 messageText 不是因为它
+        // 会变，而是让「content 是联合类型」这件事在读取点上有一处显式落脚
+        const sys = messageText(this.opts.agent.messages[0]?.content ?? '')
+        this.info(sys.split('## 项目记忆')[1]?.split('## 会话配置')[0]?.trim() ?? '(无)')
         break
+      }
 
       // 注意 /memory 和 /memories 是两回事：前者是项目记忆（CLAUDA.md，人写的），
       // 后者是记忆库（模型学的，全局）。名字像但是两套生命周期，别合并。

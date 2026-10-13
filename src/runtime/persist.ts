@@ -1,5 +1,9 @@
 import type { SessionSnapshot } from '../agent/agent.js'
 import { deriveTitle, loadSession, saveSession } from '../agent/session.js'
+import { formatBytes } from '../util/text.js'
+
+/** 会话文件超过这个体积就在 stderr 上说一句。带图的会话会撞到，正常对话不会 */
+const BIG_SESSION_BYTES = 20 * 1024 * 1024
 
 export interface PersistOptions {
   cwd: string
@@ -20,6 +24,16 @@ export interface PersistOptions {
 export function persistSession(opts: PersistOptions): void {
   const { snapshot } = opts
   if (snapshot.messages.length <= 1) return
+
+  // 带图的会话里 base64 会随每轮整份重写。超了就说一声 —— 否则用户只会看到「保存越来越慢」
+  // 而不知道账单记在图片头上（图片按设计留在历史里，见 README 的「已知限制」）
+  const bytes = JSON.stringify(snapshot.messages).length
+  if (bytes > BIG_SESSION_BYTES) {
+    process.stderr.write(
+      `[clauda] 会话 ${opts.sessionId} 已到 ${formatBytes(bytes)}（附件里的图片会随每轮重写），` +
+        `继续追加会越来越慢\n`,
+    )
+  }
 
   try {
     const previous = loadSession(opts.cwd, opts.sessionId)

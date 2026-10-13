@@ -699,6 +699,87 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
     )
     check('穿越尝试真的没写出文件', Array.isArray(d.strayFile) && d.strayFile.length === 0, JSON.stringify(d.strayFile))
 
+    // ---- 附件：图片真的作为多模态内容发出去了吗
+    //
+    // 这是「输入框能发文件」这条需求里唯一算数的证据 —— 界面上有 chip、payload 里
+    // 有字段，都不代表字节真的上了线。只能看服务端究竟收到了什么。
+    const ingested = d.attachIngest?.attachments ?? []
+    check(
+      'attachment/ingest 把磁盘上的图片读成了 data URL',
+      d.attachIngest?.ok === true &&
+        ingested.length === 1 &&
+        ingested[0].kind === 'image' &&
+        ingested[0].dataUrl?.startsWith('data:image/png;base64,'),
+      JSON.stringify(d.attachIngest),
+    )
+    // 字节数得是**真读出来的那份**，不是渲染层报上来的（`sanitizeAttachments`
+    // 还会按 data URL 长度重算一遍，那是另一条防线）
+    check(
+      'ingest 报的字节数和磁盘上的文件一致',
+      ingested[0]?.bytes > 0 && ingested[0].bytes === d.shotBytes,
+      `${ingested[0]?.bytes} vs ${d.shotBytes}`,
+    )
+    check(
+      '非图片附件只带路径、不带内容',
+      d.fileIngest?.ok === true &&
+        d.fileIngest.attachments?.[0]?.kind === 'file' &&
+        d.fileIngest.attachments[0].dataUrl === undefined &&
+        typeof d.fileIngest.attachments[0].path === 'string',
+      JSON.stringify(d.fileIngest),
+    )
+    check('带附件的这一轮跑成功了', d.attachSend?.ok === true, JSON.stringify(d.attachSend))
+
+    const sentUser = [...(d.attachSeen?.messages ?? [])].reverse().find((m) => m.role === 'user')
+    check(
+      '请求体里那条用户消息的 content 是内容块数组',
+      Array.isArray(sentUser?.content),
+      JSON.stringify(sentUser?.content).slice(0, 300),
+    )
+    const imageParts = (Array.isArray(sentUser?.content) ? sentUser.content : []).filter(
+      (p) => p?.type === 'image_url',
+    )
+    check(
+      '数组里带着真的 image_url 块，url 是 data:image/png;base64',
+      imageParts.length === 1 && imageParts[0].image_url?.url?.startsWith('data:image/png;base64,'),
+      JSON.stringify(imageParts).slice(0, 200),
+    )
+    check(
+      '用户自己打的那句话也还在（图片没有把文字挤掉）',
+      (Array.isArray(sentUser?.content) ? sentUser.content : []).some(
+        (p) => p?.type === 'text' && p.text === '看看这张图',
+      ),
+      JSON.stringify(sentUser?.content).slice(0, 300),
+    )
+
+    // 留在历史里 = 落在会话文件里。没落盘的话关掉窗口这张图就没了，「后续还能追问」是空话
+    const onDiskUser = (d.attachOnDisk?.messages ?? []).filter((m) => m.role === 'user').find((m) =>
+      Array.isArray(m.content),
+    )
+    check(
+      '带图的那条消息原样落进了会话文件',
+      Array.isArray(onDiskUser?.content) && onDiskUser.content.some((p) => p?.type === 'image_url'),
+      JSON.stringify(onDiskUser?.content).slice(0, 300),
+    )
+    // 纯文本消息**仍然**是字符串：这是保住 CLI、压缩摘要、老会话文件那几条路径不回归的关键。
+    // 顺手把整条链路改成数组是最省事的写法，也是最容易在某处静默出错的写法
+    check(
+      '纯文本消息的 content 依然是字符串（老路径没被顺手改成数组）',
+      restored.some((m) => m.role === 'user' && typeof m.content === 'string' && m.content === '项目叫什么'),
+      JSON.stringify(restored.map((m) => typeof m.content)),
+    )
+
+    // 「关掉窗口重开、点回该会话」：恢复回来的消息里必须还带着图片，
+    // 否则界面上那个会话只剩一句话，用户会以为图丢了
+    const resumedImage = (d.attachResumed?.messages ?? [])
+      .filter((m) => m.role === 'user' && Array.isArray(m.content))
+      .flatMap((m) => m.content)
+      .find((p) => p?.type === 'image_url')
+    check(
+      '从历史里恢复出来的会话仍带着那张图',
+      d.attachResumed?.ok === true && resumedImage?.image_url?.url?.startsWith('data:image/png;base64,'),
+      JSON.stringify(d.attachResumed?.messages ?? []).slice(0, 300),
+    )
+
     check('退出后会话真的没了', d.afterQuit?.ok === false, JSON.stringify(d.afterQuit))
     check('退出不卡死（MCP 该关的都关了）', elapsed < 30_000, `耗时 ${elapsed}ms`)
   }

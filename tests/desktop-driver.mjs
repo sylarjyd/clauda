@@ -20,6 +20,10 @@ import { createMockServer } from './mock-server.mjs'
 const PORT = Number(process.env.DESK_PORT ?? 8918)
 const dist = new URL('../dist/', import.meta.url).href
 
+/** 一张真的 1×1 PNG。附件那条路要么读到真字节、要么什么都没验到，所以现编一个 */
+const PNG_1X1 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-home-'))
 // 会话的 cwd 必须是个临时目录：write_file 会真落盘，写进仓库根目录就污染工作区了
 const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-desk-proj-'))
@@ -73,6 +77,18 @@ const out = {
   resumed: null,
   resumedState: null,
   afterQuit: null,
+  attachIngest: null,
+  fileIngest: null,
+  attachSend: null,
+  attachSeen: null,
+  attachOnDisk: null,
+  attachResumed: null,
+  shotBytes: null,
+  /**
+   * 「并发那两个会话」的 id。`deltas` / `statuses` 只统计它们 —— 附件那一段
+   * 也会吐增量和状态，不划清的话「增量没有串到别的会话」这条断言会开始数附件会话的账。
+   */
+  coreSessionIds: [],
   quitMs: null,
   elapsedMs: null,
   deltas: {},
@@ -145,6 +161,7 @@ try {
   const b = await app.handle('session/open', { cwd: projectDir })
   if (!a.ok || !b.ok) throw new Error(`session/open 失败：${JSON.stringify({ a, b })}`)
   out.sessionIds = [a.session.id, b.session.id]
+  out.coreSessionIds = [...out.sessionIds]
 
   // 两个会话同时跑：A 读、B 写（写会弹授权）。并发发出去，各自 await
   const [sendA, sendB] = await Promise.all([
@@ -202,6 +219,49 @@ try {
   if (c.ok) out.sessionIds.push(c.session.id)
   out.configOnDisk = fs.readFileSync(path.join(projectDir, '.clauda', 'config.json'), 'utf8')
 
+  // ---- 附件：真造一张 PNG，走「ingest 读字节 → send 带上去 → 落盘 → 恢复」整条路
+  //
+  // **必须排在下面那段「切厂商」之前**：切完厂商之后 provider 真的会往新地址发请求，
+  // 那是 api.deepseek.com —— 这个用例会变成一次真联网（实测撞回 401）。
+  // e2e 一律不能出网。
+  //
+  // 用会话 c（前面开出来那个）而不是新开一个：`e2e.mjs` 里有一串断言盯着
+  // 「开出了几个会话」「哪几个会话吐过增量」，新开一个会把它们一起带偏。
+  //
+  // 顺序照着 renderer 来：渲染层拿不到 fs，所以它是先 `attachment/ingest` 拿回
+  // 归一化结果（图片在这一步变成 data URL），再把那份描述符交给 `session/send`。
+  // 这里刻意不复刻「只传 path」，那会让 `sanitizeAttachments` 的图片分支永远不被走到。
+  const shotPath = path.join(projectDir, 'shot.png')
+  fs.writeFileSync(shotPath, Buffer.from(PNG_1X1, 'base64'))
+  out.shotBytes = fs.statSync(shotPath).size
+  out.attachIngest = await app.handle('attachment/ingest', {
+    items: [{ path: shotPath, name: 'shot.png', mime: 'image/png' }],
+  })
+  // 非图片只带路径、不读内容 —— 这条和上面那条是 `UserAttachment` 的两个分支
+  out.fileIngest = await app.handle('attachment/ingest', {
+    items: [{ path: path.join(projectDir, 'package.json') }],
+  })
+  const ingested = out.attachIngest?.attachments ?? []
+  // 文案里**不能出现「写」**：mock 服务端是按最后一条用户消息里的「写」决定返回
+  // write_file 还是 read_file 的，一带「写」就会多弹一次授权框，把上面
+  // 「写操作弹了授权框」那条断言（length === 1）撞坏
+  out.attachSend = await app.handle('session/send', {
+    sessionId: c.session.id,
+    text: '看看这张图',
+    attachments: ingested,
+  })
+  // 立刻取：后面还有若干轮请求会往 seen 里追加，晚了拿到的就不是这一轮了
+  out.attachSeen = server.seen.at(-1) ?? null
+
+  const slug = fs.readdirSync(path.join(home, 'projects'))[0]
+  const sessionFile = path.join(home, 'projects', slug, `${c.session.id}.json`)
+  out.attachOnDisk = fs.existsSync(sessionFile) ? JSON.parse(fs.readFileSync(sessionFile, 'utf8')) : null
+
+  // 关掉再从历史里接回来 —— 这正是「关掉窗口重开、点回该会话」那条路。恢复回来的
+  // 消息里要是没有图片，界面上那个会话就只剩一句话，用户会以为图丢了
+  await app.handle('session/close', { sessionId: c.session.id })
+  out.attachResumed = await app.handle('session/resume', { cwd: projectDir, id: c.session.id })
+
   // 切厂商：**地址与模型一次写完**。只换地址的话，当前会话会拿着旧模型名去问新端点，
   // 换来的只是个费解的 404。
   //
@@ -235,12 +295,17 @@ try {
 out.elapsedMs = Date.now() - t0
 
 for (const { sessionId, event } of events) {
-  if (event.type === 'assistant-delta') out.deltas[sessionId] = (out.deltas[sessionId] ?? '') + event.text
+  // 增量与状态只记并发那两个会话（见 coreSessionIds 的注释）
+  if (out.coreSessionIds.includes(sessionId)) {
+    if (event.type === 'assistant-delta') out.deltas[sessionId] = (out.deltas[sessionId] ?? '') + event.text
+  }
   if (event.type === 'tool-start') {
     out.toolStarts.push({ sessionId, name: event.name, summary: event.summary })
   }
 }
-out.statuses = Object.fromEntries(statusTimeline)
+out.statuses = Object.fromEntries(
+  [...statusTimeline].filter(([sessionId]) => out.coreSessionIds.includes(sessionId)),
+)
 out.permissions = permissionRequests
 out.eventSessionIds = [...new Set(events.map((e) => e.sessionId))]
 const known = new Set(out.sessionIds)

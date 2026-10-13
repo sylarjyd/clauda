@@ -82,6 +82,21 @@ function createWindow() {
     void desktop.handle('app/quit')
   })
 
+  /**
+   * **必须有的两个守卫**，都是「往窗口上拖文件」这个动作引出来的：
+   *
+   * Chromium 对落在没监听的区域上的拖放，默认行为是**导航到那个 file://** —— 整个 UI
+   * 被那个文件顶掉，而且没有返回键，只能关窗重开。renderer 那边只在 `.app` 上监听了
+   * 拖放，窗口的边缘、导航栏的空隙都不在它管辖范围内，所以这里必须兜住。
+   *
+   * `app://clauda/` 是启动那一次（以及将来可能的页面内跳转）要走的路，其余一律拦下。
+   * `setWindowOpenHandler` 顺手也关掉：这个应用没有任何需要开新窗的场景。
+   */
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('app://clauda/')) event.preventDefault()
+  })
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+
   void win.loadURL('app://clauda/index.html')
   return win
 }
@@ -101,6 +116,12 @@ app.whenReady().then(() => {
   ipcMain.handle('clauda:pick-directory', async () => {
     const res = await dialog.showOpenDialog({ properties: ['openDirectory'] })
     return res.canceled ? null : (res.filePaths[0] ?? null)
+  })
+  // 和 pick-directory 一样不走 desktop.handle：它要的是 Electron 的 dialog，
+  // 而不是任何业务逻辑。读字节、判大小那些都在 attachment/ingest 里
+  ipcMain.handle('clauda:pick-files', async () => {
+    const res = await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'] })
+    return res.canceled ? null : res.filePaths
   })
 
   createWindow()

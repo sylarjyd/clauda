@@ -1,6 +1,7 @@
 import { isSafeSessionId, listProjects, listSessionSummaries, loadSession } from '../agent/session.js'
 import type { PermissionMode } from '../config.js'
 import { findVendor } from '../provider/vendors.js'
+import { ingestAttachments, sanitizeAttachments } from './attachment.js'
 import type { PermissionDecision } from './permission-bridge.js'
 import { SessionManager, type EventSink, type Session, type SessionProject } from './session-manager.js'
 
@@ -75,8 +76,22 @@ export class DesktopApp {
           }))
 
         case 'session/send': {
-          const res = await this.manager.send(str(payload, 'sessionId'), str(payload, 'text'))
-          return res.ok ? { ok: true } : { ok: false, reason: res.reason }
+          // 附件在这里**只核形状**：字节早在 `attachment/ingest` 那一步就读好了，
+          // 用户拖进来之后把源文件删掉也不影响发送
+          const raw = field(payload, 'attachments')
+          const attachments = sanitizeAttachments(raw)
+          // 形状不对的会被静默丢掉（见 sanitizeAttachments）。丢几个要说一声 ——
+          // 「chip 明明在输入框上、发出去却没有」是那种能查一整晚的问题
+          const dropped = Array.isArray(raw) ? Math.max(0, raw.length - attachments.length) : 0
+          const res = await this.manager.send(str(payload, 'sessionId'), str(payload, 'text'), attachments)
+          return res.ok ? { ok: true, dropped: dropped || undefined } : { ok: false, reason: res.reason }
+        }
+
+        case 'attachment/ingest': {
+          // 拖拽 / 粘贴 / 选文件都先过这里：读字节、判大小、判路径，返回的不合规项
+          // 由 renderer 立刻报进通知栏。发送时不再读盘
+          const { attachments, rejected } = await ingestAttachments(field(payload, 'items'))
+          return { ok: true, attachments, rejected }
         }
 
         case 'session/abort':
@@ -245,16 +260,21 @@ function withStr(payload: unknown, key: string, fn: (value: string) => ChannelRe
   return fn(value)
 }
 
+/** 取原始字段。附件那两条 channel 收的就是未知形状（renderer 从 DataTransfer 里抄来的） */
+function field(payload: unknown, key: string): unknown {
+  return (payload as Record<string, unknown> | null)?.[key]
+}
+
 function str(payload: unknown, key: string): string {
-  const value = (payload as Record<string, unknown> | null)?.[key]
+  const value = field(payload, key)
   return typeof value === 'string' ? value : ''
 }
 
 function num(payload: unknown, key: string): number {
-  const value = (payload as Record<string, unknown> | null)?.[key]
+  const value = field(payload, key)
   return typeof value === 'number' ? value : 0
 }
 
 function bool(payload: unknown, key: string): boolean {
-  return (payload as Record<string, unknown> | null)?.[key] === true
+  return field(payload, key) === true
 }

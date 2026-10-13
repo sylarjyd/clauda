@@ -2306,6 +2306,237 @@ console.log('\n== 桌面端渲染层：增量重绘的节点挑选 ==')
   )
 }
 
+// 用户在输入框里带上来的图片。`WireMessage.content` 从 `string` 放宽成了
+// `string | ContentPart[]`，于是「content 一定是字符串」这个假设在好几处塌掉了。
+// 塌的方式分两档，**两档要分别钉**：
+//   - 崩的那一档只有 `messagesTokens`（`estimateTokens` 里 `ch.codePointAt` 不是函数），
+//     它经 `contextTokens()` 被 /cost、压缩判定、每轮 infoOf 调用 —— 不改就是打开会话白屏；
+//   - 静默的那一档（`summarize` / `deriveTitle` / 渲染层）**不抛**，只是把
+//     `[object Object]` 拼进摘要和标题里。不钉的话这类坏数据能安安静静躺在会话文件里。
+console.log('\n== 消息内容：从纯文本放宽到 content part 之后 ==')
+{
+  const { IMAGE_TOKEN_ESTIMATE, buildUserContent, contentTokens, messageText } = await import(
+    `${dist}util/message.js`
+  )
+  const { estimateTokens } = await import(`${dist}util/text.js`)
+  const { deriveTitle } = await import(`${dist}agent/session.js`)
+
+  const img = (url = 'data:image/png;base64,AAAA') => ({ type: 'image_url', image_url: { url } })
+  const txt = (t) => ({ type: 'text', text: t })
+
+  check('纯字符串原样返回', messageText('你好') === '你好')
+  check('text 块拼起来', messageText([txt('第一行'), txt('第二行')]) === '第一行\n第二行')
+  check('图片变成占位符', messageText([txt('看这张'), img()]) === '看这张\n[图片]')
+  check('空数组得到空串', messageText([]) === '')
+  check('不是数组的怪形状不抛', messageText(undefined) === '' && messageText(42) === '')
+
+  // 崩的那一档：`contextTokens()` 走的就是这里
+  const withImage = [txt('一段文字'), img()]
+  check('数组型 content 估算不抛（contextTokens 的回归护栏）', typeof contentTokens(withImage) === 'number')
+  check(
+    '图片按固定值计，不按 base64 长度',
+    contentTokens(withImage) === estimateTokens('一段文字') + IMAGE_TOKEN_ESTIMATE,
+    String(contentTokens(withImage)),
+  )
+  // 这条是那个「按字节估」的错误实现会当场露馅的地方：2MB 的图会算出 ~70 万
+  const huge = [img('data:image/png;base64,' + 'A'.repeat(2_800_000))]
+  check(
+    '一张 2MB 的图不会算出六位数 token',
+    contentTokens(huge) < 5000,
+    String(contentTokens(huge)),
+  )
+  check('字符串仍然走原来的估算', contentTokens('abcd') === estimateTokens('abcd'))
+
+  // 没有附件时必须**还是字符串** —— 老会话文件、CLI、压缩摘要全靠这一支
+  check('没有附件时 buildUserContent 返回字符串', typeof buildUserContent('你好', []) === 'string')
+  const withParts = buildUserContent('看这张', [
+    { kind: 'image', name: 'a.png', dataUrl: 'data:image/png;base64,AAAA', bytes: 3 },
+    { kind: 'file', name: 'b.py', path: 'C:/p/b.py', bytes: 10 },
+  ])
+  check('有附件时返回数组', Array.isArray(withParts), typeof withParts)
+  check('数组第一个块是用户打的字', withParts[0].type === 'text' && withParts[0].text === '看这张')
+  check('图片块排在路径清单前面', withParts[1].type === 'image_url' && withParts[1].image_url.url.endsWith('AAAA'))
+  check('路径清单在最后一块里', withParts[2]?.type === 'text' && withParts[2].text.includes('C:/p/b.py'), withParts[2]?.text)
+  // 一个字没打只丢了一张图 —— 空 text 块有些端点会当非法请求
+  const imageOnly = buildUserContent('', [{ kind: 'image', name: 'a.png', dataUrl: 'data:image/png;base64,AAAA', bytes: 3 }])
+  check('只发图片时正文不是空的', imageOnly[0].text.length > 0, imageOnly[0].text)
+  // 只有文件、一个字没打：正文补占位，路径清单照给
+  const fileOnly = buildUserContent('', [{ kind: 'file', name: 'b.py', path: 'C:/p/b.py', bytes: 10 }])
+  check('只发文件时也有正文', fileOnly[0].text.length > 0, fileOnly[0].text)
+
+  // 静默的那一档：不抛，但绝不能是 [object Object]
+  check('数组型 content 也能取标题', deriveTitle([{ role: 'user', content: [txt('修一下登录'), img()] }]) === '修一下登录')
+  const titleOfImageOnly = deriveTitle([{ role: 'user', content: [img()] }])
+  check('纯图片消息的标题不是空的', titleOfImageOnly.length > 0, JSON.stringify(titleOfImageOnly))
+  check('纯图片消息的标题不出现 [object Object]', !titleOfImageOnly.includes('[object Object]'), titleOfImageOnly)
+  check(
+    '坏形状的 content 不会让取标题抛',
+    typeof deriveTitle([{ role: 'user', content: { 怪: '形状' } }]) === 'string',
+  )
+}
+
+// 附件的归一化只有两条路：renderer 报原始形状（走 fs 读字节），session/send 回传
+// 归一化后的描述符（纯核形状）。**「请求体里带没带图」只能在 e2e 里断言**，
+// 这里判的是「字节读得对不对、该拒的拒没拒」。
+console.log('\n== 桌面端：附件的归一化与校验 ==')
+{
+  const { ingestAttachments, sanitizeAttachments } = await import(`${dist}runtime/attachment.js`)
+
+  // 一张真的 1×1 PNG。**不能引用磁盘上的 fixture 文件** —— 单测跑在临时目录里
+  const PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+    'base64',
+  )
+  const PNG_URL = `data:image/png;base64,${PNG.toString('base64')}`
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-attach-'))
+  const pngPath = path.join(dir, 'shot.png')
+  const pyPath = path.join(dir, 'demo.py')
+  const bigPath = path.join(dir, 'big.png')
+  const fakePngPath = path.join(dir, 'fake.png')
+  fs.writeFileSync(pngPath, PNG)
+  fs.writeFileSync(pyPath, 'print(1)\n')
+  fs.writeFileSync(bigPath, Buffer.alloc(5 * 1024 * 1024, 1))
+  // 名字是 .png、内容却是文本。改名 / 传错文件都会长成这样
+  fs.writeFileSync(fakePngPath, 'print(1)\n')
+
+  const img = await ingestAttachments([{ path: pngPath, name: 'shot.png', mime: '' }])
+  check('磁盘上的 png 被认成图片', img.attachments[0]?.kind === 'image', JSON.stringify(img.attachments))
+  check(
+    'png 的 data URL 前缀是 image/png',
+    img.attachments[0]?.dataUrl?.startsWith('data:image/png;base64,'),
+    img.attachments[0]?.dataUrl?.slice(0, 30),
+  )
+  check('字节数就是文件大小', img.attachments[0]?.bytes === PNG.length, String(img.attachments[0]?.bytes))
+  check('没有被拒的', img.rejected.length === 0, img.rejected.join(' / '))
+  // mime 空、扩展名认得出来 —— 拖进来的文件 type 常常是空串
+  check('File.type 为空也不影响判图', img.attachments[0]?.kind === 'image')
+
+  const py = await ingestAttachments([{ path: pyPath, name: 'demo.py' }])
+  check('非图片只带路径', py.attachments[0]?.kind === 'file' && py.attachments[0]?.path === pyPath)
+  check('非图片不读字节', py.attachments[0]?.dataUrl === undefined)
+
+  const big = await ingestAttachments([{ path: bigPath, name: 'big.png' }])
+  check('超过 4MB 的图片被拒', big.attachments.length === 0 && big.rejected.length === 1, big.rejected.join(' / '))
+  check('拒绝理由说清了是「太大」', /太大/.test(big.rejected[0] ?? ''), big.rejected[0])
+
+  // 认图看的是**字节**，不是名字：名字像图而内容是文本时，得在本地就拦下来。
+  // 放过去的话会一路发到端点换回一个 400，用户看到的却是「这个端点不支持图片输入」
+  // —— 一句会把用户引到换模型上去的假话。
+  const fake = await ingestAttachments([{ path: fakePngPath, name: 'fake.png', mime: 'image/png' }])
+  check('名字是 .png 但内容是文本的，被拒', fake.attachments.length === 0 && fake.rejected.length === 1, JSON.stringify(fake))
+  check('理由说的是「内容不是图片」', /不是图片/.test(fake.rejected[0] ?? ''), fake.rejected[0])
+  check('不会误报成「太大」', !/太大/.test(fake.rejected[0] ?? ''), fake.rejected[0])
+
+  // mime 以字节为准：扩展名说 jpeg、字节里是 PNG，就得报 image/png。
+  // 「扩展名 → mime」的表在这里只会给出一个错标签
+  const mislabeled = path.join(dir, 'actually.png.jpg')
+  fs.writeFileSync(mislabeled, PNG)
+  const sniffed = await ingestAttachments([{ path: mislabeled, name: 'actually.png.jpg', mime: 'image/jpeg' }])
+  check(
+    'mime 取字节嗅出来的，不认扩展名和 File.type',
+    sniffed.attachments[0]?.dataUrl?.startsWith('data:image/png;base64,'),
+    sniffed.attachments[0]?.dataUrl?.slice(0, 30),
+  )
+
+  // 剪贴板那条路：renderer 送进来的字符串。前缀是粗筛，负载同样要嗅
+  const pasted = await ingestAttachments([{ dataUrl: PNG_URL, name: '剪贴板图片' }])
+  check('没有路径但有 data:image/ 的放行', pasted.attachments[0]?.kind === 'image', JSON.stringify(pasted))
+  const badPrefix = await ingestAttachments([{ dataUrl: 'data:text/html;base64,AAAA', name: 'x' }])
+  check('data URL 前缀不是 image 的被拒', badPrefix.attachments.length === 0, JSON.stringify(badPrefix))
+  const fakePayload = await ingestAttachments([{ dataUrl: 'data:image/png;base64,AAAA', name: 'x' }])
+  check(
+    '前缀写着 image/png 但负载不是图的，被拒',
+    fakePayload.attachments.length === 0 && fakePayload.rejected.length === 1,
+    JSON.stringify(fakePayload),
+  )
+  const noSource = await ingestAttachments([{ name: 'x.png' }])
+  check('既没路径也没 data URL 的被拒', noSource.attachments.length === 0 && noSource.rejected.length === 1)
+  check('拒绝理由告诉用户怎么办', /另存/.test(noSource.rejected[0] ?? ''), noSource.rejected[0])
+
+  const nul = await ingestAttachments([{ path: `${dir}\0.png` }])
+  check('含 \\0 的路径被拒', nul.attachments.length === 0 && nul.rejected.length === 1, JSON.stringify(nul))
+  check('拒绝理由不是「没有磁盘路径」', !/没有磁盘路径/.test(nul.rejected[0] ?? ''), nul.rejected[0])
+
+  const many = await ingestAttachments(Array.from({ length: 12 }, (_, i) => ({ path: pyPath, name: `f${i}.py` })))
+  check('超过 8 个的附件被截断', many.attachments.length === 8, String(many.attachments.length))
+  check('被截断这件事报出来了', many.rejected.some((r) => /最多/.test(r)), many.rejected.join(' / '))
+
+  check('不是数组的入参不抛', (await ingestAttachments(null)).attachments.length === 0)
+
+  // 回传那一侧：纯核形状，不碰 fs
+  check(
+    '归一化过的图片能过',
+    sanitizeAttachments([{ kind: 'image', name: 'a', dataUrl: PNG_URL, bytes: PNG.length }]).length === 1,
+  )
+  check(
+    '伪造的 dataUrl 前缀过不去',
+    sanitizeAttachments([{ kind: 'image', name: 'a', dataUrl: 'https://x/a.png' }]).length === 0,
+  )
+  check(
+    '前缀对但负载不是图的过不去',
+    sanitizeAttachments([{ kind: 'image', name: 'a', dataUrl: 'data:image/png;base64,AAAA' }]).length === 0,
+  )
+  check(
+    '没有路径的文件过不去',
+    sanitizeAttachments([{ kind: 'file', name: 'a' }]).length === 0,
+  )
+  const recounted = sanitizeAttachments([{ kind: 'image', name: 'a', dataUrl: PNG_URL, bytes: 999999 }])[0]
+  check('字节数按 dataUrl 长度重算，不认 renderer 报的', recounted?.bytes === PNG.length, String(recounted?.bytes))
+}
+
+// 恢复历史时图片要能重画出来 —— 「图片留在会话历史里」这条决策的真正验收点。
+// 同时钉住「纯文本消息还是一个字符串」：老会话文件读回来必须和从前一模一样。
+console.log('\n== 桌面端渲染层：把落盘的消息还原成条目 ==')
+{
+  const { imageUrls, toItems, userText } = await import(
+    new URL('../desktop/renderer/state.js', import.meta.url).href
+  )
+
+  const content = [
+    { type: 'text', text: '这张图右边那个按钮什么颜色' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    { type: 'text', text: '附件（只给了路径，需要内容请用 read_file）：\n- C:/p/a.py' },
+  ]
+  const items = toItems([{ role: 'user', content }])
+  check('还原出一条用户条目', items.length === 1 && items[0].kind === 'user', JSON.stringify(items))
+  check('气泡里的字只有用户自己打的那些', items[0].text === '这张图右边那个按钮什么颜色', items[0].text)
+  check('追加的附件清单不进气泡', !items[0].text.includes('只给了路径'), items[0].text)
+  check('图片被还原成 data URL（重开窗口还看得见图）', items[0].images.length === 1, JSON.stringify(items[0].images))
+  check('图片就是那一张', imageUrls(content)[0].endsWith('AAAA'), imageUrls(content)[0])
+
+  const plain = toItems([{ role: 'user', content: '就一句话' }])
+  check('纯文本消息照旧（多出来的 images 是空数组）', plain[0].text === '就一句话' && plain[0].images.length === 0)
+  check('坏形状不抛', userText({ 怪: 1 }) === '' && imageUrls(undefined).length === 0)
+
+  // 工具卡片那条路完全不能因为这次改动变形
+  const tools = toItems([
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'c1', content: '文件内容' },
+  ])
+  check('工具卡片仍然对得上名字', tools[0].name === 'read_file', JSON.stringify(tools))
+  check('工具卡片仍然收得到结果', tools[0].status === 'done' && tools[0].result === '文件内容', JSON.stringify(tools[0]))
+}
+
+// 内置的九家里纯文本端点才是多数，第一次发图很可能撞上「这个端点不收图片」——
+// 而 SDK 的原话是一段原始报文，用户只会以为是自己操作错了。400 得有个人话版本，
+// 并且点到那个最可能的原因上。
+console.log('\n== 报错翻译：400 要点名「可能是图片」 ==')
+{
+  const { describeError } = await import(`${dist}util/errors.js`)
+  const cfg = { provider: { baseUrl: 'https://api.deepseek.com/v1' } }
+  const msg = describeError({ status: 400, message: 'Bad Request' }, cfg)
+  check('400 不再原样透传 SDK 的话', !msg.includes('Bad Request'), msg)
+  check('400 里点出了图片这条可能', msg.includes('图片'), msg)
+  check('400 里带上了当前接口地址', msg.includes('api.deepseek.com'), msg)
+  // 邻居不能被顺手改坏
+  check('401 仍走认证那条', describeError({ status: 401 }).includes('API Key'))
+  check('404 仍点名路径前缀', describeError({ status: 404 }, cfg).includes('compatible-mode'))
+}
+
 // app.js 是这次改动里最大的一块没被覆盖的代码。它最容易出的错不是「算错了」而是
 // 「漏画了」—— streamPlan 那种纯逻辑单测盯不到。这里套一层假 DOM 把真实的
 // renderStream / paint / renderModal 走一遍。抓到过一次真 bug：
@@ -2568,6 +2799,115 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   check('切回后对话区回来了', app.el('view-sessions').hidden === false)
   check('切回后设置容器藏起来了', app.el('view-settings').hidden === true)
   check('切回后消息流还在', app.el('stream').children.length === 1, String(app.el('stream').children.length))
+
+  // ---- 附件：拖拽 / 粘贴 / 选文件 / 发出去
+  // 这里的桩只回答「renderer 报了些什么、回来的东西画没画出来」。真字节读得对不对
+  // 是 attachment.ts 的单测，请求体里带没带图是 e2e 的事。
+  const chips = () => app.el('attach-list').children
+  const fileWithPath = (p, name, type = '') => ({ path: p, name, type, size: 100 })
+
+  check('一开始没有附件条，整条是藏着的', chips().length === 0 && app.el('attach-list').hidden === true)
+
+  // `dragover` 不 preventDefault 就没有 drop 事件；不判 types 又会把拖文字也吃掉。
+  // 两条都要钉，因为它们错了的表现都是「什么都没发生」
+  const fireDrag = (type, dataTransfer) => {
+    let prevented = false
+    app.el('app').fire(type, { dataTransfer, preventDefault: () => (prevented = true) })
+    return prevented
+  }
+  check('拖文件进来时接住 dragenter', fireDrag('dragenter', { types: ['Files'] }) === true)
+  check('接住之后整窗遮罩出来了', app.el('drop-hint').hidden === false)
+  check('拖文件时接住 dragover（不接住就没有 drop）', fireDrag('dragover', { types: ['Files'] }) === true)
+  check('拖动过程中遮罩不闪（进入计数）', app.el('drop-hint').hidden === false)
+  // 拖的是一段选中的文字：不能接管，否则用户没法把文字拖进输入框
+  check('拖文字时不去接 dragover', fireDrag('dragover', { types: ['text/plain'] }) === false)
+
+  app.el('app').fire('drop', { dataTransfer: { types: ['Files'], files: [fileWithPath('C:/p/a.png', 'a.png', 'image/png')] } })
+  await tick()
+  check('松手后遮罩收起来了', app.el('drop-hint').hidden === true)
+  check('拖进来的文件变成了一个 chip', chips().length === 1, String(chips().length))
+  check('chip 里有缩略图', chips()[0]?.children.some((c) => c.tagName === 'img'), JSON.stringify(chips()[0]?.children.map((c) => c.tagName)))
+  check('chip 上写着文件名', textOf(chips()[0]).includes('a.png'), textOf(chips()[0]))
+  check('chip 上带着体积', textOf(chips()[0]).includes('12 B'), textOf(chips()[0]))
+  check('附件条显示出来了', app.el('attach-list').hidden === false)
+  check('拖进来的文件走了磁盘路径那条路', app.ingestCalls.at(-1)?.items[0]?.path === 'C:/p/a.png', JSON.stringify(app.ingestCalls.at(-1)))
+
+  // 同一个文件再拖一次：不该出现两张一模一样的 chip（发出去就是同一张图两遍）
+  app.el('app').fire('drop', { dataTransfer: { types: ['Files'], files: [fileWithPath('C:/p/a.png', 'a.png', 'image/png')] } })
+  await tick()
+  check('同一个文件拖两次不会出现两张 chip', chips().length === 1, String(chips().length))
+
+  app.el('app').fire('drop', {
+    dataTransfer: { types: ['Files'], files: [fileWithPath('C:/p/demo.py', 'demo.py'), fileWithPath('C:/p/b.jpg', 'b.jpg', 'image/jpeg')] },
+  })
+  await tick()
+  check('可以一次拖多个', chips().length === 3, String(chips().length))
+  check('文本文件没有缩略图，只有一个字形', chips()[1].children[0].className === 'attach-glyph', chips()[1].children[0].className)
+
+  // 粘贴：没有文件时**一个字都不许动**
+  let pastePrevented = false
+  app.el('input').fire('paste', { clipboardData: { files: [] }, preventDefault: () => (pastePrevented = true) })
+  check('粘贴纯文本时不拦（拦了用户就粘不进字）', pastePrevented === false)
+
+  // 粘贴一张截图：没有磁盘路径，只能由 renderer 自己读成 data URL
+  app.el('input').fire('paste', {
+    clipboardData: { files: [{ path: '', name: 'image.png', type: 'image/png', size: 100 }] },
+    preventDefault: () => (pastePrevented = true),
+  })
+  await tick()
+  check('粘贴文件时拦下默认行为（否则文件名会被当文本插进来）', pastePrevented === true)
+  check('粘贴的截图也变成了 chip', chips().length === 4, String(chips().length))
+  check(
+    '没有磁盘路径时改走 dataUrl 那条路',
+    app.ingestCalls.at(-1)?.items[0]?.dataUrl?.startsWith('data:image/'),
+    JSON.stringify(app.ingestCalls.at(-1)),
+  )
+
+  // 点 chip 上的 ×
+  chips()[0].children.at(-1).click()
+  await tick()
+  check('点 × 少一个 chip', chips().length === 3, String(chips().length))
+
+  // 点「附件」按钮走文件选择器
+  app.picker.paths = ['C:/p/picked.py']
+  await app.el('attach').click()
+  await tick()
+  check('选文件也能加进来', chips().length === 4, String(chips().length))
+  check('选文件只报路径，名字交给主进程定', app.ingestCalls.at(-1)?.items[0]?.name === undefined, JSON.stringify(app.ingestCalls.at(-1)))
+
+  // 只丢一张图、一个字不打就发 —— 旧代码在 `!text` 那里直接返回，这条发不出去
+  const before = app.el('stream').children.length
+  await app.el('composer').fire('submit')
+  await tick()
+  const sentPayload = app.sent.at(-1)
+  check('空文本 + 有附件也发得出去', sentPayload !== undefined, JSON.stringify(sentPayload))
+  check('发出去的 payload 里带着附件', Array.isArray(sentPayload?.attachments) && sentPayload.attachments.length === 4, JSON.stringify(sentPayload?.attachments))
+  check('附件带上去了图片的 dataUrl', sentPayload.attachments.some((a) => a.kind === 'image' && a.dataUrl), JSON.stringify(sentPayload.attachments))
+  check('气泡立刻多了一条', app.el('stream').children.length === before + 1, String(app.el('stream').children.length))
+  const bubble = app.el('stream').children.at(-1).children[0]
+  check('气泡里能看见那张图', bubble.children.some((c) => c.className === 'bubble-img'), JSON.stringify(bubble.children.map((c) => c.className)))
+  check('发成功后附件清空了', chips().length === 0, String(chips().length))
+
+  // 发送失败时**不能**清附件：清掉再报错，用户得重拖一遍
+  app.picker.paths = ['C:/p/again.py']
+  await app.el('attach').click()
+  await tick()
+  check('又挂上一个附件', chips().length === 1, String(chips().length))
+  app.sendBehavior.fail = '上一条消息还在处理中'
+  await app.el('composer').fire('submit')
+  await tick()
+  // 错误是当作一条 notice 条目推进消息流的（`state.js` 的 `case 'error'`），
+  // 不是顶上那条通知栏
+  check('失败时报了错', textOf(app.el('stream')).includes('还在处理中'), textOf(app.el('stream')))
+  check('失败后附件还留在输入框上（不白拖）', chips().length === 1, String(chips().length))
+  app.sendBehavior.fail = null
+
+  // 丢掉不合规的附件要说一声 —— 「chip 明明在输入框上、发出去却没有」很难查
+  app.sendBehavior.dropped = 1
+  await app.el('composer').fire('submit')
+  await tick()
+  check('有附件没发出去时会给个通知', textOf(app.el('notices')).includes('不合规'), textOf(app.el('notices')))
+  app.sendBehavior.dropped = 0
 
   uninstallDom()
 }

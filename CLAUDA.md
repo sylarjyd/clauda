@@ -239,7 +239,7 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 ## 桌面端
 
 `npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是一条窄导航条加三栏：
-导航条（会话 / 模型 / 技能 / MCP，每项带实时徽标）、左栏会话列表（按项目分组，状态点是
+导航条（模型 / 技能 / MCP / 会话，每项带实时徽标）、左栏会话列表（按项目分组，状态点是
 空闲 / 运行中 / 等待授权）、中栏对话、右栏改动文件与待办。最底下还有一行通栏的通知栏，
 没通知时整行塌掉。灰阶是浅色暖调，赤陶 accent 沿用了原来暗色版的家族（白底上压深了一档）。
 斜杠命令不做成输入框 —— `/model` 和 `/mode` 是中栏顶栏的控件，`/compact` 自动触发。
@@ -262,6 +262,7 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
   project.ts                createProjectRuntime：按 cwd 建 config / provider / MCP
   desktop-app.ts            channel 分发层（无 Electron），main.js 只是它的薄适配
   persist.ts                落盘，CLI 与桌面端共用
+  attachment.ts             用户附件的归一化与校验（ingest 碰 fs / sanitize 纯函数）
 ```
 
 **channel 一律返回 `{ ok, reason? }` 而不是抛异常**：IPC 那头的 catch 拿不到堆栈，
@@ -278,6 +279,21 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
 `tests/desktop-driver.mjs` 是桌面端最有价值的一条回归：它用子进程跑完两个会话并行 +
 授权往返 + 恢复 + 退出，打印一行 JSON 给 `e2e.mjs` 断言。加桌面端功能时先看它。
 它的会话 cwd 是临时目录（`write_file` 会真落盘，写进仓库根目录就污染工作区了）。
+
+**附件在「添加的那一刻」就 ingest，不是发送时**。三条入口（拖拽 / 粘贴 / 选文件）都先走
+`attachment/ingest`，字节在这一步读成 data URL 回到 renderer —— 缩略图、「图片太大」、
+「没有磁盘路径」因此都是即时反馈，而不是发出去才失败。`session/send` 收到的已经是那份
+归一化好的描述符，只核形状不再读盘。
+
+**「是不是图片」看字节，不看名字**：`ingestAttachments` 与 `sanitizeAttachments` 都用
+`sniffImage` 认魔数，**data URL 的 mime 一律以嗅出来的为准**，调用方声明的 `mime` / 扩展名 /
+`data:image/` 前缀只用来分流。所以没有「扩展名 → mime」的表（`.jpg` 里装 PNG 时它只会给出
+错标签）。理由是把一个改名成 `.png` 的文本发出去，端点会回 400，而用户看到的是
+`errors.ts` 那句「这个端点不支持图片输入」—— 一句把人引到换模型上去的假话。
+`desktop/renderer/app.js` 那条 `dataUrl` 兜底是 **renderer 送进来的字符串**，同一条规矩。
+
+拖拽监听挂在 `els.app` 上而**不是 `window`**：假 DOM 的 `El` 没有 `window.addEventListener`，
+挂上去整份渲染层单测当场跑不起来。同理粘贴挂在 `els.input` 上。
 
 `tests/renderer-dom.mjs` 是一层够用的假 DOM，让 `unit.mjs` 能在 Node 里把 `app.js`
 真跑一遍（`renderStream` / `paint` / `renderModal`）。**它不是浏览器实现的替代品**：
@@ -350,3 +366,25 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
   而不是变成一条工具错误结果。
 - 记忆库正文用字节封顶（4KB）而不是字符数，中英混写下字符数根本约束不住体积；
   索引也一样按字节截断，两处都走 `truncateBytes`。
+- **`WireMessage.content` 是 `string | ContentPart[]`，任何「假定它是字符串」的读取点都必须
+  先过 `src/util/message.ts` 的 `messageText()`**。直接 `.split` / `estimateTokens` 在数组上
+  会抛（`for (const ch of text)` 里 `ch.codePointAt` 是 undefined），而 `.slice` /
+  `textContent` 那一类**不抛、只是静默变成 `[object Object]`** —— 后者更难查，因为它不报错。
+  两档要分别设断言：崩的那条（`messagesTokens` 经 `contextTokens()`）钉「不抛且不爆表」，
+  静默的那几条（`summarize` / `deriveTitle` / `state.js`）钉「字符串里不出现 `[object Object]`」。
+  `string` 留在联合类型里是**刻意**的：老会话文件、工具结果、系统提示词、压缩摘要因此全都不用改。
+- **图片按固定值 `IMAGE_TOKEN_ESTIMATE`（1200）计 token，绝不能写成「base64 长度 / 4」**：
+  后者对一张 2MB 的图会算出约 70 万 token，`contextTokens()` 当场超过 `contextWindow`，
+  压缩每轮都触发、上下文条永远顶格。要的是「模型看到多少信息」，不是「传了多少字节」。
+  和 `estimateTokens` 一样刻意粗糙，只用于触发压缩。
+- **Electron ≥32 删掉了 `File.path`**，拖拽 / 粘贴来的 File 只能经
+  `webUtils.getPathForFile()` 拿磁盘路径。它是**同步**的，且对**没有磁盘来源**的 File
+  返回**空串**（截图工具、网页里复制的图片都是这一类），对非 File 对象**会抛** ——
+  调用点必须包 try。没有磁盘路径时由 renderer 自己 `FileReader` 读成 data URL 兜底，
+  这是渲染层唯一一处碰字节的地方（它拿不到 fs）。
+- **拖文件到窗口上，Chromium 的默认行为是导航到那个 `file://`**，整个 UI 被顶掉且没有回退
+  路径。`main.js` 的 `will-navigate` 守卫 + `setWindowOpenHandler` 就是为此加的，
+  不是可选的加固。写 UI 用例时别只看「chip 出现了」，还要看窗口没换页。
+- 写桌面端 e2e fixture 时注意**别把请求发到真厂商的地址上去**：`project/set-vendor`
+  之后 provider 真的会往新 baseUrl 发请求（实测撞回 `api.deepseek.com` 的 401），
+  所以涉及真实发送的用例必须排在切厂商**之前**。

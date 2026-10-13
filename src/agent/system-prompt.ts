@@ -41,6 +41,7 @@ export function buildSystemPrompt(opts: SystemPromptOptions): string {
     environment(cwd),
     toneAndStyle(),
     toolGuidance(),
+    attachmentGuidance(),
     modeGuidance(mode),
     skillsSection(opts.skills),
     memoryIndexSection(opts.memoryIndex),
@@ -123,6 +124,12 @@ function toolGuidance(): string {
 - 不要写没有必要的抽象、配置项和「万一以后要用」的兼容代码。改动范围贴着需求走。
 - 不要主动 git commit / push，除非用户明确要求。
 - 不要为了通过检查而删测试、跳过断言或注释掉报错代码；发现问题要如实告诉用户。`
+}
+
+function attachmentGuidance(): string {
+  return `## 附件
+- 用户消息里可能直接带着图片，那是已经嵌进消息里的，你**能看到它** —— 不要试图用 read_file 去读来源文件或地址。
+- 图片之外的附件只给了**路径**。要看内容就自己 read_file；遇到二进制文件（图片、压缩包、可执行文件）它会明确报错，如实说明读不了即可，不要换个工具反复重试。`
 }
 
 function modeGuidance(mode: SystemPromptOptions['mode']): string {

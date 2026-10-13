@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { claudaHome } from '../config.js'
 import type { WireMessage } from '../types.js'
+import { messageText } from '../util/message.js'
 import type { SessionSnapshot } from './agent.js'
 
 export interface SessionRecord {
@@ -196,7 +197,17 @@ export function latestSessionId(cwd: string): string | null {
 export function deriveTitle(messages: WireMessage[]): string {
   const firstUser = messages.find((m) => m.role === 'user')
   if (!firstUser) return '(空会话)'
-  const line = firstUser.content.split('\n').find((l) => l.trim()) ?? ''
+  // 带图的消息 content 是数组，直接 .split 会抛；数组型还有可能一个字都没有
+  const line = messageText(firstUser.content)
+    .split('\n')
+    .find((l) => l.trim())
+  if (!line) {
+    // 纯图片消息。正常的用户消息总有一句正文（`buildUserContent` 会补），
+    // 但会话文件是磁盘上的 JSON，手改出来的形状也得给个非空标题
+    const hasImage =
+      Array.isArray(firstUser.content) && firstUser.content.some((p) => p?.type === 'image_url')
+    return hasImage ? '(图片)' : ''
+  }
   return line.length > 60 ? line.slice(0, 60) + '…' : line
 }
 

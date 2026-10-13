@@ -17,6 +17,7 @@ const IDS = [
   'view-sessions', 'view-settings', 'settings-title', 'settings-sub', 'settings-body',
   'new-session', 'pick-project', 'project-path', 'session-list', 'notices', 'chat-title',
   'model-input', 'mode-select', 'context-fill', 'stream', 'composer', 'input', 'abort',
+  'attach-list', 'attach', 'drop-hint',
   'changed-files', 'todos', 'modal-host',
 ]
 
@@ -126,6 +127,23 @@ export async function bootRenderer() {
 
   // 用例可以改它，模拟「配错了的服务器连不上」。默认成功
   const mcp = { fail: null }
+
+  /**
+   * 附件相关。**主进程那侧的行为一律不在这里实现**（读字节、判 4MB、认扩展名都是
+   * `src/runtime/attachment.ts` 的事，unit.mjs 里真造文件测）。这里只做两件事：
+   * 把 renderer 送上来的原始形状原样报回一条归一化结果，好让断言盯着
+   * 「chip 有没有画出来」「submit 有没有把它们带上去」。
+   */
+  const ingestCalls = []
+  const picker = { paths: [] }
+  /** 送给 `session/send` 的每份 payload。断言「附件有没有跟着消息出去」只能看它 */
+  const sent = []
+  /**
+   * 让用例把 `session/send` 弄成失败 / 部分失败。默认两个字段都是空的（一切正常）。
+   * `fail` 非空时返回 `{ok:false}`，用来验「发送失败不能清空附件」这条 ——
+   * 清空 + 报错的组合会让用户白拖一遍。
+   */
+  const sendBehavior = { fail: null, dropped: 0 }
   const savedModels = []
   const savedVendors = []
   const savedBaseUrls = []
@@ -188,6 +206,32 @@ export async function bootRenderer() {
           return { ok: true, session }
         }
         if (channel === 'session/state') return { ok: true, session: opened.get(payload.sessionId) }
+        if (channel === 'session/send') {
+          sent.push(payload)
+          if (sendBehavior.fail) return { ok: false, reason: sendBehavior.fail }
+          return { ok: true, dropped: sendBehavior.dropped || undefined }
+        }
+        if (channel === 'attachment/ingest') {
+          ingestCalls.push(payload)
+          if (picker.rejectAll) return { ok: true, attachments: [], rejected: ['（桩：一律拒绝）'] }
+          return {
+            ok: true,
+            attachments: (payload.items ?? []).map((it) => {
+              const isImage =
+                String(it.mime ?? '').startsWith('image/') ||
+                /\.(png|jpe?g|webp|gif)$/i.test(String(it.path ?? ''))
+              return {
+                kind: isImage ? 'image' : 'file',
+                name: it.name || 'stub',
+                path: it.path,
+                // 有 dataUrl 就用它（剪贴板那条路），否则现编一个 data URL（磁盘那条路）
+                dataUrl: isImage ? (it.dataUrl ?? 'data:image/png;base64,AAAA') : undefined,
+                bytes: 12,
+              }
+            }),
+            rejected: picker.rejected ?? [],
+          }
+        }
         if (channel === 'project/info') return { ok: true, info: projectInfo }
         if (channel === 'project/set-default-model') {
           savedModels.push(payload)
@@ -221,7 +265,23 @@ export async function bootRenderer() {
       },
       onEvent: (fn) => handlers.push(fn),
       pickDirectory: async () => 'C:/p',
+      pickFiles: async () => picker.paths,
+      /**
+       * 真实现是 `webUtils.getPathForFile`：**同步**，且对没有磁盘来源的 File 返回空串。
+       * 桩按同样的契约来 —— 用例给 File 造一个 `path` 字段就走磁盘那条路，不给就是
+       * 剪贴板那条（renderer 得自己 FileReader 读）。
+       */
+      pathForFile: (file) => file?.path ?? '',
     },
+  }
+
+  // FileReader 只有剪贴板那条路会用到（有磁盘路径时根本不读字节）。
+  // 桩里直接回一个固定长度的 data URL，够验证「renderer 把 dataUrl 报上去了」
+  globalThis.FileReader = class {
+    readAsDataURL() {
+      this.result = 'data:image/png;base64,UE5H'
+      this.onload?.()
+    }
   }
 
   await import(new URL('../desktop/renderer/app.js', import.meta.url).href)
@@ -241,6 +301,14 @@ export async function bootRenderer() {
     savedBaseUrls,
     vendors: VENDORS,
     projectInfo,
+    /** 送给 `attachment/ingest` 的每一份 payload，断言 renderer 报了些什么 */
+    ingestCalls,
+    /** 送给 `session/send` 的每一份 payload */
+    sent,
+    /** 改它来喂「选文件」那条入口 */
+    picker,
+    /** 改它来喂「发送失败 / 有附件被丢掉」两条路径 */
+    sendBehavior,
     /** 侧边栏第 n 个会话行。组的第 0 个孩子是标题，行从 1 开始 */
     row: (n) => byId.get('session-list').children[0].children[n],
     tick,
@@ -256,4 +324,5 @@ export function tick() {
 export function uninstallDom() {
   delete globalThis.document
   delete globalThis.window
+  delete globalThis.FileReader
 }

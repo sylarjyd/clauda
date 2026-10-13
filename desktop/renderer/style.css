@@ -674,6 +674,9 @@ select:focus {
 .composer {
   display: flex;
   align-items: flex-end;
+  /* 附件条要能独占一行：见 `.attach-list` 的 `flex-basis: 100%`。
+     不换行的话 chip 会和 textarea、按钮挤在同一行里 */
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 16px 14px;
   border-top: 1px solid var(--line);
@@ -692,6 +695,118 @@ select:focus {
   display: flex;
   gap: 6px;
   flex: none;
+}
+
+/* ---------------------------------------------------------------- 附件 */
+
+/*
+ * 待发附件那一条。`flex-basis: 100%` 是让它在 `.composer` 里独占一行的全部机关 ——
+ * 这样就不必为了分行去动 textarea 的父节点（index.html 上那条注释禁的就是这个）。
+ */
+.attach-list {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.attach-list[hidden] {
+  display: none;
+}
+
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 3px 4px 3px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--bg-raise);
+}
+
+/* 这是本文件里第一处 img 规则。CSP 的 img-src 已经放行 data:，样式这边只管尺寸 */
+.attach-chip img {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+.attach-glyph {
+  width: 40px;
+  text-align: center;
+  font-size: 18px;
+}
+
+.attach-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.attach-size {
+  flex: none;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.attach-chip .remove {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.attach-chip .remove:hover {
+  background: var(--bg-sunken);
+  color: var(--danger);
+}
+
+/*
+ * 整窗拖拽遮罩。
+ *
+ * `pointer-events: none` 是**必须**的：它铺满整窗，正是最上面那个元素，
+ * 不禁用的话 drop 事件全落在遮罩自己身上，拖到最后什么都不会发生。
+ */
+.drop-hint {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  background: rgba(169, 79, 40, 0.06);
+  color: var(--accent-ink);
+  font-size: 15px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.drop-hint[hidden] {
+  display: none;
+}
+
+/* 用户气泡里的图片。`max-width: 100%` 让它不撑破气泡（气泡本身封在 78%） */
+.bubble-img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  margin-top: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
 }
 
 /* ---------------------------------------------------------------- 设置页 */

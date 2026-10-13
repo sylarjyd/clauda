@@ -29,10 +29,7 @@
       <nav class="rail" aria-label="主导航">
         <div class="rail-mark" title="clauda">◆</div>
 
-        <button type="button" class="rail-item" id="nav-sessions">
-          <span class="rail-label">会话</span>
-          <span class="rail-badge" id="badge-sessions"></span>
-        </button>
+        <!-- 四项同级，顺序是「配置 → 内容」：前三项是会话要用到的资源，会话自己压轴 -->
         <button type="button" class="rail-item" id="nav-model">
           <span class="rail-label">模型</span>
           <span class="rail-badge mono" id="badge-model"></span>
@@ -44,6 +41,10 @@
         <button type="button" class="rail-item" id="nav-mcp">
           <span class="rail-label">MCP</span>
           <span class="rail-badge" id="badge-mcp"></span>
+        </button>
+        <button type="button" class="rail-item" id="nav-sessions">
+          <span class="rail-label">会话</span>
+          <span class="rail-badge" id="badge-sessions"></span>
         </button>
 
         <div class="rail-spacer"></div>
@@ -94,8 +95,15 @@
           <div id="stream" class="stream"></div>
 
           <form id="composer" class="composer">
+            <!--
+              待发附件。`.composer` 是 `flex-wrap: wrap` 的，这一条靠 `flex-basis: 100%`
+              独占一行，textarea 和按钮留在下一行 —— 所以这里只是**多一个子节点**，
+              textarea 的父节点没变（上面那条注释禁的就是换父节点）。
+            -->
+            <div id="attach-list" class="attach-list" hidden></div>
             <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
             <div class="composer-actions">
+              <button type="button" id="attach" class="ghost" title="选择文件作为附件">附件</button>
               <button type="button" id="abort" class="ghost" hidden>停止</button>
               <button type="submit" id="send">发送</button>
             </div>
@@ -129,6 +137,13 @@
         于是「MCP 开关接不上」这类错误恰好死在引发它的那个页面上，一个字都看不到。
       -->
       <div id="notices" class="notices"></div>
+
+      <!--
+        整窗拖拽遮罩。`position: fixed` 让它脱离文档流，所以不会参与 `.app` 的网格
+        排布（那张网格每个子元素都写死了 grid-column，多一个没定位的就会挤出一行）。
+        样式里必须带 `pointer-events: none`，否则遮罩自己会把 drop 事件吃掉。
+      -->
+      <div id="drop-hint" class="drop-hint" hidden>松开即添加为附件</div>
     </div>
 
     <div id="modal-host" class="modal-host" hidden></div>

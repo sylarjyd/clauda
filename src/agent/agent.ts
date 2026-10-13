@@ -9,9 +9,11 @@ import {
   emptyUsage,
   type ToolCall,
   type Usage,
+  type UserAttachment,
   type WireMessage,
   type WireToolCall,
 } from '../types.js'
+import { buildUserContent, contentTokens, messageText } from '../util/message.js'
 import { capByTokens, estimateTokens, truncateMiddle } from '../util/text.js'
 import { buildSystemPrompt, type MemorySummary, type SkillSummary } from './system-prompt.js'
 import type { TurnSummary, View } from './view.js'
@@ -55,7 +57,8 @@ const TOOL_TRUNCATE_HINT =
 function messagesTokens(msgs: WireMessage[]): number {
   let total = 0
   for (const m of msgs) {
-    total += estimateTokens(m.content)
+    // 不能直接 estimateTokens：用户消息带图时 content 是数组，那边只收字符串
+    total += contentTokens(m.content)
     if (m.tool_calls) {
       for (const tc of m.tool_calls) {
         total += estimateTokens(tc.function.name + tc.function.arguments)
@@ -157,8 +160,18 @@ export class Agent {
 
   // ------------------------------------------------------------ 主循环
 
-  async runTurn(userInput: string, signal: AbortSignal): Promise<TurnOutcome> {
-    this.messages.push({ role: 'user', content: userInput })
+  /**
+   * 跑一轮。
+   *
+   * `attachments` 只有桌面端会传（拖拽 / 粘贴 / 选文件来的）。CLI 侧走默认空数组，
+   * 于是 `buildUserContent` 返回**字符串**，老路径一个字节都没变。
+   */
+  async runTurn(
+    userInput: string,
+    signal: AbortSignal,
+    attachments: UserAttachment[] = [],
+  ): Promise<TurnOutcome> {
+    this.messages.push({ role: 'user', content: buildUserContent(userInput, attachments) })
 
     const usageBefore = this.totalUsage
     let text = ''
@@ -429,7 +442,8 @@ export class Agent {
     const transcript = messages
       .map((m) => {
         const calls = m.tool_calls?.map((c) => `  → 调用 ${c.function.name}(${truncateMiddle(c.function.arguments, 300)})`).join('\n')
-        return `[${m.role}] ${truncateMiddle(m.content, 4000)}${calls ? '\n' + calls : ''}`
+        // 数组型 content 会被 truncateMiddle 静默 toString 成 [object Object]，先拍平
+        return `[${m.role}] ${truncateMiddle(messageText(m.content), 4000)}${calls ? '\n' + calls : ''}`
       })
       .join('\n\n')
 

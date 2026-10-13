@@ -13,6 +13,7 @@ import { PermissionManager } from '../permissions.js'
 import type { Provider } from '../provider/types.js'
 import type { SkillMeta } from '../skills/types.js'
 import type { Tool } from '../tools/types.js'
+import type { UserAttachment } from '../types.js'
 import { IpcView, type ViewEvent } from './ipc-view.js'
 import { mcpCostNotice, type McpCostNotice } from './mcp-cost.js'
 import { persistSession } from './persist.js'
@@ -206,7 +207,7 @@ export class SessionManager {
     return this.sessions.get(id)
   }
 
-  async send(sessionId: string, text: string): Promise<SendResult> {
+  async send(sessionId: string, text: string, attachments: UserAttachment[] = []): Promise<SendResult> {
     const session = this.sessions.get(sessionId)
     if (!session) return { ok: false, reason: '会话不存在' }
     if (session.status !== 'idle') return { ok: false, reason: '上一条消息还在处理中，请等它结束' }
@@ -218,7 +219,7 @@ export class SessionManager {
     this.beginTurnMark(session)
 
     try {
-      const outcome = await session.agent.runTurn(text, controller.signal)
+      const outcome = await session.agent.runTurn(text, controller.signal, attachments)
       session.view.turnEnd(session.agent.buildTurnSummary(outcome))
       return { ok: true, outcome }
     } catch (err) {
