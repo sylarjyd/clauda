@@ -109,6 +109,13 @@ export interface ClaudaConfig {
    * 那时 `resolveProfiles` 会就地补一份出来，读完 `loadConfig` 就不是空串了。
    */
   activeProvider: string
+  /**
+   * 「本项目默认用哪个智能体」，空串 = 没设。
+   *
+   * **只在开新会话时起作用**：设置页那个下拉框的初始值、CLI 启动时读一次。会话一旦建好就
+   * 自带冻结的快照，之后改这个键不会动到任何已开的会话 —— 同「模型 / 端点只对新会话生效」。
+   */
+  defaultAgent: string
   permissions: PermissionsConfig
   pricing: PricingConfig
   /** MCP 服务器，key 是服务器名 */
@@ -153,6 +160,7 @@ function defaultConfig(): ClaudaConfig {
     },
     profiles: {},
     activeProvider: '',
+    defaultAgent: '',
     permissions: {
       mode: 'default',
       allow: [],
@@ -201,6 +209,9 @@ function merge(base: ClaudaConfig, patch: RawConfig): ClaudaConfig {
     // 唯一补齐它的是 `resolveProfiles`，`loadConfig` 返回前必定跑过一次
     profiles: mergeProfiles(base.profiles, patch.profiles) as Record<string, ProviderProfile>,
     activeProvider: patch.activeProvider ?? base.activeProvider,
+    // 新顶层键一律**显式列出**：`...patch` 是浅合并，靠它兜底的话，哪天有个调用方给了
+    // `defaultAgent: undefined`（TS 上完全合法），这个键就会被无声抹成 undefined 而不是空串
+    defaultAgent: patch.defaultAgent ?? base.defaultAgent,
     permissions: { ...base.permissions, ...(patch.permissions ?? {}) },
     pricing: { ...base.pricing, ...(patch.pricing ?? {}) },
     // 必须显式列出：`...patch` 是浅合并，项目配置里只要出现 mcpServers 这一整个键，
@@ -502,6 +513,27 @@ export function writeProjectProfile(
   return file
 }
 
+/**
+ * 记下「本项目默认用哪个智能体」，空串 = 取消默认。
+ *
+ * 形状照 `writeActiveProfile`：经 `readJsonObjectForWrite` 读**磁盘原文**（解析不了就抛、
+ * 绝不覆盖）、只动 `defaultAgent` 这一个键、**不拿 `loadConfig()` 的结果回写**（那里面
+ * `${VAR}` 已经换成真密钥了）。
+ *
+ * 刻意**不**调 `ensureProfileShape`：那会顺手补出 `profiles` / `activeProvider`，
+ * 而这里只该动一个键 —— 用户只是想标个默认智能体，不该发现配置文件多出一截。
+ *
+ * 存的是**名字**不是路径：智能体可能来自全局目录，也可能被项目里同名的盖掉，
+ * 「这一个名字现在指的是哪份文件」是 `AgentRegistry` 的事。
+ */
+export function writeDefaultAgent(cwd: string, name: string): string {
+  const file = configPath(cwd)
+  const raw = readJsonObjectForWrite(file)
+  raw.defaultAgent = name
+  writeJson(file, raw)
+  return file
+}
+
 /** 切换当前使用的档案。地址与模型本来就是「这一份档案」的属性，不用另外搬 */
 export function writeActiveProfile(cwd: string, key: string): string {
   const file = configPath(cwd)
@@ -524,6 +556,71 @@ export function removeProjectProfile(cwd: string, key: string): string {
   raw.profiles = profiles
   writeJson(file, raw)
   return file
+}
+
+/**
+ * 新增（或整体覆盖）一个 MCP 服务器，返回写到了哪个文件。
+ *
+ * `file` 由调用方给（项目级是 `configPath(cwd)`，全局是 `<claudaHome>/config.json`）——
+ * 同 `writeProjectProvider` 的 `profileKey`：写哪个文件是调用方才知道的事。
+ *
+ * 和那份档案写路径共用同一套底线：读**磁盘原文**（`readJsonObjectForWrite`，解析不了就抛、
+ * 不覆盖）、只动 `mcpServers[name]` 这一个键、**绝不拿 `loadConfig()` 的结果回写** ——
+ * 那里面 `${MY_TOKEN}` 已经被 `expandEnvRefs` 换成了真密钥，回写就是把密钥明文落盘。
+ *
+ * 同名时**整条替换**，粒度跟 `merge()` 一致（见那里对 mcpServers 的注释）：改一个既有服务器
+ * 就是重写它，不做字段级深合并 —— 半覆盖会让「删掉一个 args」变成不可能表达的事。
+ */
+export function writeMcpServer(file: string, name: string, config: McpServerConfig): string {
+  const raw = readJsonObjectForWrite(file)
+  const servers = asObject(raw.mcpServers)
+  // 没给值的键不要碰：`{ args: undefined }` 展开进去会把磁盘上原有的 args 抹掉
+  servers[name] = stripUndefined(config)
+  raw.mcpServers = servers
+  writeJson(file, raw)
+  return file
+}
+
+/**
+ * 删掉一个服务器，返回**是不是真的删到了**（文件里本来没有这个名字就是 `false`）。
+ *
+ * 返回布尔值而不是文件路径，是因为调用方要按优先级找文件：服务器可能定义在项目配置里，
+ * 也可能只定义在全局配置里，而 `mcpServers` 在 `merge()` 里是「按名字合并」的 ——
+ * 合并之后看不出某一条来自哪个文件。项目那份没有就落到全局那份上找。
+ *
+ * 没删到时**不写盘**：一是没必要为了一个空操作碰用户的文件，二是「两个文件都没有」
+ * 这个事实本身就是调用方要的判断依据。
+ *
+ * 名字不在时不抛 —— 调用方的意图是「删完之后它不在了」，而结果正好如此，重复点一下删除
+ * 不该报错。真正的「这个名字压根不存在」由 `McpManager.removeServer` 去抛（它同时管运行期）。
+ */
+export function removeMcpServer(file: string, name: string): boolean {
+  const raw = readJsonObjectForWrite(file)
+  const servers = asObject(raw.mcpServers)
+  if (!(name in servers)) return false
+  delete servers[name]
+  raw.mcpServers = servers
+  writeJson(file, raw)
+  return true
+}
+
+/**
+ * 把某个服务器从**两处配置**里清掉：先看项目那份，项目里没有才落到全局那份。
+ *
+ * 为什么要按优先级找而不是让调用方指定：`mcpServers` 在 `merge()` 里是「按名字合并」的，
+ * 合并之后**看不出某一条来自哪个文件**，而删除必须落到真正写着它的那一份上 —— 往项目文件
+ * 里删一个其实定义在全局的服务器，结果是「点了删除，重启又回来了」。
+ *
+ * 项目优先而不是全局优先，是为了让「项目里覆盖了全局的同名服务器」这种情况删得干净：
+ * 同名时项目那份是生效的那份，用户的「删掉它」指的也是它。
+ *
+ * 返回真正删到的那个文件；两处都没有则返回 `''`（此时一个字节都没写）。
+ */
+export function removeMcpServerAnywhere(cwd: string, name: string): string {
+  const projectFile = configPath(cwd)
+  if (removeMcpServer(projectFile, name)) return projectFile
+  const globalFile = path.join(claudaHome(), 'config.json')
+  return removeMcpServer(globalFile, name) ? globalFile : ''
 }
 
 /**

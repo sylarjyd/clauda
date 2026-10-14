@@ -148,6 +148,79 @@ export class McpManager {
     this.rebuildActive()
   }
 
+  /**
+   * 运行期加一个服务器并连上（设置页的「新增」和对话里的 `mcp_add` 都走这里）。
+   *
+   * **不能靠重建整个运行时来达到这个目的**：`closeAll()` 不可逆（`closed` 一置位，
+   * `start()` 在 `:63` 就永远返回），而且那会把已经连上的服务器全踢掉重连一遍。
+   * 构造时抄下来的那份 `config` 是**引用**，所以往它里面加一个键就够了。
+   *
+   * 失败时**抛**（契约同 `setEnabled`）：吞掉就成了「界面说接上了、工具一个没多」。
+   */
+  async addServer(name: string, cfg: McpServerConfig): Promise<void> {
+    if (this.closed) throw new Error('MCP 管理器已经关闭，加不了服务器')
+    this.config[name] = cfg
+    this.offByUser.delete(name)
+
+    if (cfg.enabled === false) {
+      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0 })
+      this.rebuildActive()
+      return
+    }
+
+    try {
+      const tools = await this.connectOne(name, cfg)
+      this.perServer.set(name, tools)
+      this.statuses.set(name, {
+        name,
+        transport: transportOf(cfg),
+        state: 'connected',
+        toolCount: tools.length,
+      })
+    } catch (e) {
+      // `connectOne` 失败时会把半开的连接还回去，但 pid / 超时是在 connect 成功之后
+      // 就记下的，得在这儿一并清掉 —— 留着的话新的服务器会继承一个死 pid
+      this.pids.delete(name)
+      this.timeouts.delete(name)
+      const error = describe(e)
+      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, error })
+      this.rebuildActive()
+      throw new Error(error)
+    }
+    this.rebuildActive()
+  }
+
+  /**
+   * 运行期摘掉一个服务器：断开、并从配置和工具集合里一起清掉。
+   *
+   * 与 `setEnabled(name, false)` 的区别是**配置也删** —— 那个只是本次运行不连，重启就
+   * 回来了；这个是用户说「不要了」。
+   *
+   * 名字压根不存在时**抛**：默默成功的话，界面会显示「已删除」而配置里那一行还在。
+   */
+  async removeServer(name: string): Promise<void> {
+    if (!this.config[name] && !this.statuses.has(name)) {
+      throw new Error(`没有名为 "${name}" 的 MCP 服务器`)
+    }
+    const client = this.clients.get(name)
+    this.clients.delete(name)
+    this.pids.delete(name)
+    this.perServer.delete(name)
+    this.statuses.delete(name)
+    this.offByUser.delete(name)
+    this.timeouts.delete(name)
+    delete this.config[name]
+
+    if (client) {
+      try {
+        await client.close()
+      } catch {
+        // 断不掉就算了，工具已经从集合里摘走了
+      }
+    }
+    this.rebuildActive()
+  }
+
   /** 接入的工具，交给 Agent 拼进工具集 */
   tools(): Tool[] {
     return this.active

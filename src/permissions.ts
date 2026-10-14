@@ -74,6 +74,10 @@ function formatLabel(tool: Tool, args: unknown): string {
 }
 
 function describeRisk(tool: Tool, args: unknown): string {
+  // 工具自己声明了风险就用它的，**放在最前面**：下面几条都是按类猜的通用文案，而只有
+  // 工具自己知道这次调用具体要害在哪里。典型的例子是 `mcp_add` —— 它归在 exec 类里，
+  // 通用文案对它返回的是空串，弹出来会是一个只有标题、看不出在批准什么的框。
+  if (tool.risk) return tool.risk(args)
   // MCP 工具放在最前面：它默认是 exec，但用户可以按服务器改成 write，
   // 那时会掉进下面那条「将修改文件」，而实际改什么完全不在我们掌握之中。
   if (tool.source?.kind === 'mcp') {

@@ -50,11 +50,15 @@ const desktop = new DesktopApp({
     createProjectRuntime({
       cwd,
       version: VERSION,
-      // MCP 连不上之类的问题不带 sessionId，走通知栏；丢进 console 是留个现场
-      onWarn: (msg) => {
-        console.warn('[clauda]', msg)
-        sink.send('', { type: 'app-notice', level: 'warn', msg })
-      },
+      // MCP 连不上之类的诊断**只留在控制台**，不往界面推。
+      //
+      // 通知栏是「你刚做了什么、成没成」的地方（它待在侧栏之外，正是为了让设置页上的
+      // 报错看得见，见 CLAUDA.md），而这条消息带的是子进程的原始报错，一屏好几行技术
+      // 细节 —— 用户嘴里的「日志」就是它。
+      //
+      // 这不算把失败藏起来：连不上的那台在「工具」页上会红着（`state: 'failed'`）并带着
+      // 它自己的错误原文，徽标上的已连接数也跟着掉。要看现场还有这一行 console。
+      onWarn: (msg) => console.warn('[clauda]', msg),
     }),
 })
 

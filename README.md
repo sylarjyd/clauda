@@ -18,6 +18,8 @@ clauda -p "解释 src/agent/loop.ts" --output-format json   # 无头模式，适
 - **会话持久化**：每个目录独立的会话历史，`--continue` / `--resume` 随时接着聊
 - **项目记忆**：`CLAUDA.md` 存项目约定，每次会话自动带进上下文
 - **技能**：把成套的操作指引写进 `SKILL.md`，模型按需载入，也可用 `/技能名` 手动触发
+- **智能体**：一整套「你是谁 + 用哪个模型 + 能用哪些工具和技能 + 什么权限 + 开口问什么」
+  存进 `AGENT.md`，开新会话时绑一个 —— 桌面端在「智能体」页里增删改
 - **记忆库**：模型在会话里学到的事实自己存下来，跨会话复用；只注入索引，正文按需取
 - **MCP**：接上 Model Context Protocol 服务器，工具集在运行时长出来，`/mcp` 可随时启停
 - **不锁死厂商**：任何 OpenAI 兼容端点；常见厂商（DeepSeek、豆包/火山方舟、通义千问/百炼、
@@ -146,6 +148,16 @@ export CLAUDA_MODEL=qwen2.5-coder:14b
 不填则按 `contextWindow / 4` 自动取值（上限 8000）—— 本地 4k 窗口的模型会自动收紧到
 1k，避免一个 `read_file` 就把窗口吃光。注意 `read_file` 自己的 2000 是**行**上限，
 不是 token 上限。
+
+`defaultAgent` 标一个**本项目默认的智能体**（名字，见下文「智能体」），新会话默认绑它：
+
+```json
+{ "defaultAgent": "code-review" }
+```
+
+它只影响之后**新建**的会话 —— 已经在跑的会话，绑定在建会话那一刻就冻结了。
+智能体本身存在 `~/.clauda/agents/`（全局）和 `<项目>/.clauda/agents/`（项目级）下，
+**不在 `config.json` 里**。
 
 ## 用法
 
@@ -343,6 +355,76 @@ description: 审查改动的代码，按严重程度列出问题
   `/skills` 里会标出来。
 - `SKILL.md` 必须是 **UTF-8**。用记事本存成 ANSI(GBK) 的话读出来是乱码。
 
+## 智能体
+
+技能是「某类任务怎么做」，智能体是「**这一整段对话是什么**」—— 一整套装配配方：
+名字、描述、厂商档案、模型、温度、权限模式与规则、工具和技能的白名单、新会话空态里
+那几条可点的问题，以及一段系统提示词。**开新会话时绑一个**。
+
+一个智能体就是一个目录加一份 `AGENT.md`，和技能同构：
+
+```
+.clauda/agents/code-review/AGENT.md     项目级
+~/.clauda/agents/code-review/AGENT.md   全局
+```
+
+```markdown
+---
+name: code-review
+description: 按严重程度审查改动
+profile: deepseek
+model: deepseek-chat
+temperature: 0
+permission: default
+deny: bash
+tools: read_file, grep, glob, mcp__linear
+skills: code-review
+questions: 这次改动有什么风险|测试怎么跑
+---
+
+你是一名严格的代码审查员。先说结论，再按「必须改 / 建议改」两档列问题…
+```
+
+**frontmatter 是配置，正文就是系统提示词那一段。**
+
+| 键 | 缺省 | 说明 |
+| --- | --- | --- |
+| `name` | 目录名 | 不符合 `[a-z0-9][a-z0-9-]*` 就退回目录名 |
+| `description` | 正文第一句 | 列表里显示 |
+| `profile` | 项目当前使用的那份档案 | `profiles` 里的 key。**只写名字** |
+| `model` | 那份档案的 model | 覆盖模型名（模型 id 里带斜杠也没问题） |
+| `temperature` | 那份档案的 temperature | 数字，非法就忽略这一项 |
+| `permission` | 项目配置的 `permissions.mode` | `default` / `auto` / `plan` |
+| `allow` / `deny` | 项目配置的同名项 | 免问 / 禁用规则，逗号分隔 |
+| `tools` | 全部 | 工具名白名单，逗号分隔。`mcp__linear` 盖住整台服务器 |
+| `skills` | 全部 | 技能名白名单，逗号分隔。同时管提示词里的「可用技能」 |
+| `questions` | 无 | 新会话空态的可点问题，**`\|` 分隔** |
+
+几个要点：
+
+- **只写 `profile` 的名字，不抄端点和密钥**。`AGENT.md` 因此可以放心提交进 git、发给别人；
+  密钥仍旧只留在 `config.json` 一处。
+- **`tools` / `skills` 是白名单：不写 = 全部可用；写了 = 只要这些**。这一条**连
+  `skill_write` / `mcp_add` / `memory_*` 一起管** —— 一个 `tools: read_file, grep` 的智能体
+  不光不能写文件，也不能写技能、写记忆、挂 MCP。要给它留哪一样就显式写出来。
+- **`allow` / `deny` 和 `tools` 是两件事**：后者决定工具「在不在手上」，前者决定「要不要问」。
+  一个工具可以既在白名单里、又被 `deny` 挡着。
+- **两条分隔符别弄混**：`tools` / `skills` / `allow` / `deny` 用**逗号**（它们永远是标识符），
+  `questions` 用 **`|`** —— 问题里本来就会带逗号（「跑测试要装什么，怎么装？」）。
+  `|` 因此在 `questions` 里是**保留字符**，要写它就换成全角 `｜`。
+- **降级而不是报错**：名字不合规退回目录名、温度写错只忽略这一项、白名单里认不出的名字
+  原样留着（可能指一个这个项目还没装的 MCP 服务器）。只有 `profile` 指向一份不存在的档案时，
+  会退回项目当前那份，并在设置页那一行标出来。
+- **正文里别写 `## 项目记忆` 和 `## 会话配置`** 这两个标题（它们被 `/memory` 用来切段）。
+- **改一个智能体只影响之后新开的会话**。会话在建立那一刻就把这份配方冻住了，恢复时按快照
+  走、不回头重读文件 —— 所以删掉一个智能体之后，绑着它的老会话照样能原样打开。
+  这和技能 / MCP 的「改了当场对项目里所有会话生效」是**故意相反**的：工具是会话手里拿着的
+  东西，换了手里就得换；智能体是这段对话的身份，身份不该在对话中途被换掉。
+- 名字给过、智能体却已经不在了（比如刚被删掉）时**不报错**：会话按默认配置打开，通知栏说一声。
+- **模型能读智能体，但不能在对话里创建它**（技能和 MCP 都有这种工具，智能体没有）——
+  那等于让模型给自己写一份 `permission: auto` 的配方，是一个直接的自我提权口子。
+- 全局与项目级**同名时离当前目录近的赢**，和技能一致。
+
 ## 记忆库
 
 `CLAUDA.md` 是**你写**的项目说明，全文进上下文。记忆库是**模型自己写**的 —— 它在会话里
@@ -479,6 +561,11 @@ src/
   skills/
     frontmatter.ts    最小 YAML frontmatter 解析（无依赖）
     registry.ts       SKILL.md 发现与读取
+  agents/
+    types.ts          智能体与冻结快照（AgentSpec）的类型
+    registry.ts       AGENT.md 发现与读取（frontmatter 逐字段校验）
+    writer.ts         写 AGENT.md 与删目录（含路径护栏）
+    apply.ts          把智能体套进 config、工具白名单与技能视图
   mcp/
     naming.ts         工具名消毒与撞名消解（纯函数）
     tool.ts           把 MCP 工具包成 clauda 的 Tool

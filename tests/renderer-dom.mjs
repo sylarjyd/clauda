@@ -12,11 +12,16 @@
 
 const IDS = [
   'app',
-  'nav-sessions', 'nav-model', 'nav-skills', 'nav-mcp',
-  'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp',
+  'nav-agents', 'nav-sessions', 'nav-model', 'nav-skills', 'nav-mcp',
+  'nav-settings', 'settings-group',
+  // 点开「设置」时要让位的两块。少了它们 renderRail 会直接抛
+  'rail', 'browse',
+  'badge-agents', 'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp',
   'view-sessions', 'view-settings', 'settings-title', 'settings-sub', 'settings-body',
-  'new-session', 'pick-project', 'project-path', 'session-list', 'notices', 'chat-title',
-  'model-input', 'mode-select', 'context-fill', 'stream', 'composer', 'input', 'abort',
+  'new-session', 'new-session-agent', 'pick-project', 'project-path', 'session-list', 'notices',
+  'chat-title', 'chat-agent',
+  'model-input', 'mode-select', 'context-fill', 'stream', 'empty-questions',
+  'composer', 'input', 'abort',
   'attach-list', 'attach', 'drop-hint',
   'changed-files', 'todos', 'modal-host',
 ]
@@ -149,6 +154,87 @@ export async function bootRenderer() {
   const savedBaseUrls = []
   const savedActive = []
   const savedRemovals = []
+  const savedSkillAdds = []
+  const savedSkillRemovals = []
+  const savedMcpAdds = []
+  const savedMcpRemovals = []
+  const savedAgentAdds = []
+  const savedAgentRemovals = []
+  const savedAgentDefaults = []
+  /**
+   * 让用例把 `skill/add` / `mcp/add` 弄成失败。默认是空的（写盘成功）。
+   * `mcp.fail` 是**每台服务器**的失败原因（`mcp/set-enabled` 那条既有分支在用），
+   * 加号失败是另一码事 —— 名字不同、时机不同，所以另开一格
+   */
+  const skillBehavior = { fail: null }
+  const mcpAddBehavior = { fail: null }
+  const agentBehavior = { fail: null }
+  /**
+   * 智能体的**磁盘真相**。`project/info` 那份是从这里折出六个字段的，正文与配置明细
+   * 只有 `agent/get` 才给 —— 桩要是把它们也塞进 `projectInfo.agents`，就永远测不出
+   * 「右栏的正文必须走 `agent/get` 那条路」。
+   *
+   * 两份的取法都是刻意的：
+   * - `code-review` 是本项目默认，`questions` 非空（空态那几条靠它）；`temperature: 0`
+   *   是**有效值**，和「没写」必须能分开。
+   * - `kimi-chat` 不是默认、`temperature` **没写**（读回草稿时得是空栏而不是 0），
+   *   并且带一条非空的 `problem`（档案没了的降级提示，界面得摆出来）。
+   *
+   * `problem` 在真后端是拿着项目配置算出来的，不在 `ResolvedAgent` 上；这里挂在桩的
+   * 记录里，只为让 `project/info` 那条提示有东西可画。
+   */
+  const agentStore = {
+    'code-review': {
+      name: 'code-review',
+      description: '按严重程度审查改动',
+      dir: 'C:/p/.clauda/agents/code-review',
+      file: 'C:/p/.clauda/agents/code-review/AGENT.md',
+      scope: 'project',
+      profile: 'custom',
+      model: '',
+      temperature: 0,
+      permission: 'default',
+      allow: ['write_file'],
+      deny: ['Bash(rm:*)'],
+      tools: ['read_file', 'grep'],
+      skills: ['demo'],
+      questions: ['这次改动有什么风险？', '跑测试要装什么，怎么装？'],
+      body: '你是一名严格的代码审查员。',
+      problem: '',
+    },
+    'kimi-chat': {
+      name: 'kimi-chat',
+      description: '闲聊用的',
+      dir: 'C:/home/.clauda/agents/kimi-chat',
+      file: 'C:/home/.clauda/agents/kimi-chat/AGENT.md',
+      scope: 'global',
+      profile: 'kimi',
+      model: '',
+      temperature: undefined,
+      permission: undefined,
+      allow: undefined,
+      deny: undefined,
+      tools: [],
+      skills: [],
+      questions: [],
+      body: '你是个随和的助手。',
+      problem: '档案「kimi」找不到，用的是当前使用的那份',
+    },
+  }
+
+  /**
+   * `project/info` 里那一条：**只有这六个字段**。真后端就是这么拼的（`AgentInfo`），
+   * 正文、白名单、常见问题一概不在里面 —— `project/info` 被每轮刷新的徽标拖着走。
+   */
+  const agentBrief = (a, isDefault) => ({
+    name: a.name,
+    description: a.description,
+    file: a.file,
+    scope: a.scope,
+    isDefault,
+    problem: a.problem ?? '',
+  })
+
   /**
    * 两份档案，**当前使用的那份不是列表里的第一份**（顺序按 key 排，`custom` 在前）——
    * 这样「选中」和「当前使用」混成一套判据时，界面测试立刻能抓到。
@@ -208,6 +294,13 @@ export async function bootRenderer() {
       { name: 'broken', transport: 'http', state: 'disabled', toolCount: 0 },
     ],
     mcpCost: { tokens: 900, servers: 1, tools: 2, infoText: '已接入 MCP：1 个服务器 / 2 个工具', warnText: '' },
+    // 智能体。**只到这六个字段为止**（见 `agentBrief`）；正文要正文走 `agent/get`
+    agents: [
+      agentBrief(agentStore['code-review'], true),
+      agentBrief(agentStore['kimi-chat'], false),
+    ],
+    // 本项目默认。有它，`#new-session-agent` 那一格才有个可验证的初始选中项
+    defaultAgent: 'code-review',
   }
 
   globalThis.document = {
@@ -224,6 +317,10 @@ export async function bootRenderer() {
         if (channel === 'session/list') return { ok: true, sessions: [] }
         if (channel === 'session/open') {
           const id = `s${++seq}`
+          // `agent` 是**名字**（'' = 明确不要智能体）。真后端解析不出来时只警告、不抛 ——
+          // 桩照做，否则「名字给过却已经不在了」这条降级路径根本走不到
+          const asked = typeof payload.agent === 'string' ? payload.agent : ''
+          const spec = asked ? agentStore[asked] : undefined
           const session = {
             id,
             cwd: payload.cwd,
@@ -233,6 +330,12 @@ export async function bootRenderer() {
             todos: [],
             contextTokens: 0,
             contextRatio: 0,
+            agentName: spec ? spec.name : '',
+            // 空态那几条只能来自**这份会话冻结的** AgentSpec，不能回头按名字现查 ——
+            // 回头查的话，改一个智能体的常见问题，老会话的空态会跟着变
+            agentQuestions: spec?.questions ?? [],
+            agentWarning:
+              asked && !spec ? `智能体「${asked}」已经不在了，这个会话按默认配置打开` : '',
           }
           opened.set(id, session)
           return { ok: true, session }
@@ -330,11 +433,113 @@ export async function bootRenderer() {
           projectInfo.profiles.splice(at, 1)
           return { ok: true, file: projectInfo.configFile }
         }
+        // 智能体的增删改查。**这四条同样必须显式写**（理由见下一条注释）：落到兜底的
+        // `{ok:true}` 上就是「保存了、磁盘没变，测试还报成功」
+        if (channel === 'agent/add') {
+          savedAgentAdds.push(payload)
+          if (agentBehavior.fail) return { ok: false, reason: agentBehavior.fail }
+          const root = payload.scope === 'global' ? 'C:/home/.clauda/agents' : 'C:/p/.clauda/agents'
+          const file = `${root}/${payload.name}/AGENT.md`
+          // 同名**整份覆盖**，所以它同时是「保存」；`created` 决定界面报「新建」还是「保存」
+          const created = !(payload.name in agentStore)
+          agentStore[payload.name] = {
+            name: payload.name,
+            description: payload.description ?? '',
+            dir: `${root}/${payload.name}`,
+            file,
+            scope: payload.scope,
+            profile: payload.profile ?? '',
+            model: payload.model ?? '',
+            temperature: payload.temperature,
+            permission: payload.permission,
+            allow: payload.allow,
+            deny: payload.deny,
+            tools: payload.tools ?? [],
+            skills: payload.skills ?? [],
+            questions: payload.questions ?? [],
+            body: payload.body ?? '',
+            problem: agentStore[payload.name]?.problem ?? '',
+          }
+          const brief = agentBrief(agentStore[payload.name], projectInfo.defaultAgent === payload.name)
+          const at = projectInfo.agents.findIndex((a) => a.name === payload.name)
+          if (at >= 0) projectInfo.agents[at] = brief
+          else projectInfo.agents.push(brief)
+          return { ok: true, file, created }
+        }
+        if (channel === 'agent/get') {
+          const agent = agentStore[payload.name]
+          // 找不到**报失败**，不能静默成功 —— 那会让用户对着一个空表单以为「它本来就是空的」
+          return agent ? { ok: true, agent } : { ok: false, reason: `没有这个智能体：${payload.name}` }
+        }
+        if (channel === 'agent/remove') {
+          savedAgentRemovals.push(payload)
+          const at = projectInfo.agents.findIndex((a) => a.name === payload.name)
+          if (at < 0) return { ok: false, reason: `没有这个智能体：${payload.name}` }
+          const gone = agentStore[payload.name]
+          projectInfo.agents.splice(at, 1)
+          delete agentStore[payload.name]
+          return { ok: true, dir: gone.dir }
+        }
+        if (channel === 'project/set-default-agent') {
+          savedAgentDefaults.push(payload)
+          // `''` 是「取消默认」，不是错误
+          if (payload.name && !agentStore[payload.name]) {
+            return { ok: false, reason: `没有这个智能体：${payload.name}` }
+          }
+          projectInfo.defaultAgent = payload.name ?? ''
+          for (const a of projectInfo.agents) a.isDefault = a.name === projectInfo.defaultAgent
+          return { ok: true, file: projectInfo.configFile }
+        }
         // 连不上的服务器：`McpManager.setEnabled` 会抛，channel 层翻成 `{ok:false, reason}`。
         // 界面必须把这个 reason 显示出来，不能报成功
         if (channel === 'mcp/set-enabled') {
           const reason = mcp.fail?.[payload.name]
           return reason ? { ok: false, reason } : { ok: true }
+        }
+        // 技能与 MCP 的增删。**这四条必须显式写**：不写的话会落到下面那句
+        // `return { ok: true }` 上，于是「保存了但磁盘没变」也被判成成功
+        if (channel === 'skill/add') {
+          savedSkillAdds.push(payload)
+          if (skillBehavior.fail) return { ok: false, reason: skillBehavior.fail }
+          const root = payload.scope === 'global' ? 'C:/home/.clauda/skills' : 'C:/p/.clauda/skills'
+          const file = `${root}/${payload.name}/SKILL.md`
+          projectInfo.skills.push({
+            name: payload.name,
+            description: payload.description,
+            dir: `${root}/${payload.name}`,
+            file,
+          })
+          return { ok: true, file }
+        }
+        if (channel === 'skill/remove') {
+          savedSkillRemovals.push(payload)
+          const at = projectInfo.skills.findIndex((s) => s.name === payload.name)
+          if (at < 0) return { ok: false, reason: `没有这个技能：${payload.name}` }
+          const [gone] = projectInfo.skills.splice(at, 1)
+          return { ok: true, dir: gone.dir }
+        }
+        if (channel === 'mcp/add') {
+          savedMcpAdds.push(payload)
+          if (mcpAddBehavior.fail) return { ok: false, reason: mcpAddBehavior.fail }
+          if (projectInfo.mcp.some((s) => s.name === payload.name)) {
+            return { ok: false, reason: `服务器 "${payload.name}" 连不上` }
+          }
+          const file =
+            payload.scope === 'global' ? 'C:/home/.clauda/config.json' : projectInfo.configFile
+          projectInfo.mcp.push({
+            name: payload.name,
+            transport: payload.config.type ?? (payload.config.url ? 'http' : 'stdio'),
+            state: 'connected',
+            toolCount: 2,
+          })
+          return { ok: true, file }
+        }
+        if (channel === 'mcp/remove') {
+          savedMcpRemovals.push(payload)
+          const at = projectInfo.mcp.findIndex((s) => s.name === payload.name)
+          if (at < 0) return { ok: false, reason: `没有名为 "${payload.name}" 的 MCP 服务器` }
+          projectInfo.mcp.splice(at, 1)
+          return { ok: true, file: projectInfo.configFile }
         }
         return { ok: true }
       },
@@ -376,8 +581,20 @@ export async function bootRenderer() {
     savedBaseUrls,
     savedActive,
     savedRemovals,
+    savedSkillAdds,
+    savedSkillRemovals,
+    savedMcpAdds,
+    savedMcpRemovals,
+    savedAgentAdds,
+    savedAgentRemovals,
+    savedAgentDefaults,
+    skillBehavior,
+    mcpAddBehavior,
+    agentBehavior,
     vendors: VENDORS,
     projectInfo,
+    /** 智能体的磁盘真相（`agent/get` 给的就是这里的一份）。用例可以直接改它 */
+    agentStore,
     /** 送给 `attachment/ingest` 的每一份 payload，断言 renderer 报了些什么 */
     ingestCalls,
     /** 送给 `session/send` 的每一份 payload */

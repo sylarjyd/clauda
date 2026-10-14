@@ -29,10 +29,13 @@ export const MAX_ATTACHMENTS = 8
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
 /**
- * 左导航的四个视图。**视图名同时是 CSS 选择器**（`.app[data-view="…"]`），所以
- * 拼错了不会报错、只会让三栏布局静默塌掉 —— 归约时挡一道，别指望肉眼发现。
+ * 左导航的五个视图。`'sessions'` 是中栏那张对话，其余四个是共用一个容器的设置页
+ * （见 `SETTINGS_META`）。
+ *
+ * 归约时挡一道是因为视图名还会被拿去当对象的下标找元数据 —— 拼错了不会报错，
+ * 只会画出一片空白，别指望肉眼发现。
  */
-export const VIEWS = ['sessions', 'model', 'skills', 'mcp']
+export const VIEWS = ['sessions', 'agents', 'model', 'skills', 'mcp']
 
 export function createState() {
   return {
@@ -60,13 +63,20 @@ export function createState() {
     attachments: [],
     /**
      * `project/info` 的结果，模型 / 技能 / MCP 三个设置页共用这一份。
-     * null 表示还没拉到（没有会话、或者刚切完会话正在重新拉）。
+     *
+     * 它是**按项目目录**来的（技能、MCP、厂商档案全是项目级的），所以一个会话都没开
+     * 也该有值。null 只表示「还没选目录」或「正在重新拉」。
      */
     project: null,
   }
 }
 
-/** 会话快照的字段与缺省值。打开会话和 `session-state` 回填**必须共用这一份** */
+/**
+ * 会话快照的字段与缺省值。打开会话和 `session-state` 回填**必须共用这一份**。
+ *
+ * **每个后端会下发的字段都得在这儿列一行**：`mergeSnapshot` 只认这份名单里的键，
+ * 没列进去的会被静默丢掉 —— 症状是「后端明明发了 `agentName`，顶栏永远空着」。
+ */
 const SESSION_DEFAULTS = {
   cwd: '',
   title: '',
@@ -76,6 +86,12 @@ const SESSION_DEFAULTS = {
   todos: [],
   contextTokens: 0,
   contextRatio: 0,
+  /** 这个会话绑的智能体名，空串 = 没绑。取自 `SessionInfo`，不是项目的默认智能体 */
+  agentName: '',
+  /** 空态可点的问题。取自**这份会话冻结的** AgentSpec，见 `SessionInfo.agentQuestions` */
+  agentQuestions: [],
+  /** 非空时界面弹**一次**通知：绑的智能体已经不在了，这个会话按默认配置打开 */
+  agentWarning: '',
 }
 const SESSION_FIELDS = Object.keys(SESSION_DEFAULTS)
 
@@ -107,9 +123,10 @@ export function reduce(state, action) {
     case 'history':
       return { ...state, history: { ...state.history, [action.cwd]: action.sessions ?? [] } }
     case 'select':
-      // 项目信息是跟着会话走的。换了会话先清空，免得设置页拿上一个项目的配置 /
-      // 技能 / MCP 顶上 —— 那看着像「切了会话但设置没跟着变」
-      return { ...state, activeId: action.id, project: null }
+      // 项目信息**不跟着会话清**：它是按 cwd 拉的，同一个项目下的会话切来切去，
+      // 配置 / 技能 / MCP 一个字都不会变。清掉只会让设置页闪一下空态。
+      // 真换了项目（点开另一个项目里的会话）由 app.js 那边跟着换 cwd 并重拉
+      return { ...state, activeId: action.id }
     case 'session-opened':
       return openSession(state, action.session)
     case 'view':

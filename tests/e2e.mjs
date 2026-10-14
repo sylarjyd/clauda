@@ -131,6 +131,68 @@ console.log('\n== 配置优先级：配置文件 > 环境变量 ==')
   fs.rmSync(home, { recursive: true, force: true })
 }
 
+console.log('\n== CLI：config.json 的 defaultAgent 生效 ==')
+{
+  // 单开一份 home：这条用例会往里面写 `defaultAgent` 和一份带工具白名单的智能体，
+  // 留在共享的 TMP_HOME 里会把后面每一条 CLI 用例都套上一个白名单
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-agent-cli-'))
+  const dir = path.join(home, 'agents', 'readonly')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(
+    path.join(dir, 'AGENT.md'),
+    [
+      '---',
+      'name: readonly',
+      'description: 只读助手',
+      'model: agent-cli-model',
+      'tools: read_file',
+      '---',
+      '',
+      '你只读文件，一个字都不改。',
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ defaultAgent: 'readonly' }), 'utf8')
+
+  // 证据只能看**服务端收到了什么**：命令行这边既看不到提示词也看不到工具集。
+  // 无头模式没人能点授权框，所以白名单里给了 read_file 这一轮才跑得完 —— 顺带也是
+  // 「白名单真的在手上」的反面证据（没给的话这一步就卡住了）
+  const before = server.seen.length
+  const { stdout, stderr, code } = await runClauda([...baseArgs, '-p', '项目叫什么'], '', { CLAUDA_HOME: home })
+  check('CLI 无头模式仍然跑得完', code === 0 && stdout.includes('项目名是 clauda'), `code=${code}\n${stdout}\n${stderr}`)
+
+  const req = server.seen.slice(before)[0] ?? {}
+  const sys = (req.messages ?? []).find((m) => m.role === 'system')
+  check(
+    'defaultAgent 的正文进了系统提示词',
+    String(sys?.content).includes('## 智能体：readonly') &&
+      String(sys.content).includes('你只读文件，一个字都不改。'),
+    String(sys?.content).slice(0, 400),
+  )
+  // 这一条是「`applyAgentToConfig` 必须夹在 `loadConfig` 与建 provider 之间」的探针：
+  // 晚一步就成了「提示词说用 A、请求打到 B」，而两边都不报错
+  check('智能体的 model 折进了请求（provider 建之前就生效了）', req.model === 'agent-cli-model', String(req.model))
+  check(
+    '工具白名单生效：请求里有 read_file，没有 write_file',
+    (req.tools ?? []).some((t) => t.function?.name === 'read_file') &&
+      !(req.tools ?? []).some((t) => t.function?.name === 'write_file'),
+    JSON.stringify((req.tools ?? []).map((t) => t.function?.name)),
+  )
+
+  // 名字指向一个不存在的智能体：**不 fail** —— 一个被删掉的智能体不该让命令行起不来。
+  // 交互模式下说一声，然后按「没有智能体」装配
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ defaultAgent: '已经删掉的那个' }), 'utf8')
+  const missing = await runClauda([...baseArgs], '/exit\n', { CLAUDA_HOME: home })
+  const missingAll = missing.stdout + missing.stderr
+  check(
+    '默认智能体找不到时不报错，只提示一句',
+    missing.code === 0 && missingAll.includes('已经删掉的那个') && missingAll.includes('不在了'),
+    `code=${missing.code}\n${missingAll}`,
+  )
+  fs.rmSync(home, { recursive: true, force: true })
+}
+
 console.log('\n== 管道输入按 GBK 兜底解码 ==')
 {
   // 中文 Windows（代码页 936）的管道默认发 GBK 字节，Node 按 UTF-8 硬解会得到一片 U+FFFD。
@@ -518,8 +580,10 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
   if (d) {
     check('驱动正常跑完', d.ok === true, `${d.error ?? ''}\n${stderr.slice(0, 800)}`)
     check('退出码为 0', code === 0, `code=${code}\n${stderr.slice(0, 800)}`)
-    // 四个：并发跑的那两个，外加下面验「默认模型只影响新会话」和「切厂商换新会话模型」时各新开的一个
-    check('开出了四个会话', d.sessionIds.length === 4, JSON.stringify(d.sessionIds))
+    // 七个：并发跑的那两个，验「默认模型只影响新会话」和「切厂商换新会话模型」时各新开的一个，
+    // 外加智能体那一段开的三个（不带 / 带名字 / 名字找不到）。**全都要登记** ——
+    // `straySessionIds` 拿它当白名单，漏记就会被当成一次泄漏
+    check('开出了七个会话', d.sessionIds.length === 7, JSON.stringify(d.sessionIds))
 
     // 并发：两边都跑完了，A 读到项目名、B 写完文件
     check('会话 A 的回合成功', d.send.a?.ok === true, JSON.stringify(d.send.a))
@@ -569,14 +633,30 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
         d.toolStarts.some((t) => t.name === 'write_file' && t.sessionId === d.sessionIds[1]),
       JSON.stringify(d.toolStarts),
     )
-    // 工具集经 channel 传到 renderer 之后仍然完整：7 个内置 + 无条件注入的 2 个记忆工具。
-    // 这个 home 没有 mcpServers，所以也不该冒出 mcp__ 前缀的工具
+    // 工具集经 channel 传到 renderer 之后仍然完整：7 个内置 + 无条件注入的 2 个记忆工具
+    // + 4 个「对话里增删技能 / MCP」工具。这个 home 没有 mcpServers，也没有技能，
+    // 所以既不该冒出 mcp__ 前缀的工具，也不该有那个按需载入的 `skill`
     const tools = d.tools.a?.session?.tools ?? []
     check(
       '会话工具集完整且没有多余的 MCP 工具',
-      ['read_file', 'write_file', 'edit_file', 'glob', 'grep', 'bash', 'todo_write', 'memory_read', 'memory_write'].every(
-        (n) => tools.includes(n),
-      ) && tools.length === 9 && !tools.some((n) => n.startsWith('mcp__')),
+      [
+        'read_file',
+        'write_file',
+        'edit_file',
+        'glob',
+        'grep',
+        'bash',
+        'todo_write',
+        'memory_read',
+        'memory_write',
+        'skill_write',
+        'skill_remove',
+        'mcp_add',
+        'mcp_remove',
+      ].every((n) => tools.includes(n)) &&
+        tools.length === 13 &&
+        !tools.some((n) => n.startsWith('mcp__')) &&
+        !tools.includes('skill'),
       JSON.stringify(tools),
     )
     check(
@@ -614,6 +694,26 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
     )
 
     // ---- 设置页（模型 / 技能 / MCP）的数据源
+    //
+    // 先看**一个会话都没开**时那次调用：技能与 MCP 挂在项目运行时上，配它们正是开
+    // 第一个会话之前想做的事。这条通道早先按 sessionId 取，那一刻三个页面只能显示
+    // 「还没有打开的会话」—— 那就是这次的回归点
+    const noSession = d.projectInfoNoSession
+    check(
+      '没开会话也能拿到设置页快照（技能 / MCP 挂在项目上）',
+      noSession?.ok === true && noSession.info?.cwd === d.opened?.a?.cwd,
+      JSON.stringify(noSession),
+    )
+    check(
+      '没开会话时快照就已经是完整的（档案、技能、MCP 都在）',
+      Array.isArray(noSession?.info?.profiles) &&
+        noSession.info.profiles.length === 1 &&
+        noSession.info.activeProvider === 'default' &&
+        Array.isArray(noSession.info.skills) &&
+        Array.isArray(noSession.info.mcp),
+      JSON.stringify({ profiles: noSession?.info?.profiles, activeProvider: noSession?.info?.activeProvider }),
+    )
+
     const info = d.projectInfo?.info
     check('project/info 拿得到快照', d.projectInfo?.ok === true && !!info, JSON.stringify(d.projectInfo))
     // 环境变量里那个刻意非默认的名字，得一路传到设置页
@@ -727,6 +827,266 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
         d.configAfterRemoveActive === d.configAfterVendor,
       JSON.stringify(d.removeActive),
     )
+    // ---- 技能与 MCP 的增删：设置页那两个表单和对话里那四个工具最终都走这四条通道
+    //
+    // 断言一律盯**磁盘上的文件**和通道回来的快照。通道回一个路径不代表文件写出来了；
+    // 配置里的键写对了也不代表运行期真连上了 —— 这两件事各有各的错法。
+    const projCwd = d.opened?.a?.cwd
+    check(
+      'skill/add 把 SKILL.md 写到了项目的技能根下',
+      d.skillAdd?.ok === true &&
+        d.skillAdd.file === path.join(projCwd, '.clauda', 'skills', 'weekly-report', 'SKILL.md'),
+      JSON.stringify(d.skillAdd),
+    )
+    check(
+      '磁盘上那份真的带 frontmatter，名字与说明都在',
+      typeof d.skillFile === 'string' &&
+        d.skillFile.startsWith('---\n') &&
+        d.skillFile.includes('name: weekly-report') &&
+        /description: .*周报/.test(d.skillFile),
+      String(d.skillFile).slice(0, 200),
+    )
+    check(
+      '设置页快照里出现了新技能',
+      (d.projectInfoAfterSkill?.info?.skills ?? []).some((s) => s.name === 'weekly-report'),
+      JSON.stringify(d.projectInfoAfterSkill?.info?.skills),
+    )
+    // 决策 2（立刻生效）唯一的验收点：这个会话是**零技能时**开出来的，那时 `skill`
+    // 工具根本不在集合里。加完技能当场就能看到它，才叫「当前会话也能用」
+    check(
+      '加完技能后老会话当场拿到 skill 工具（不用新开会话）',
+      (d.stateAfterSkill?.session?.tools ?? []).includes('skill'),
+      JSON.stringify(d.stateAfterSkill?.session?.tools),
+    )
+    check(
+      '范围选全局就落在 CLAUDA_HOME 下（两个根真的分流了）',
+      d.skillAddGlobal?.ok === true && d.globalSkillFile === true,
+      JSON.stringify({ res: d.skillAddGlobal, exists: d.globalSkillFile }),
+    )
+    // 名字是路径的一部分，不合规必须**当场拒**：静默改名会让界面上的名字和目录名对不上
+    check(
+      '不合规的技能名被挡住，磁盘上一个目录都没多',
+      d.badSkill?.ok === false && String(d.badSkill.reason).length > 0,
+      JSON.stringify(d.badSkill),
+    )
+    check('被拒的那次没写出任何东西', Array.isArray(d.escapedSkill) && d.escapedSkill.length === 0, JSON.stringify(d.escapedSkill))
+    check(
+      'skill/remove 删的是整个技能目录',
+      d.skillRemove?.ok === true && d.skillGone === true,
+      JSON.stringify({ res: d.skillRemove, gone: d.skillGone }),
+    )
+    check(
+      '删不存在的技能报「没有」，不静默成功',
+      d.skillRemoveMissing?.ok === false && String(d.skillRemoveMissing.reason).includes('weekly-report'),
+      JSON.stringify(d.skillRemoveMissing),
+    )
+    check(
+      '删完之后快照里没有它了（全局那份还在）',
+      !(d.projectInfoAfterSkillRemove?.info?.skills ?? []).some((s) => s.name === 'weekly-report') &&
+        (d.projectInfoAfterSkillRemove?.info?.skills ?? []).some((s) => s.name === 'house-style'),
+      JSON.stringify(d.projectInfoAfterSkillRemove?.info?.skills),
+    )
+
+    // MCP：真起一个子进程（tests/mock-mcp.mjs，两个工具）再删掉。状态是 connected、
+    // 工具数是**真数出来**的 2 而不是回显配置 —— 这条才有资格叫「加完就能用」
+    check('mcp/add 起来了那个子进程', d.mcpAdd?.ok === true, JSON.stringify(d.mcpAdd))
+    const mcpAdded = (d.projectInfoAfterMcpAdd?.info?.mcp ?? []).find((s) => s.name === 'desk-mock')
+    check(
+      '新服务器在快照里是 connected 且工具数对得上',
+      mcpAdded?.state === 'connected' && mcpAdded.toolCount === 2,
+      JSON.stringify(mcpAdded),
+    )
+    const afterMcpAdd = d.configAfterMcpAdd ? JSON.parse(d.configAfterMcpAdd) : {}
+    check(
+      'MCP 配置写进了项目那份 config.json 的 mcpServers',
+      afterMcpAdd.mcpServers?.['desk-mock']?.command === process.execPath &&
+        afterMcpAdd.mcpServers?.['desk-mock']?.args?.[0]?.endsWith('mock-mcp.mjs'),
+      JSON.stringify(afterMcpAdd.mcpServers),
+    )
+    // 加了新段落之后，别的段落还必须是**此刻**的原样（前面刚切到 deepseek、
+    // 两份档案并存）：档案、当前使用、传输旋钮、未展开的占位符，一条都不能被顺手重写
+    check(
+      '加 MCP 时其它段落一字未动',
+      afterMcpAdd.activeProvider === 'deepseek' &&
+        afterMcpAdd.profiles?.default?.model === 'desk-model-2' &&
+        afterMcpAdd.profiles?.deepseek?.model === 'deepseek-chat' &&
+        afterMcpAdd.provider?.timeoutMs === 20000 &&
+        afterMcpAdd.provider?.baseUrl === undefined &&
+        d.configAfterMcpAdd.includes('${CLAUDA_API_KEY}') === true,
+      JSON.stringify({ active: afterMcpAdd.activeProvider, provider: afterMcpAdd.provider }),
+    )
+    // 连不上的服务器：`addServer` 抛，通道翻成 `{ok:false, reason}`。**不能**静默报成功 ——
+    // 那是「界面说接上了、工具一个没多」那条老回归
+    check(
+      '连不上的 MCP 服务器返回 {ok:false, reason}',
+      d.badMcp?.ok === false && String(d.badMcp.reason).length > 0,
+      JSON.stringify(d.badMcp),
+    )
+    check(
+      '失败那次也没把已有的服务器搞脏',
+      d.configAfterBadMcp ? JSON.parse(d.configAfterBadMcp).mcpServers?.['desk-mock']?.command === process.execPath : false,
+      String(d.configAfterBadMcp).slice(0, 300),
+    )
+    check(
+      'mcp/remove 只摘掉指定的那一条（连不上的那条还在）',
+      d.mcpRemove?.ok === true &&
+        JSON.stringify(Object.keys(JSON.parse(d.configAfterMcpRemove ?? '{}').mcpServers ?? {})) === '["bad-mock"]',
+      String(d.configAfterMcpRemove).slice(-200),
+    )
+    check(
+      '删完之后快照里没有那个服务器了',
+      !(d.projectInfoAfterMcpRemove?.info?.mcp ?? []).some((s) => s.name === 'desk-mock'),
+      JSON.stringify(d.projectInfoAfterMcpRemove?.info?.mcp),
+    )
+
+    // ---- 智能体：设置页那套表单与「开新会话时绑定」最终都走这四条通道
+    //
+    // 断言一律盯**磁盘上的文件**。通道回一个路径不代表文件写出来了；快照里有那一行
+    // 也不代表 frontmatter 真是那个形状（旧路径、丢了 `temperature: 0`，光看返回值都发现不了）。
+    check(
+      'agent/add 把 AGENT.md 写到了项目的智能体根下',
+      d.agentAdd?.ok === true &&
+        d.agentAdd.file === path.join(projCwd, '.clauda', 'agents', 'code-review', 'AGENT.md') &&
+        d.agentAdd.created === true,
+      JSON.stringify(d.agentAdd),
+    )
+    check(
+      '磁盘上那份真的带 frontmatter，tools / temperature 两行都在',
+      typeof d.agentFile === 'string' &&
+        d.agentFile.startsWith('---\n') &&
+        d.agentFile.includes('name: code-review') &&
+        d.agentFile.includes('tools: read_file, grep') &&
+        // 0 是**有效配置**：丢了这一行就是「温度设置不生效」，而返回值里根本看不出来
+        d.agentFile.includes('temperature: 0') &&
+        // 问题里那个逗号**不能**把一句切成两条 —— 这是 `questions` 用 `|` 当分隔符的全部理由
+        d.agentFile.includes('questions: 这次改动有什么风险 | 跑测试要装什么，怎么装？'),
+      String(d.agentFile).slice(0, 400),
+    )
+    check(
+      'agent/get 把正文读回来了（`project/info` 刻意不带正文）',
+      d.agentGet?.ok === true &&
+        String(d.agentGet.agent?.body).includes('严格的代码审查员') &&
+        d.agentGet.agent?.questions?.length === 2 &&
+        d.agentGet.agent.questions[1] === '跑测试要装什么，怎么装？',
+      JSON.stringify(d.agentGet),
+    )
+    // 智能体文件是要能提交进 git、发给别人的，所以快照里只许有它**自己**写的东西 + 路径：
+    // 端点与密钥一个字都不能出现（`profile` 只出名字）
+    const agentInfo = (d.projectInfoAfterAgentAdd?.info?.agents ?? []).find((a) => a.name === 'code-review')
+    check(
+      '设置页快照里有它，且不带正文、不带任何密钥',
+      agentInfo !== undefined &&
+        agentInfo.description === '按严重程度审查改动' &&
+        agentInfo.profile === 'default' &&
+        agentInfo.body === undefined &&
+        agentInfo.isDefault === false &&
+        !/apiKey|baseUrl|\$\{CLAUDA_API_KEY\}/.test(JSON.stringify(d.projectInfoAfterAgentAdd?.info?.agents)),
+      JSON.stringify(agentInfo),
+    )
+    // 名字是路径的一部分，不合规必须**当场拒**：静默改名会让界面上的名字和目录名对不上。
+    // 这同时复验了 `../` 那道穿越闸门在智能体这条路上一样管用
+    check(
+      '不合规的智能体名被挡住',
+      d.badAgent?.ok === false && String(d.badAgent.reason).length > 0,
+      JSON.stringify(d.badAgent),
+    )
+
+    // 标「本项目默认」：**只写 config.json 的一个键**。写回走的是磁盘原文，
+    // 所以 `${VAR}` 必须**还是**占位符 —— 展开了就是明文密钥落盘，而且是静默发生
+    const cfgBeforeAgent = d.configBeforeAgentAdd ? JSON.parse(d.configBeforeAgentAdd) : {}
+    const cfgAfterAgent = d.configAfterDefaultAgent ? JSON.parse(d.configAfterDefaultAgent) : {}
+    const { defaultAgent: _pickedDefault, ...agentRest } = cfgAfterAgent
+    // 基线取在智能体那一段**开头**：`agent/add` 写的是 AGENT.md，配置一个字都不该动
+    check('agent/add 没碰过 config.json', d.configBeforeAgentAdd === d.configAfterAgentAdd, '配置在 agent/add 前后不一样')
+    check(
+      'set-default-agent 只加了 defaultAgent 一个键，其余段落一字未动',
+      d.setDefaultAgent?.ok === true &&
+        cfgAfterAgent.defaultAgent === 'code-review' &&
+        JSON.stringify(agentRest) === JSON.stringify(cfgBeforeAgent) &&
+        d.configAfterDefaultAgent.includes('${CLAUDA_API_KEY}') === true,
+      JSON.stringify({ res: d.setDefaultAgent, after: cfgAfterAgent }),
+    )
+    check(
+      'project/info 标出了哪一个是本项目默认',
+      (d.projectInfoAfterDefaultAgent?.info?.agents ?? []).filter((a) => a.isDefault).map((a) => a.name).join(',') ===
+        'code-review' && d.projectInfoAfterDefaultAgent.info.defaultAgent === 'code-review',
+      JSON.stringify(d.projectInfoAfterDefaultAgent?.info?.agents),
+    )
+    // 「套项目默认」只发生在界面那一格下拉框的初始值里，**主进程没有这条魔法** ——
+    // 一条没绑过的会话不该因为项目有默认就悄悄变成它（那是行为静默改变，最难查的一类）
+    check(
+      'agent 传空串 = 明确不要智能体，不套项目默认',
+      d.openNoAgent?.ok === true &&
+        d.openNoAgent.session.agentName === '' &&
+        (d.openNoAgent.session.agentQuestions ?? []).length === 0 &&
+        d.openNoAgent.session.agentWarning === '',
+      JSON.stringify(d.openNoAgent?.session),
+    )
+    check(
+      'agent 传名字 = 绑上它，空态问题跟着这份**冻结的**配方来',
+      d.openWithAgent?.ok === true &&
+        d.openWithAgent.session.agentName === 'code-review' &&
+        JSON.stringify(d.openWithAgent.session.agentQuestions) ===
+          JSON.stringify(['这次改动有什么风险', '跑测试要装什么，怎么装？']),
+      JSON.stringify(d.openWithAgent?.session),
+    )
+    // 名字不存在时**不抛**：一个被删掉的智能体不该让会话打不开（自动恢复那条路尤其）
+    check(
+      '名字找不到时按「没有智能体」装配，另给一条警告',
+      d.openMissingAgent?.ok === true &&
+        d.openMissingAgent.session.agentName === '' &&
+        String(d.openMissingAgent.session.agentWarning).includes('已经删掉的那个'),
+      JSON.stringify(d.openMissingAgent?.session?.agentWarning),
+    )
+
+    // 冻结语义的**磁盘证据**：配方随会话落盘。而且里面绝不能有端点或密钥 ——
+    // 会话文件是明文 JSON，而 config.json 里的密钥可能正是 `${DEEPSEEK_KEY}` 这种占位符
+    const agentRec = d.agentSessionOnDisk ? JSON.parse(d.agentSessionOnDisk) : {}
+    check(
+      '会话文件里冻着建会话那一刻的配方',
+      agentRec.agent?.name === 'code-review' &&
+        agentRec.agent.body === undefined &&
+        String(agentRec.agent.prompt).includes('严格的代码审查员') &&
+        agentRec.agent.model === 'agent-model' &&
+        agentRec.agent.temperature === 0 &&
+        agentRec.agent.profile === 'default',
+      JSON.stringify(agentRec.agent),
+    )
+    check(
+      '会话文件里搜不到任何密钥或端点',
+      typeof d.agentSessionOnDisk === 'string' &&
+        !/apiKey|baseUrl/.test(d.agentSessionOnDisk) &&
+        !d.agentSessionOnDisk.includes('${CLAUDA_API_KEY}'),
+      String(d.agentSessionOnDisk).slice(0, 300),
+    )
+
+    check(
+      'agent/remove 删的是整个智能体目录',
+      d.agentRemove?.ok === true && d.agentDirGone === true,
+      JSON.stringify({ res: d.agentRemove, gone: d.agentDirGone }),
+    )
+    // 删不存在的要报「没有」，**不能静默成功**（界面那行会留在原地，用户以为还配着）
+    check(
+      '删完之后再 get 报「没有」，不静默成功',
+      d.agentGetMissing?.ok === false && String(d.agentGetMissing.reason).includes('code-review'),
+      JSON.stringify(d.agentGetMissing),
+    )
+    check(
+      '快照里也没有它了',
+      !(d.projectInfoAfterAgentRemove?.info?.agents ?? []).some((a) => a.name === 'code-review'),
+      JSON.stringify(d.projectInfoAfterAgentRemove?.info?.agents),
+    )
+    // **先前那条绑过它的老会话照样能打开、还是它那份配方** —— 配方冻在会话里，不依赖那个目录
+    // 还在。这是「冻结」而不是「恢复时按名字重查」最直接的正面证据
+    check(
+      '智能体删掉后，老会话恢复出来仍绑着它',
+      d.agentSessionAfterRemove?.ok === true &&
+        d.agentSessionAfterRemove.session.agentName === 'code-review' &&
+        JSON.stringify(d.agentSessionAfterRemove.session.agentQuestions) ===
+          JSON.stringify(['这次改动有什么风险', '跑测试要装什么，怎么装？']),
+      JSON.stringify(d.agentSessionAfterRemove?.session),
+    )
+
     check(
       '下发的厂商表非空且 key 唯一（renderer 的选择器直接照着它画）',
       Array.isArray(d.projectInfoAfterVendor?.info?.vendors) &&

@@ -1,5 +1,6 @@
 import type { SessionSnapshot } from '../agent/agent.js'
 import { deriveTitle, loadSession, saveSession } from '../agent/session.js'
+import type { AgentSpec } from '../agents/types.js'
 import { formatBytes } from '../util/text.js'
 
 /** 会话文件超过这个体积就在 stderr 上说一句。带图的会话会撞到，正常对话不会 */
@@ -10,6 +11,13 @@ export interface PersistOptions {
   sessionId: string
   model: string
   snapshot: SessionSnapshot
+  /**
+   * 这条会话冻结的智能体配方。**可选**：CLI 没有会话级绑定，主进程之外的调用方也不必造一份。
+   *
+   * 漏传的症状不是报错，而是「这次会话能跑，重开就不认识自己了」—— 恢复出来的会话会退回
+   * 「没有智能体」，提示词、工具白名单、权限覆盖一起消失。
+   */
+  agent?: AgentSpec
 }
 
 /**
@@ -49,6 +57,9 @@ export function persistSession(opts: PersistOptions): void {
       todos: snapshot.todos,
       totalUsage: snapshot.totalUsage,
       cost: snapshot.cost,
+      // 逐个字段手拼的字面量，所以新字段必须在这儿补一行；不能靠 `...opts` 兜底
+      // （那会把 sessionId / snapshot 这些不该落盘的键一起写进去）
+      agent: opts.agent,
     })
   } catch {
     // 会话落盘失败不该影响主流程

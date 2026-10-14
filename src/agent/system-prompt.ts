@@ -24,6 +24,13 @@ export interface SystemPromptOptions {
   skills?: { list(): SkillSummary[] }
   /** 同上，不必依赖 memory-store 的实现。total 用来提示还有多少篇没列出来 */
   memoryIndex?: { entries: MemorySummary[]; total: number }
+  /**
+   * 本会话绑的智能体（`AGENT.md` 的正文就是提示词里那一段）。不填就是没有智能体。
+   *
+   * 收窄成 `{name, prompt}` 而不是直接收 `AgentSpec`：这段函数只管「往提示词里插一段文字」，
+   * 不必认识智能体的模型 / 权限 / 白名单那些字段（它们走 `applyAgentToConfig` 和装配层）。
+   */
+  agent?: { name: string; prompt: string }
 }
 
 /**
@@ -38,6 +45,7 @@ export function buildSystemPrompt(opts: SystemPromptOptions): string {
 
   return [
     coreIdentity(),
+    agentIdentity(opts.agent),
     environment(cwd),
     toneAndStyle(),
     toolGuidance(),
@@ -71,6 +79,21 @@ function coreIdentity(): string {
 不要因为一件事「不属于软件工程」就把它推掉。该不该接，看的是手上的工具够不够，而不是「这是不是我的专业」。够不到的地方照实说明缺什么，再给一条走得通的路子（请用户把数据放进工作目录、写段代码去取、把步骤讲清楚由用户自己执行），而不是开口先说「这超出我的能力范围」。真做不到的事，说清楚是哪一件、为什么，比笼统地自我否定有用得多。
 
 反过来也别吹：没有的工具就说没有（例如当前没有联网检索、没有内置数据），不要承诺做不到的事，也不要编一个看起来像的答案。`
+}
+
+/**
+ * 智能体带来的那段人格 —— 紧跟 `coreIdentity()` 之后、`environment()` 之前。
+ *
+ * **插入位置只有一个选择**：这段文字回答的是「你是谁」，该紧挨着基础人格；而**绝不能**
+ * 插在 `## 项目记忆` 和 `## 会话配置` 之间（见文件头那条顺序约定）。
+ *
+ * 标题里带上名字是给排查用的：模型开始复述人格时，一眼能看出这段来自哪份 `AGENT.md`。
+ * 正文为空就当没有 —— 一个只有标题的段对模型没有信息量，只是白付 token。
+ */
+function agentIdentity(agent?: SystemPromptOptions['agent']): string {
+  const body = agent?.prompt.trim()
+  if (!agent || !body) return ''
+  return `## 智能体：${agent.name}\n\n${body}`
 }
 
 function environment(cwd: string): string {

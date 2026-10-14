@@ -1,7 +1,11 @@
 import { listMemories } from '../agent/memory-store.js'
+import { AgentRegistry } from '../agents/registry.js'
 import { loadConfig, type CliOverrides } from '../config.js'
 import { McpManager } from '../mcp/manager.js'
 import { SkillRegistry } from '../skills/registry.js'
+import { makeMcpAddTool, makeMcpRemoveTool } from '../tools/mcp.js'
+import { makeSkillRemoveTool, makeSkillWriteTool } from '../tools/skill.js'
+import type { Tool } from '../tools/types.js'
 import { createToolAssembly } from './tools-assembly.js'
 import type { SessionProject } from './session-manager.js'
 
@@ -39,24 +43,39 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
   }
 
   const skills = SkillRegistry.discover(opts.cwd)
+  // 智能体和技能同构：打开项目时扫一次，之后 `refresh()` 原地重扫
+  const agents = AgentRegistry.discover(opts.cwd)
   const mcp = new McpManager(config.mcpServers ?? {}, {
     version: opts.version,
     view: { warn: opts.onWarn ?? (() => {}) },
   })
   await mcp.start()
 
-  const assembly = createToolAssembly(skills, mcp)
+  // 「对话里增删技能 / MCP 服务器」的四个工具。它们要拿到注册表和管理器，所以在这一层建，
+  // 建完交给装配配方摆位置 —— 装配层因此不必认识 `McpManager`（它会起子进程）
+  const extraTools: Tool[] = [
+    makeSkillWriteTool(skills, { cwd: opts.cwd }),
+    makeSkillRemoveTool(skills),
+    makeMcpAddTool(mcp, { cwd: opts.cwd }),
+    makeMcpRemoveTool(mcp, { cwd: opts.cwd }),
+  ]
+  const assembly = createToolAssembly(skills, mcp, extraTools)
 
   return {
     cwd: opts.cwd,
     config,
     skills,
+    agents,
     memoryIndex: () => listMemories(),
     assembleTools: assembly.assemble,
     mcp: {
       // 原样把 Promise 交出去，不要在这里 `void` 掉：SessionManager 要 await 它，
       // 连接失败得能冒泡到界面 —— 吞掉的后果是「点了开关，报成功，其实没接上」
       setEnabled: (name, enabled) => mcp.setEnabled(name, enabled),
+      // 同上，这两个也**必须**把异常放出去：连不上时 `addServer` 会抛，设置页要据此报错，
+      // 而不是显示「已添加」却一个工具都没多
+      addServer: (name, cfg) => mcp.addServer(name, cfg),
+      removeServer: (name) => mcp.removeServer(name),
       status: () => mcp.status(),
       tokenHint: () => mcp.tokenHint(),
       tools: () => mcp.tools(),

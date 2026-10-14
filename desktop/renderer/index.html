@@ -36,12 +36,39 @@
 
         <!--
           导航条同时是「状态脊」：每一项自带一个实时徽标（会话数 / 当前模型 /
-          技能数 / MCP 已连接数）。这些是后台状态，不该逼用户点进去才知道。
+          技能数 / 智能体数 / MCP 已连接数）。这些是后台状态，不该逼用户点进去才知道。
 
-          四项同级，顺序是「配置 → 内容」：前三项是会话要用到的资源，会话自己压轴
-          —— 它就贴在下面那张会话列表的顶上，起一个分节标题的作用。
+          会话视图下这里只有「会话」一项。四个设置项是**另一套左栏内容**，点底部的
+          「设置」才换上（见 `#settings-group`）—— 换上时这一格和下面的会话列表一起让位。
         -->
-        <nav class="rail" aria-label="主导航">
+        <nav class="rail" id="rail" aria-label="主导航">
+          <!--
+            会话排在最上面、且紧挨着下面那张会话列表：进应用第一眼就是它。这一格的徽标
+            是进行中的会话数。
+          -->
+          <button type="button" class="rail-item" id="nav-sessions">
+            <span class="rail-label">会话</span>
+            <span class="rail-badge mono" id="badge-sessions"></span>
+          </button>
+        </nav>
+
+        <!--
+          设置四项。点开「设置」之后**整块左栏换成它** —— 会话那一格和下面的会话列表
+          同时让位（用户的原话是「点击设置 隐藏会话相关内容」）。
+
+          所以它排在 `.browse` **上面**：换上去之后它就是左栏的第一块内容，接的正是
+          原来「会话」那一格的位置。底部的「设置」只是个开关，不再是这四个的容器 ——
+          所以这里也不缩进、不画左侧竖线。
+        -->
+        <div class="rail-group" id="settings-group" hidden>
+          <!--
+            智能体排在最前面：它是唯一一项「描述整段对话」的配置，模型/技能/工具
+            都只是它参考的素材。把它压在模型上面，也是用户指定的位置。
+          -->
+          <button type="button" class="rail-item" id="nav-agents">
+            <span class="rail-label">智能体</span>
+            <span class="rail-badge mono" id="badge-agents"></span>
+          </button>
           <button type="button" class="rail-item" id="nav-model">
             <span class="rail-label">模型</span>
             <span class="rail-badge mono" id="badge-model"></span>
@@ -51,21 +78,20 @@
             <span class="rail-badge" id="badge-skills"></span>
           </button>
           <button type="button" class="rail-item" id="nav-mcp">
-            <span class="rail-label">MCP</span>
+            <span class="rail-label">工具</span>
             <span class="rail-badge" id="badge-mcp"></span>
           </button>
-          <button type="button" class="rail-item" id="nav-sessions">
-            <span class="rail-label">会话</span>
-            <span class="rail-badge" id="badge-sessions"></span>
-          </button>
-        </nav>
+        </div>
 
         <!--
-          会话浏览区。设置视图下整块隐藏（见 style.css）：那时中栏是设置页，
-          而这里点一行只会换会话、**不会切回会话视图**，留着就是一块点不出结果的
-          区域。导航条本身不隐藏，否则进了设置页就没有回去的路。
+          会话浏览区。**只在会话视图下在**：点开「设置」之后整块让位给上面那四项。
+
+          它一度想五个视图下都常驻，理由是「换一份配置、马上找个会话来试」该是一步。
+          但设置页上真正要点的东西在中栏和右栏，把「项目目录 / 新会话 / 一长串会话」
+          留在左边，只会把该看的那四个设置项挤到看不见。要试新配置，点「会话」回去
+          就行 —— 那一下本来就要点，因为换回会话视图正是它的语义（`showSessions()`）。
         -->
-        <div class="browse">
+        <div class="browse" id="browse">
           <label class="project-picker">
             <span>项目目录</span>
             <button id="pick-project" class="ghost small">选择…</button>
@@ -75,12 +101,42 @@
             「新会话」贴在这一列会话的顶上，而不是品牌那一行：它属于**这个项目**的会话
             列表，不是属于整个窗口，放这儿之后「在哪个项目里新建」一目了然，不必回头去
             看上面那行路径。
-            顺带也修了一处别扭：它同样不切视图（`openNewSession` 只开会话、不动 `view`），
-            留在设置页上点它和点一行会话一样点不出结果，跟着 `.browse` 一起收起正合适。
+            它和会话行一样，点完会把中栏换回对话（`showSessions()`）—— 造一个新的出来
+            当然是给你看的，留在设置页上会显得这一下没生效。
           -->
+          <!--
+            「用哪个智能体」这一格**只在开新会话时点得动** —— 这是「会话创建那一刻定下来」
+            这条决策在界面上的落点。选项由 `renderNewSessionAgent()` 现填，默认落在
+            本项目默认的那个上；没有默认就落在「（不用智能体）」。
+
+            它**总是带一个具体值**（没选就发空串），所以主进程那条「没给名字就套项目默认」
+            的隐患在这条路径上根本不成立。
+          -->
+          <select id="new-session-agent" class="new-session-agent" aria-label="新会话使用哪个智能体"></select>
           <button id="new-session" class="new-session" title="在选中的项目里新建会话">＋ 新会话</button>
           <div id="session-list" class="session-list"></div>
         </div>
+
+        <!--
+          设置停靠区：整个左栏只有这一个按钮钉在窗口最底下。点它把上面的内容在
+          「会话」和「设置四项」之间换一次 —— 它现在是个开关，不是展开器。
+
+          靠 `margin-top: auto` 而不是 `.browse` 的 `flex: 1` 顶到底：点开「设置」
+          之后 `.browse` 就 `hidden` 了，还指望它把这一块顶下去的话，按钮会跟着往上跑。
+        -->
+        <div class="settings-dock">
+          <button
+            type="button"
+            class="rail-item"
+            id="nav-settings"
+            aria-expanded="false"
+            aria-controls="settings-group"
+          >
+            <span class="rail-label">设置</span>
+            <span class="rail-caret" aria-hidden="true"></span>
+          </button>
+        </div>
+
       </aside>
 
       <main class="chat">
@@ -90,7 +146,19 @@
         -->
         <div class="view" id="view-sessions">
           <header class="topbar">
-            <div class="topbar-title" id="chat-title">还没有打开的会话</div>
+            <!--
+              标题和「这个会话绑的智能体」并成一组。**不能**把 `#chat-agent` 直接挂到
+              `.topbar` 上：那是个 `space-between` 的两列 flex，多一个孩子会把中栏的
+              控件整排挤歪。
+            -->
+            <div class="topbar-left">
+              <div class="topbar-title" id="chat-title">还没有打开的会话</div>
+              <!--
+                显示的是**这一个会话**绑的智能体，不是「项目的默认智能体」——
+                同一个项目下两个会话可以绑两个不同的智能体。没有绑定时整格藏起来。
+              -->
+              <span class="chat-agent mono" id="chat-agent" hidden></span>
+            </div>
             <div class="topbar-controls">
               <label class="control">
                 <span>模型</span>
@@ -113,6 +181,17 @@
 
           <div id="stream" class="stream"></div>
 
+          <!--
+            新会话空态：这个智能体配好的「常见问题」，点一条就当作发出去。
+
+            **为什么不塞进 `#stream` 里**：`renderStream` 靠
+            `while (streamNodes.length > items.length) els.stream.lastElementChild.remove()`
+            收尾，多一个尾巴上来的节点会被它当成多余的消息节点删掉。放在同级、
+            由 `renderEmptyQuestions()` 自己管显示与否，`#stream` 那套被测试钉住的
+            DOM 契约一个字都不用动。
+          -->
+          <div id="empty-questions" class="empty-questions" hidden></div>
+
           <form id="composer" class="composer">
             <!--
               待发附件。`.composer` 是 `flex-wrap: wrap` 的，这一条靠 `flex-basis: 100%`
@@ -129,7 +208,7 @@
           </form>
         </div>
 
-        <!-- 模型 / 技能 / MCP 三个设置页共用这一个容器，内容由 app.js 现画 -->
+        <!-- 智能体 / 模型 / 技能 / 工具四个设置页共用这一个容器，内容由 app.js 现画 -->
         <div class="view" id="view-settings" hidden>
           <header class="settings-head">
             <h1 class="settings-title" id="settings-title"></h1>

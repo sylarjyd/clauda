@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import type { AgentSpec } from '../agents/types.js'
 import { claudaHome } from '../config.js'
 import type { WireMessage } from '../types.js'
 import { messageText } from '../util/message.js'
@@ -17,6 +18,14 @@ export interface SessionRecord {
   todos: SessionSnapshot['todos']
   totalUsage: SessionSnapshot['totalUsage']
   cost: number
+  /**
+   * 建会话时绑的智能体（冻结的那一份）。**必须可选**：`isSessionRecord()` 不验它，
+   * 磁盘上那些老会话文件没有这个键 —— 写成必填会让它们整个被判成坏文件、从侧边栏一起消失。
+   *
+   * 形状校验在 `readAgentSpec()`（`agents/apply.ts`）那边做，通道是磁盘上的 JSON、
+   * 手改得坏，照本文件通篇「坏数据降级而不是崩」的取向。
+   */
+  agent?: AgentSpec
 }
 
 /** 每个工作目录一个子目录，避免不同项目的会话混在一起 */

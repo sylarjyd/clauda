@@ -1,5 +1,6 @@
 import { isSafeSessionId, listProjects, listSessionSummaries, loadSession } from '../agent/session.js'
-import type { PermissionMode } from '../config.js'
+import { readAgentSpec } from '../agents/apply.js'
+import type { McpServerConfig, PermissionMode } from '../config.js'
 import { findVendor } from '../provider/vendors.js'
 import { ingestAttachments, sanitizeAttachments } from './attachment.js'
 import type { PermissionDecision } from './permission-bridge.js'
@@ -25,6 +26,12 @@ export interface SessionInfo {
   todos: unknown
   contextTokens: number
   contextRatio: number
+  /** 这条会话绑的智能体名，空串 = 没绑。**不是**项目的默认智能体：同项目两会话可以绑不同的 */
+  agentName: string
+  /** 新会话空态的**可点问题**，取自这条会话**冻结的**配方（回头按名字查会让老会话跟着改） */
+  agentQuestions: string[]
+  /** 空串 = 没事。非空时界面弹**一次**通知（快照是高频的，不能每来一次弹一次） */
+  agentWarning: string
 }
 
 export interface DesktopAppOptions {
@@ -131,11 +138,140 @@ export class DesktopApp {
           return { ok: true }
         }
 
-        case 'project/info':
-          return withSession(this.manager, payload, (session) => {
-            const info = this.manager.projectInfo(session.id)
-            return info ? { ok: true, info } : { ok: false, reason: '项目运行时还没就绪' }
+        /**
+         * 技能与 MCP 的增删。四条通道形状一致：先 `ensureProject`（和 `project/info`
+         * 一样带副作用，这个项目可能还没开过会话），再调 `SessionManager` 上对应的方法。
+         *
+         * **参数不合法一律由 manager 抛**（名字不合规、服务器不存在、命令和 url 都没给…），
+         * 外层那个 catch 翻成 `{ok:false, reason}` —— 在这里再判一遍的话，判据就有两份，
+         * 迟早出现「通道放行了、manager 又拒了」或者反过来的分歧。
+         */
+        case 'skill/add': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          const scope = str(payload, 'scope') === 'global' ? 'global' : 'project'
+          return {
+            ok: true,
+            file: this.manager.addSkill(cwd, {
+              scope,
+              name: str(payload, 'name'),
+              description: str(payload, 'description'),
+              body: str(payload, 'body'),
+            }),
+          }
+        }
+
+        case 'skill/remove': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          return { ok: true, dir: this.manager.removeSkill(cwd, str(payload, 'name')) }
+        }
+
+        case 'mcp/add': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          const cfg = field(payload, 'config')
+          if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+            return { ok: false, reason: 'mcp/add 需要 config 对象' }
+          }
+          await this.manager.ensureProject(cwd)
+          const scope = str(payload, 'scope') === 'global' ? 'global' : 'project'
+          // 不包 try：连不上时 `addServer` 会抛，正是外层 catch 翻成人话给用户看
+          return {
+            ok: true,
+            file: await this.manager.addMcpServer(cwd, scope, str(payload, 'name'), cfg as McpServerConfig),
+          }
+        }
+
+        case 'mcp/remove': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          return { ok: true, file: await this.manager.removeMcpServer(cwd, str(payload, 'name')) }
+        }
+
+        /**
+         * 智能体的增删改查。形状同上面四条：先 `ensureProject`，再委托 manager，
+         * 参数不合法由 manager 抛、外层 catch 翻成 `{ok:false, reason}`。
+         *
+         * **`tools` / `skills` / `questions` 走数组，不走分隔符字符串**：`,` 与 `|` 是
+         * **文件格式**的事，归 `writeAgent` 管（连 `|` 的转义都在那儿）。IPC 传数组，
+         * 渲染层只在自己那边按行拆一次，两边各写一套 split 迟早分叉。
+         *
+         * `agent/add` **不触发工具广播**（改智能体只影响新会话），所以这里也不需要
+         * 那些技能 / MCP 通道里的刷新动作 —— 理由写在 `SessionManager.addAgent` 上。
+         */
+        case 'agent/add': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          const scope = str(payload, 'scope') === 'global' ? 'global' : 'project'
+          const permission = str(payload, 'permission')
+          const result = this.manager.addAgent(cwd, {
+            scope,
+            name: str(payload, 'name'),
+            description: str(payload, 'description'),
+            body: str(payload, 'body'),
+            // 空串一律落成 `undefined`（= 文件里不写这个键 = 沿用项目当前那份）。
+            // 把 `''` 原样写进文件会读成「显式设成空」，逐键覆盖的语义就反了
+            profile: strOrUndef(payload, 'profile'),
+            model: strOrUndef(payload, 'model'),
+            temperature: numOrUndef(payload, 'temperature'),
+            // 认不出的值当没给：写进去也只是被注册表忽略，不如在边界上就统一口径
+            permission: isPermissionMode(permission) ? permission : undefined,
+            allow: strList(payload, 'allow'),
+            deny: strList(payload, 'deny'),
+            tools: strList(payload, 'tools'),
+            skills: strList(payload, 'skills'),
+            questions: strList(payload, 'questions'),
           })
+          // 「同名整份覆盖」，所以 `created` 决定界面说「已新建」还是「已保存」
+          return { ok: true, file: result.file, created: result.created }
+        }
+
+        case 'agent/get': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          // 名字不存在时 `getAgent` 抛，外层翻成人话 —— **不能静默成功**，
+          // 那会让用户对着一个空表单以为「它本来就是空的」
+          return { ok: true, agent: this.manager.getAgent(cwd, str(payload, 'name')) }
+        }
+
+        case 'agent/remove': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          return { ok: true, dir: this.manager.removeAgent(cwd, str(payload, 'name')) }
+        }
+
+        /**
+         * 标「本项目默认」。'' = 取消默认。只影响之后新开的会话 ——
+         * 已经在跑的会话绑定是冻结的（同「模型 / 端点只对新会话生效」）。
+         */
+        case 'project/set-default-agent':
+          return withStr(payload, 'cwd', (cwd) => ({
+            ok: true,
+            file: this.manager.setDefaultAgent(cwd, str(payload, 'name')),
+          }))
+
+        /**
+         * 设置页（模型 / 技能 / MCP）唯一的数据源，**按 cwd 取**。
+         *
+         * 这条通道**有副作用**：第一次调用会把项目运行时建起来。技能与 MCP 挂在它
+         * 上面（MCP 子进程的宿主就是它），而配技能和 MCP 正是开第一个会话之前想做的事 ——
+         * 以前这里按 sessionId 取，于是那一刻三个页面只剩「还没有打开的会话」。
+         * 副作用是幂等的，多一次往返不值当，所以合在「取快照」这一条里。
+         */
+        case 'project/info': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          const info = this.manager.projectInfo(cwd)
+          return info ? { ok: true, info } : { ok: false, reason: '项目运行时还没就绪' }
+        }
 
         /**
          * 改**某一份档案**的接口地址 / 默认模型。`profileKey` 是设置页左栏选中的那份，
@@ -213,7 +349,13 @@ export class DesktopApp {
     // 这层拦一道是为了给出人话错误。真正的兜底在 session.ts —— 那边的 id 还可能
     // 来自会话文件内容，只堵 IPC 是堵不住的
     if (id && !isSafeSessionId(id)) return { ok: false, reason: `非法会话 id：${id}` }
-    const session = await this.manager.openSession(cwd, id ? { id } : {})
+    // `agent` 是名字（'' = 明确不要智能体）。**主进程没有「没给名字就用 `defaultAgent`」这条魔法**
+    // —— 那个回退太容易咬人（见 `openSession` 里 `pickAgent` 那段）。所以「套项目默认」这件事
+    // 只发生在界面那一格下拉框的初始值里：渲染层总是发一个具体值进来
+    const session = await this.manager.openSession(cwd, {
+      ...(id ? { id } : {}),
+      agent: str(payload, 'agent'),
+    })
     return { ok: true, session: infoOf(session) }
   }
 
@@ -247,6 +389,12 @@ export class DesktopApp {
         totalUsage: rec.totalUsage ?? { input: 0, output: 0 },
         cost: rec.cost ?? 0,
       },
+      // **永远传 `agentSpec`，哪怕值是 `null`。** 传 `null` 和省略不是一个意思：省略会落进
+      // 「新会话」分支去套**当下的**项目默认，于是一条从没绑过智能体的旧会话会在用户什么都
+      // 没点的情况下悄悄变成默认智能体 —— 行为静默改变，最难查的一类。
+      // `readAgentSpec` 过一遍形状：会话文件是磁盘上的明文 JSON，手改得坏，而
+      // `isSessionRecord` 刻意不验这个键（见 `agent/session.ts`）
+      agentSpec: readAgentSpec(rec.agent) ?? null,
     })
     return { ok: true, session: infoOf(session), messages: rec.messages }
   }
@@ -262,6 +410,13 @@ function infoOf(session: Session): SessionInfo {
     todos: session.agent.todos.toJSON(),
     contextTokens: session.agent.contextTokens(),
     contextRatio: session.agent.contextUsageRatio(),
+    agentName: session.agentName,
+    agentQuestions: session.agentSpec?.questions ?? [],
+    // 名字给过却解析不出来（比如它刚被删掉）时才提示。自动恢复的会话不该因为一个消失的智能体
+    // 就打不开，所以这里只是「说一声」，不是错误
+    agentWarning: session.agentMissing
+      ? `智能体「${session.agentMissing}」已经不在了，这个会话按默认配置打开`
+      : '',
   }
 }
 
@@ -299,4 +454,39 @@ function num(payload: unknown, key: string): number {
 
 function bool(payload: unknown, key: string): boolean {
   return field(payload, key) === true
+}
+
+const PERMISSION_MODES: readonly string[] = ['default', 'auto', 'plan']
+
+function isPermissionMode(v: string): v is PermissionMode {
+  return PERMISSION_MODES.includes(v)
+}
+
+/** 空串 = 「没填这一栏」= 文件里不写这个键。IPC 那头拿到的 `''` 正是这个意思 */
+function strOrUndef(payload: unknown, key: string): string | undefined {
+  const value = str(payload, key).trim()
+  return value || undefined
+}
+
+/**
+ * 数字参数。**缺键 / 非数字一律 `undefined`**，不能借 `num()` 那个 0 兜底 ——
+ * 温度 0 是有效配置（也是常用值），用 0 代表「没填」会把它悄悄换成 0 然后看起来对。
+ */
+function numOrUndef(payload: unknown, key: string): number | undefined {
+  const value = field(payload, key)
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 数组参数。非数组（缺键 / 类型不对）和空数组都返回 `undefined` —— 在写盘那边两者等价
+ * （都不写那一行），这里合并没有信息损失，还能挡住 renderer 传错类型时静默写成一行空配置。
+ */
+function strList(payload: unknown, key: string): string[] | undefined {
+  const raw = field(payload, key)
+  if (!Array.isArray(raw)) return undefined
+  const list = raw
+    .filter((x): x is string => typeof x === 'string')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  return list.length > 0 ? list : undefined
 }

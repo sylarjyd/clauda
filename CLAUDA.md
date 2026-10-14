@@ -46,6 +46,9 @@
   是浅合并，项目配置里只要出现这个键，全局配的服务器就会被**整个顶掉**。现在的处理是按
   **服务器名**合并，同名时项目级的整体替换全局的，**不做字段级深合并** —— 想改全局某个
   服务器的单个字段，得把它整个重写一遍。
+  「只有一个值的键」（`activeProvider`、`defaultAgent`）没有这个合并问题，但**同样要占
+  一行**：靠 `...patch` 兜底的话，哪天有个调用方给了 `defaultAgent: undefined`
+  （TS 上完全合法），这个键会被无声抹成 `undefined` 而不是空串。
 - **MCP 子进程必须关掉**（`McpManager.closeAll()`）。`StdioClientTransport` 起的子进程会让
   事件循环一直活着，忘了关的表现是 `/exit` 之后**卡住不返回**而不是报错。三个出口都要接：
   REPL 的 `onExit`、无头模式的 `shutdown()`、以及 `SIGTERM` 兜底。
@@ -53,14 +56,24 @@
 - **系统提示词的段落顺序即语义**，新段落一律插在 `## 项目记忆` 之前。两处依赖这个顺序：
   `repl.ts` 的 `/memory` 靠 `split('## 项目记忆')[1].split('## 会话配置')[0]` 取项目记忆，
   往这两个标题之间插任何东西都会弄坏它；测试里也有对应的回归断言。
-  当前顺序：`coreIdentity → environment → toneAndStyle → toolGuidance → modeGuidance →
-  skillsSection → memoryIndexSection → memorySection → configSection`。
+  当前顺序：`coreIdentity → agentIdentity → environment → toneAndStyle → toolGuidance →
+  attachmentGuidance → modeGuidance → skillsSection → memoryIndexSection → memorySection →
+  configSection`。智能体那段排第二是**唯一合理的位置**：它交付的就是「你是谁」，
+  该紧挨着基础人格，而不是沉进环境 / 风格那几段「怎么做」里。
 - **记忆只注入索引，正文一律不进提示词**（`memoryIndexSection` 只输出 name/description/type）。
   记忆库是无限增长的，正文一旦进提示词就是每轮都付。单测有「索引里不含正文」的断言
   盯着这条，别为了「让模型少调一次工具」把正文塞进去。
 - **工具想改系统提示词，靠 `Tool.invalidatesPrompt` 声明，不要在 agent 循环里判断工具名**。
   目前只有 `memory_write` 用：不重建提示词的话，模型刚写下的事实当轮自己都看不见。
   代价是这一轮 `messages[0]` 变了、会打断后端的提示词前缀缓存，所以只在真写了记忆时触发。
+- **工具想换掉工具集合，靠 `Tool.invalidatesTools` 声明**（同一套理由，别在循环里认工具名）。
+  跑完走 `AgentOptions.onToolsChanged` 回调，而不是 Agent 自己 `setTools` —— 它手里那份数组
+  是过期的，重算要回到持有项目运行时的那一层（`SessionManager.refreshProjectTools`，
+  `setMcpEnabled` 现在也复用它，早先那是同一条循环的第二份写法）。**漏掉声明的症状是
+  「刚加的东西当轮用不上」**：技能写得出来却载入不了、MCP 接上了工具一个没多，而且不报错 ——
+  四个工具（`skill_write` / `skill_remove` / `mcp_add` / `mcp_remove`）都声明了它。
+  两个 MCP 工具**不**声明 `invalidatesPrompt`（提示词里那段「## 可用技能」没动），
+  但那条回调为省事一律连提示词一起重建 —— 它分不出刚跑的是哪个工具，宁可多重建一次。
 - **记忆工具是无条件注入的**（不同于技能工具「有技能才挂」）：没有记忆时恰恰最需要
   `memory_write`，藏起来就永远写不进第一条。代价是这两个 schema 每轮都要付，实测
   **+384 token**（7 个内置是 1385）—— 调整它们的 description 时留意这个数。
@@ -151,6 +164,22 @@
   不覆盖**，别为了容错丢掉整份配置。同步**不许图省事重跑 `loadConfig`** —— 它内部的
   `dotenv.config` 会改全局 `process.env`（见下面 `createProjectRuntime` 那条），
   `SessionManager.patchTemplate` + `syncTemplate` 就是在内存里做 `resolveProfiles` 那一件事。
+- **技能与 MCP 的两条写路径沿用上面那条**（`skills/writer.ts` 的 `writeSkill` / `removeSkill`，
+  `config.ts` 的 `writeMcpServer` / `removeMcpServer`），各自另有一条自己的：
+  技能名按 `NAME_RE` 校验后**照用、不 slugify** —— 静默改名会让界面上的名字和目录名对不上，
+  那是最难查的一类问题；`removeSkill` 有两道护栏（必须是某个 `skills` 根的直接子目录、
+  里面真有 `SKILL.md`），因为它会一路走到 `rmSync(recursive)`，一个手滑的入参就是递归删任意目录。
+  写完**顺序不能换**：先 `registry.refresh()` 再广播新工具集 —— 装配读的是 `skills.list()`，
+  反过来算出来的还是旧名单（零技能时连 `skill` 工具都不在集合里，用户看到的是「技能页里有了，
+  可它说没有这个技能」）。MCP 那边**先写盘再连接**：写盘可能因为文件不是合法 JSON 而抛，
+  那时连接还没建；反过来则是「连接建好了、配置没写成」—— 一个谁也找不到的孤儿子进程，
+  重启就没了，用户还以为是保存成功了。连不上时**不回滚配置**（那是个看得见也删得掉的状态）。
+  保密一条：`env` / `headers` 的值可以含密钥，所以 **`ProjectInfo.mcp` 永远不把它们读回来**，
+  表单只让填不让看，提示用户写成 `${VAR}` 占位符。
+- **新增表单的「范围」默认全局，agent 的 `scope` 默认项目 —— 这个不一致是有意的**：
+  用户填表时眼睛就看着「范围」那一栏，改起来没有成本；agent 是在人不在场的时候动手，
+  一次误判就往 `~/.clauda/skills`（或全局 `mcpServers`）里塞东西，波及的是**每一个**项目。
+  要全局它会显式说。
 - **厂商档案是唯一真源，`provider` 段只剩传输旋钮**（`profiles` + `activeProvider`，
   见 `resolveProfiles`）。`cfg.provider` 是「当前生效那份」的解析视图，所以十来处
   `cfg.provider.model` 的读取点一个字都不用改。遗留字段（老文件里端点还住在 `provider` 段）
@@ -167,6 +196,74 @@
   历史：2026-10 之前端点与厂商是**项目级立刻生效**的（全项目共享一个 provider 实例，
   切厂商还会刷所有活会话的模型 + 重建系统提示词）。那让「切厂商」变成一个会打断正在跑的
   会话的动作，也让同一个设置页要同时讲两套作用范围，于是统一成了现在这一条。
+- **智能体是一整套装配配方，一个目录一份 `AGENT.md`**（`src/agents/`，
+  `types / registry / writer / apply`，形状逐条照 `src/skills/` 抄）：
+  `~/.clauda/agents/<name>/AGENT.md`（全局）或 `<cwd>/.clauda/agents/<name>/AGENT.md`
+  项目级（**离 cwd 越近越优先**，扫描顺序与技能同一套）。frontmatter 是标量配置
+  （名字 / 描述 / 档案 / 模型 / 温度 / 权限三件 / 工具 / 技能 / 常见问题），**正文就是系统
+  提示词那一段**。缺省的语义要分清：`undefined` = 没写这个键（沿用项目当前那份），
+  `[]` = 写了但为空；`temperature` 的「写了 0」必须和「没写」分开，所以类型是
+  `number | undefined` 而不是 `number`。
+  校验取向和技能一致 —— **能退回默认的就退回并继续，不能退的才丢**：名字不合规退回目录名
+  （目录名也不合规才整份丢掉）、温度非数字 / 越界只忽略这一项、`tools` / `skills` 里认不出
+  的名字**原样保留**（它可能指一个这个项目还没装的 MCP 服务器）。只有 `profile` 指向不存在
+  的档案时走「退回项目当前那份 + 在设置页标一句 `problem`」—— 静默换档案会让人对着一个
+  「明明配了 DeepSeek 却在跑 Kimi」的会话查半天。
+  **两条分隔符约定，别去「统一」**：`tools` / `skills` / `allow` / `deny` 这类**标识符列表
+  用逗号**，`questions` 这类**散文列表用 `|`** —— 问题里本来就会带逗号（「跑测试要装什么，
+  怎么装？」）。`|` 因此在 `questions` 里是**保留字符**，`writeAgent` 落盘时换成全角 `｜`；
+  换行会把单行 frontmatter 撑破，所以每个标量与每条问题都过 `flatten`。**IPC 传的是数组**
+  （`agent/add` 收 `string[]`），分隔符是**文件格式**的事、归 `writeAgent` 管 —— 渲染层和
+  主进程各写一套 split 迟早分叉。正文里**不许出现 `## 项目记忆` / `## 会话配置`**：
+  `repl.ts` 的 `/memory` 切的是**第一处**标题，正文里混进这两个词，提示词看着正常、
+  `/memory` 却打印一堆垃圾，所以 `writeAgent` 里直接拒收（段插在记忆段之前是必要但不充分）。
+- **会话把「自己是哪个智能体」冻成快照，恢复时绝不按名字重读磁盘**（`SessionRecord.agent`
+  存的是解析好的 `AgentSpec`，不是名字）。这和技能 / MCP 的「改了当场对项目里所有会话生效」
+  **故意相反**，理由与上面那条「改配置只对之后新建的会话生效」同源：**工具是会话手里拿的
+  东西，换了手里就得换；智能体是这段对话的身份，身份不该在对话中途被换掉**。按名字重查会让
+  「我把审查员调紧了一点」在**所有**老会话上一起生效，那正是用户选定「改一个智能体只影响
+  之后新开的会话」时要排除的。冻结还白捡两件事：删掉一个智能体之后**老会话照样原样打开**
+  （它自带配方，不依赖那个目录还在），恢复路径也少一次磁盘 IO。
+  同一处：`AgentSpec` 里**绝不能出现 `apiKey` / `baseUrl`** —— 会话文件是磁盘上的明文 JSON，
+  而 `config.json` 里的密钥可能正是 `${DEEPSEEK_KEY}` 这种占位符，抄一份进去等于把「密钥只
+  留在一处」当面拆掉。端点与密钥照旧在恢复时从**当时的** config 取。
+  快照要用一个 `readAgentSpec(v)` 把形状过一遍（缺 `name` 或 `prompt` 就当没有）——
+  它是磁盘上的 JSON、手改得坏，而 `isSessionRecord` 刻意不验它。
+  **CLI 没有会话级绑定**（也不做 `--agent` 开关）：它只读一次 `config.defaultAgent` 当名字
+  去解析，装配配方（`applyAgentToConfig` / `scopedSkills` / `assemble(spec)`）与桌面端同源。
+  不这么做的话，桌面端写进项目配置的「本项目默认」在命令行上完全无效，那个键就成了半截功能。
+- **「没绑过」和「没有快照」是两件事，恢复路径永远传 `agentSpec: rec.agent ?? null`**。
+  传 `null` 而不是省略是**必须的**：省略会落进「新会话」分支去套**当下的**项目默认，于是
+  一条从没绑过智能体的旧会话会在用户什么都没点的情况下悄悄变成默认智能体 —— 行为静默改变，
+  最难查的一类。`openSession` 的判据因此只有三条路：**`agentSpec` 只要出现过（哪怕值是
+  `null`）就按「恢复」处理，快照权威、绝不看 `config.defaultAgent`**；否则拿 `agent` 当名字
+  去注册表解析（`''` = 明确不要智能体）；否则就是没有智能体。**主进程没有「没给名字就用
+  `defaultAgent`」这条魔法** —— 那个回退太容易咬人，套默认只发生在界面那一格下拉框里。
+  名字给过却解析不出来（比如它刚被删掉）**不抛**：按「没有智能体」装配，另给一条
+  `SessionInfo.agentWarning` 让通知栏说一声（渲染层按会话 id 去重，`session/state` 是高频的，
+  每来一次快照弹一次会把通知栏刷满）。自动恢复的会话不该因为一个删掉的智能体就打不开。
+  `applyAgentToConfig` **必须夹在 `structuredClone(entry.project.config)` 与
+  `createProvider(config.provider)` 之间** —— provider 构造后不可变，晚一步的症状是
+  **提示词说用 A、请求打到 B，且不报错**。
+- **工具与技能的白名单必须按会话过滤，不能按项目**（`createToolAssembly` 的 `assemble(agent?)`
+  每次拿智能体现算，`refreshProjectTools` 把计算**挪进循环**、各算各的）。同一个项目下两个
+  会话可以绑**不同的**智能体，项目级共享一份的话，一个关了 `bash`、另一个还能跑。
+  `assemble` 一共四个调用点（建会话 / 广播 / `beginTurnMark` / CLI 的 `repl.ts`），漏一个
+  就是「有一个入口不过白名单」。判据复用 `permissions.ts` 的 `normalizeToolName` 加前缀匹配
+  （`norm === n || norm.startsWith(n + '__')`，两边都归一化），于是 `mcp__linear` 盖住
+  `mcp__linear__create_issue`、`mcp` 盖住所有 MCP 工具 —— 和权限那套 MCP 工具名的约定同源。
+  **白名单连 `extraTools`（`skill_write` / `skill_remove` / `mcp_add` / `mcp_remove`）和
+  `memory_*` 一起挡**。这是「写了 = 只要这些」的正确读法，但**反直觉、必须写进文档**：
+  一个 `tools: read_file, grep` 的智能体不光不能写文件，还不能写技能、写记忆、挂 MCP。
+  技能白名单靠一个**委托式的子集视图**实现（转发给项目那份真注册表再按名字过滤），于是
+  `skillsSection()` / `makeSkillTool()` 一行没改，真注册表 `refresh()` 之后视图自动跟上。
+- **故意没有 `agent_write`**（技能和 MCP 都有「对话里新增」，智能体没有）。它意味着模型能
+  给自己写一份 `permission: auto` 的智能体 —— 一个**自我提权**的口子，比 `mcp_add` 那次
+  「起个以你自己身份运行的子进程」更直接。要加也得先有一套独立的授权设计。
+- **`agent/add` 不触发 `refreshProjectTools`**：改一个智能体只影响之后新开的会话，已开会话
+  的工具集一个字不动。这和上面那两条（技能 / MCP 增删**当场**广播）是**相反**的，别看着
+  不对称就去补一次广播。设置页那个新增表单的「范围」默认**本项目**（技能 / MCP 的表单默认
+  全局），因为智能体文件是可以提交进 git 的、落在项目里才说得通。
 - **provider 的 client 在 `stream()` 开头跟 `cfg` 对一次**（`provider/openai.ts` 的
   `syncClient`）。`new OpenAI({ baseURL })` 是构造函数里建好的快照，不同步的话 `cfg` 改了而请求
   发往旧地址，**且不报任何错**（症状是「改了没反应」）。当前这条**永远不会触发** —— 端点冻结在
@@ -178,22 +275,51 @@
   目录穿越检查不让它 import 到 `dist/`，所以 `ProjectInfo` 只下发结论（`provider.vendorKey`）
   加整张表（`vendors`），renderer 按 key 查、不判。代价是那个 `'__custom__'` 字面量在
   `session-manager.ts` / `app.js` / `renderer-dom.mjs` 里各有一份，改名要三处一起改。
-- **左栏只有一栏**（`index.html` 的 `<aside class="sidebar">`）：品牌 → 主导航
-  `.rail` → 会话浏览区 `.browse`（项目路径 / 新会话 / 会话列表）。导航条早先是独立的一窄条
-  （76px），2026-10 合了进来 ——「看哪个视图」和「看哪个会话」本来就在同一列里点。四个视图
-  `sessions / model / skills / mcp` 由 `.app[data-view]` 驱动 grid 模板切换（会话视图三列，
-  设置视图两列 + 摘右栏）。
+- **左栏只有一栏**（`index.html` 的 `<aside class="sidebar">`）：品牌 → 导航条 `.rail` →
+  设置四项 `#settings-group` → 会话浏览区 `.browse`（项目路径 / 新会话 / 会话列表）→
+  底部的设置停靠区 `.settings-dock`。导航条早先是独立的一窄条（76px），2026-10 合了进来 ——
+  「看哪个视图」和「看哪个会话」本来就在同一列里点。
+  **五个视图共用同一张三列骨架**，`style.css` 里一条 `.app[data-view=…]` 覆盖规则都没有，
+  `data-view` 只作为「当前在哪一页」的 DOM 标记留着。所以新加一页不必回去补 CSS 名单
+  （那条规矩早没了，别再照着做），但 `state.js` 的 `VIEWS` 仍然要加 —— 它既是视图名又是
+  归约时要挡一道的白名单。
+  **智能体排在最前面**：它是唯一一项「描述整段对话」的配置，模型 / 技能 / 工具都只是它
+  参考的素材。
+  **左栏是两套内容，点底部那个「设置」换一次**（用户的原话：「点击设置 隐藏会话相关内容，
+  把设置的内容放在左侧列表上方」）：会话视图下是 `.rail`（只有「会话」一项）+ `.browse`；
+  四个设置页下换成 `#settings-group`，接的正是原来「会话」那一格的位置，`.rail` 和
+  `.browse` 一起让位（`renderRail()`）。
+  **「设置开着没有」不是独立状态，等于「`state.view` 是不是 `sessions`」**。曾经有过一个
+  单独的 `settingsOpen` 标志，它和视图各真各的，于是存在「分组收着、视图却在技能页」这种
+  组合 —— 那时左栏是空的，什么也点不了。别再引第二个标志回来。
+  「设置」按钮因此**会切视图**（进 `lastSettingsView`，默认智能体；再点回会话），不再是
+  纯粹的展开器。它也是回会话视图**唯一**的路 —— `.rail` 那时是 `hidden` 的。
+  `.browse` 里「＋ 新会话」上面那一格 `#new-session-agent` 是**会话级绑定的唯一入口**
+  （见上面那条「没绑过 vs 没有快照」）：它**总是带一个具体值**（没选就发空串），所以桌面端
+  永远不走「没传 `agent`」那条会去套项目默认的路。`#chat-agent` 显示的是**这一个会话**绑的
+  智能体，不是项目的默认值 —— 它因此只能挂在 `SessionInfo` 上（`project/info` 是按 cwd 取的，
+  一个字段都不来自具体会话），不能挂到 `.topbar` 上（那是 `space-between` 的两列 flex，
+  多一个孩子会把控件整排挤歪）。空态那几条可点问题同理只能取 `SessionInfo.agentQuestions`
+  （源自**这份会话冻结的** AgentSpec），回头按名字去 `ProjectInfo.agents` 现查会把刚冻下来的
+  东西又变回活的。
   「＋ 新会话」在 `.browse` 里、**不在品牌那一行**：它属于当前项目的会话列表（放这儿才看得出
   「在哪个项目里新建」），虚线边框是和实线会话行区分的——点开已有的 vs 造一个新的。因为它在
   `.browse` 内，设置视图下会跟着一起被摘掉，这与既有的「会话行也点不出结果」一致（`openNewSession`
   同样不切视图），是顺带修好而不是新引入的别扭。`class` 只能是 `.new-session` 不能加 `ghost`
   —— `button.ghost` 的边框色会盖掉虚线。
-  两条容易踩的：**设置视图下左栏不能整块摘掉**，否则进了设置页就没有回会话视图的路 ——
-  要摘的是 `.browse`（会话浏览区，见 `style.css` 里那组 `.app[data-view] … .browse` 规则）；
+  两条容易踩的：**底部 `.settings-dock` 里那个「设置」按钮任何时候都不能藏** —— 进了设置页
+  之后 `.rail` 和 `.browse` 都是 `hidden` 的，它是回会话视图唯一的路，藏了就真回不去了；
   **每个子元素要写死 `grid-column`**（`display:none` 摘掉子元素后剩下的会自动补位，`.chat`
   会掉进那个 0 宽的列里）。`state.js` 里 `VIEWS` 既是视图名又是 CSS 选择器，拼错了不报错、
   只会让布局静默塌掉，所以归约时要挡一道。徽标（会话数 / 当前模型 / 技能数 / MCP 已连接比）
   编码的是后台状态，别把它退化成纯装饰。
+- **`hidden` 属性在这些块上必须配一条显式的 `[hidden] { display: none }`**：`.rail` /
+  `.browse` / `.rail-group` 都是作者写的 `display: flex`，和浏览器自带的
+  `[hidden] { display: none }` 同为 (0,1,0)，而作者样式排在后面 —— 于是那个 `hidden` 完全
+  不起作用，DOM 里看着是真的、屏幕上照样画着。这一条**踩过两次**（先 `.rail-group`，再
+  `.rail` / `.browse`），两次都是靠开窗口看才发现，假 DOM 只能验属性、验不出样式。
+  代价是「点开设置左边挂着两套内容」。同 `.view[hidden]` 那条弯路 —— 症状一样：**假 DOM
+  全绿，真窗口不对**。
 - **会话浏览区 `.browse` 是 flex 列且 `flex: 1; min-height: 0`**：它自己不吃掉剩余高度的话，
   里面 `.session-list` 的 `flex: 1` 就没有确定高度可分配，列表不会滚动，只会把整列越撑越长。
 - **通知栏（`#notices`）必须待在侧栏之外**，在 `.app` 网格的第二行通栏（`grid-row: 2;
@@ -202,7 +328,12 @@
   接不上」这种**恰好发生在设置页上**的报错会死在引发它的那一页，一个字都看不到 —— 那正是
   把通道改成 `{ok:false, reason}` 要解决的问题，白修了。**放进 `.browse` 会重演这个 bug**：
   那正是设置视图下唯一被 `display:none` 的那块。别改成浮层：通知不自动消失也没有关闭按钮，
-  浮层会常驻盖住输入框（底部正是输入框），要盖住什么才能看见，得先想清楚。`tests/unit.mjs`
+  浮层会常驻盖住输入框（底部正是输入框），要盖住什么才能看见，得先想清楚。
+- **通知栏里只放「你刚做了什么、成没成」** —— 也就是渲染层自己那条 `notice()`。主进程
+  `onWarn` 那类后台诊断（MCP 连不上、上下文压缩失败）**只打控制台**，一条都不往窗口推：
+  它们带的是子进程的原始报错，一屏好几行技术细节，混进这条通栏就是刷屏，而用户要的
+  「日志」正是这个。这不算把失败藏起来 —— 连不上的那台在「工具」页上红着并带着错误原文，
+  徽标上的已连接数也跟着掉。`tests/unit.mjs`
   末尾有一条结构断言钉着「它不在 `<aside class="sidebar">` 里」（比实际需要更严一档，
   故意留着的余量）。
 - **`createProjectRuntime` 必须把 `loadConfig` 包在 `process.env` 快照里**。它内部的
@@ -231,9 +362,24 @@
 - **`app.js` 绑的 id 必须和 `index.html` 对得上**。改了一边忘了另一边的话，
   `getElementById` 返回 null，启动时第一个 `addEventListener` 就抛 TypeError，
   窗口一片空白 —— 看着像整个渲染层没生效。自检组里有交叉断言盯着。
-- **模型 / 技能 / MCP 三个设置页共用 `project/info` 这一份快照**（`session-manager.ts`
-  的 `projectInfo`），按**会话**取 —— 技能与 MCP 都挂在项目运行时上，而运行时是开会话
-  时才建出来的。切换会话要先把它清成 `null`，否则会拿上一个项目的配置顶上。
+- **左栏和页标题叫「工具」，页内正文写「MCP 服务器」**（`index.html` 的 `nav-mcp` 与
+  `SETTINGS_META.mcp`）。用户在那一页上装的是「能让 agent 干活的东西」，标题给的就是这个词；
+  正文里保留「MCP 服务器」是因为**一个服务器会带出很多个工具**，丢掉这个名字会让
+  「服务器连不上」和「工具没接上」变成同一句话。只有标签和标题这两处文本改了 ——
+  `id="nav-mcp"`、`VIEWS` 里的 `'mcp'`、IPC 通道名、CSS 选择器一律不动，别顺手「统一」。
+- **模型 / 技能 / 工具三个设置页共用 `project/info` 这一份快照**（`session-manager.ts`
+  的 `projectInfo`），按 **cwd** 取 —— 里面每一个字段（技能、MCP、上下文、厂商档案）都是
+  项目级的，没有一个来自某个会话，所以**一个会话都没开也得有**：技能与 MCP 挂在项目运行时
+  上，而配它们正是开第一个会话之前想做的事。这条通道因此**有副作用**，第一次调用会把运行时
+  建起来（`ensureProject`，幂等）。
+  **项目运行时的生死不跟会话走**：会话开关只加减 `refs`，界面选中的那个目录另外把它钉住
+  （`pinnedCwd`）—— 少了这枚钉子，「刚关掉最后一个会话」那个瞬间菜单徽标和三个设置页会一起
+  变空。销毁（`dropProject`）要同时满足「没会话用」和「没被选中」两个条件：`ensureProject`
+  换目录时会直接调过去，那时 `refs` 可能大于零。而 `disposeAll` 得**单独**收被钉住的那份 ——
+  它没有会话引用，`closeSession` 带不走它，漏了就是「关窗之后进程不消失」（MCP 子进程留着）。
+  前端那边 `state.project` 也**不再跟着会话清**（切同一项目的会话本来就没变化，清掉只会闪
+  一下空态）；点开另一个项目里的会话时，`cwd` 与项目信息要一起跟过去，否则设置页显示的
+  是上一个项目的样子。
   设置页在 `app.js` 里**按指纹增量重建**（同 `renderModal` 那套），没有这道判断的话
   流式输出期间每一帧都会重画整块，「默认模型」输入框当场失焦。**反过来也有坑**：MCP
   开关失败时服务器状态没变、指纹就不变，光重拉会判定「无变化」直接返回，开关停在用户
@@ -246,6 +392,14 @@
   右栏纹丝不动」。指纹里那份 `profiles` 摘要要带上 `baseUrl`：只比对 key 的话，改完
   地址界面不重画，看着像没保存。删档案走**两步内联确认**（`pendingRemove`，也进指纹），
   不复用 `renderModal` —— 那个宿主被授权请求用 `dataset.key` 占着。
+- **技能页和 MCP 页各有一个内联的新增表单**（`skillFormBlock` / `mcpFormBlock`），
+  同样不弹窗：`renderModal` 是授权专用的（无参无返回值，内容全由选中会话的 `pending`
+  推出来）。两条容易踩的：表单里**正在输入的值绝不能进指纹** —— 值存在模块级的
+  `skillForm` / `mcpForm` 里以便重画时回填，而任何一次 `replaceChildren` 都会把输入框连焦点
+  一起抖掉，那正是这套增量重绘存在的理由（测试用**节点同一性**钉死这条：无关的 dispatch 之后
+  `输入框还是同一个对象`）；两个删除各自用独立的 `pendingSkillRemove` / `pendingMcpRemove`，
+  不复用 `pendingRemove`（那是厂商档案的 key，撞名会让 A 页的确认框跑到 B 页）。
+  空态下表单也得在（提前 return 的话，「一条都没有」时唯一的出路就没了）。
 - **展示文案不要在这里另造**：MCP 开销提示走 `src/runtime/mcp-cost.ts` 的
   `infoText` / `warnText`（纯文本、不含 ANSI，CLI 与桌面端共用），技能空态抄
   `repl.ts` 里 `/skills` 那句。两处各写一套的话，改了阈值或口径没人会想起来去对齐另一边。
@@ -275,10 +429,14 @@ MCP 服务器退出码是 0，只有同一个 tick 里连着退出才会炸。
 ## 桌面端
 
 `npm run mock` 起假服务端，另开一个终端 `npm run desktop`。布局是三栏：左栏自上而下是
-品牌、主导航（模型 / 技能 / MCP / 会话，每项带实时徽标）、当前项目与会话列表（列表顶上
-一条虚线的「＋ 新会话」，下面按项目分组，状态点是空闲 / 运行中 / 等待授权）；中栏对话；
-右栏改动文件与待办。最底下还有一行通栏的通知栏，
-没通知时整行塌掉。灰阶是浅色暖调，赤陶 accent 沿用了原来暗色版的家族（白底上压深了一档）。
+品牌、导航条（会话视图下只有「会话」一项，带进行中会话数）、当前项目与会话列表
+（列表顶上依次是「用哪个智能体」的下拉框和一条虚线的「＋ 新会话」，下面按项目分组，
+状态点是空闲 / 运行中 / 等待授权），最底下钉着「设置」；点它之后左栏整个换成设置四项
+（智能体 / 模型 / 技能 / 工具，每项带实时徽标），会话那两块让位。中栏对话，顶栏标题右边
+一格 `#chat-agent` 写着这个会话绑的智能体，消息流与输入框之间是**新会话空态的可点问题**
+（点一条就当作发出去，不经过输入框）；右栏改动文件与待办。最底下还有一行通栏的通知栏，
+没通知时整行塌掉。配色是**中性白**（`#f8f9fb` 底 / `#ffffff` 浮起），赤陶 accent 沿用了
+更早暗色版的家族（白底上压深到 5.4:1）。
 斜杠命令不做成输入框 —— `/model` 和 `/mode` 是中栏顶栏的控件，`/compact` 自动触发。
 窗口**没有菜单栏**（`main.js` 里 `Menu.setApplicationMenu(null)`），文件 / 编辑 / 视图
 那几项一个都用不上，白占一条。**那一行必须带 `process.platform !== 'darwin'`** ——
@@ -296,7 +454,7 @@ desktop/                    薄壳，纯 JS，不在 tsconfig 的 rootDir 覆盖
   main.js                   建窗口 / 注册 IPC / webContents → EventSink
   preload.cjs               contextBridge 暴露 window.clauda（必须 CJS）
   renderer/
-    index.html  style.css   三列骨架（左栏含主导航 + 中栏 + 右栏 + 底部通知行），靠 data-view 切列数
+    index.html  style.css   三列骨架（左栏 + 中栏 + 右栏 + 底部通知行），五个视图共用，data-view 只作标记
     state.js                纯归约 reduce(state, action)，单测直接 import
     markdown.js             最小 markdown → HTML（先转义再套标签）
     app.js                  DOM 绑定 + 流式增量更新
@@ -305,8 +463,8 @@ src/runtime/                全部逻辑，不依赖 Electron，被 tsc 和测�
   mcp-cost.ts               MCP token 占比提示（纯文本，ANSI 颜色留给 CLI 包）
   ipc-view.ts               IpcView implements View
   permission-bridge.ts      授权 Promise 桥：requestId 防陈旧回复、denyAll 兜底
-  session-manager.ts        Map<sessionId, Session> + Map<cwd, Project>（引用计数）
-  project.ts                createProjectRuntime：按 cwd 建 config / provider / MCP
+  session-manager.ts        Map<sessionId, Session> + Map<cwd, Project>（引用计数 + 界面选中的钉住）
+  project.ts                createProjectRuntime：按 cwd 建 config / 技能 / 智能体 / MCP（provider 归会话）
   desktop-app.ts            channel 分发层（无 Electron），main.js 只是它的薄适配
   persist.ts                落盘，CLI 与桌面端共用
   attachment.ts             用户附件的归一化与校验（ingest 碰 fs / sanitize 纯函数）

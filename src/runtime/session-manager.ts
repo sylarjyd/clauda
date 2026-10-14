@@ -1,13 +1,22 @@
+import path from 'node:path'
 import { Agent, type AgentOptions, type SessionSnapshot, type TurnOutcome } from '../agent/agent.js'
+import { agentProfileProblem, applyAgentToConfig, scopedSkills, toSpec } from '../agents/apply.js'
+import type { AgentInfo, AgentMeta, AgentSpec, HasSkills, HasTools, ResolvedAgent } from '../agents/types.js'
+import { removeAgent as removeAgentDir, writeAgent, type WriteAgentInput } from '../agents/writer.js'
 import {
+  claudaHome,
   completeProfile,
   configPath,
   normalizeBaseUrl,
+  removeMcpServerAnywhere,
   removeProjectProfile,
   writeActiveProfile,
+  writeDefaultAgent,
+  writeMcpServer,
   writeProjectProfile,
   writeProjectProvider,
   type ClaudaConfig,
+  type McpServerConfig,
   type PermissionMode,
   type ProjectProviderPatch,
   type ProviderConfig,
@@ -18,7 +27,8 @@ import type { McpServerStatus } from '../mcp/manager.js'
 import { PermissionManager } from '../permissions.js'
 import { OpenAICompatibleProvider } from '../provider/openai.js'
 import type { Provider } from '../provider/types.js'
-import type { SkillMeta } from '../skills/types.js'
+import type { SkillMeta, SkillSource } from '../skills/types.js'
+import { removeSkill, writeSkill, type SkillScope } from '../skills/writer.js'
 import type { Tool } from '../tools/types.js'
 import type { UserAttachment } from '../types.js'
 import { IpcView, type ViewEvent } from './ipc-view.js'
@@ -43,8 +53,8 @@ export type SessionStatus = 'idle' | 'running'
 export type SendResult = { ok: true; outcome: TurnOutcome } | { ok: false; reason: string }
 
 /**
- * 一个项目的运行时。**按 cwd 缓存、按会话引用计数**，因为 `McpManager` 会起子进程，
- * 而且它的 `closeAll()` 不可逆（关掉就不能再开）。
+ * 一个项目的运行时。**按 cwd 缓存、按会话引用计数**（外加界面选的那个项目把它钉住），
+ * 因为 `McpManager` 会起子进程，而且它的 `closeAll()` 不可逆（关掉就不能再开）。
  */
 export interface SessionProject {
   readonly cwd: string
@@ -59,14 +69,47 @@ export interface SessionProject {
    * 刻意不写成 `AgentOptions['skills']` —— 那边只声明了 `{name, description}`，
    * 而桌面端的技能页要显示 `file` / `dir`。`SkillMeta[]` 协变地满足 `SkillSummary[]`，
    * 所以传给 `Agent` 依然合法。
+   *
+   * 另外两个方法是增删技能要用的（都在 `SkillRegistry` 上）：`refresh()` 让它原地重扫
+   * ——注册表原先是打开项目那一刻的一次性快照—— `get()` 用来按名字查到那个 `SKILL.md` 的
+   * 精确路径。不写死成 `SkillRegistry` 是为了让这个接口继续只依赖「能干什么」。
+   *
+   * `has()` / `read()` 进来是因为**按智能体白名单收窄出来的技能视图**也走这个接口
+   * （`scopedSkills` 收 `SkillSource`，返回的视图也要能塞回 `AgentOptions.skills`）——
+   * 提示词里的「可用技能」索引必须和工具集合看到的是同一份名单。
    */
-  readonly skills?: { list(): SkillMeta[] }
+  readonly skills?: SkillSource & { refresh(): void }
+  /**
+   * 智能体注册表。可选，和 `skills` 同一个理由：这个接口只承诺「项目里有哪些智能体」，
+   * 而没有智能体的调用方（测试里那些假的 project）不必为此造一个。
+   *
+   * `resolve()` 才是建会话要的那一份（带正文），`list()` 只给元数据 —— 桌面端的智能体页
+   * 要显示 `file` / `scope`，所以这里不收窄成 `AgentOptions['agent']`。
+   */
+  readonly agents?: {
+    list(): AgentMeta[]
+    get(name: string): AgentMeta | undefined
+    resolve(name: string): ResolvedAgent | null
+    refresh(): void
+  }
   readonly memoryIndex?: AgentOptions['memoryIndex']
-  /** 每次现算，跟着 MCP 开关走 */
-  assembleTools(): Tool[]
+  /**
+   * 每次现算，跟着 MCP 开关和智能体白名单走。
+   *
+   * **收智能体参数是「按会话过滤」的落点**：同项目两个会话可以绑不同智能体，
+   * 所以调用方（`openSession` / `refreshProjectTools` / `beginTurnMark`）必须逐个会话地传。
+   */
+  assembleTools(agent?: HasTools & HasSkills): Tool[]
   readonly mcp: {
     /** 可能抛：连接失败的服务器在这里报错，别把返回值丢掉（见 `setMcpEnabled`） */
     setEnabled(name: string, enabled: boolean): Promise<void>
+    /**
+     * 运行期加一个服务器并把配置交给调用方落盘（顺序在调用方那边，见 `addMcpServer`）。
+     * **可能抛**：连不上时抛，别吞 —— 吞掉的后果是「界面说加上了，工具一个没多」。
+     */
+    addServer(name: string, cfg: McpServerConfig): Promise<void>
+    /** 运行期摘掉一个服务器。名字不存在时抛 */
+    removeServer(name: string): Promise<void>
     status(): McpServerStatus[]
     tokenHint(): number
     /** 只要 MCP 那几个，`assembleTools()` 是全部工具。`mcpCostNotice` 要靠它数工具个数 */
@@ -151,6 +194,14 @@ export interface ProjectInfo {
   }
   permissions: { mode: PermissionMode; allow: string[]; deny: string[] }
   skills: SkillMeta[]
+  /**
+   * 智能体一览。**不带正文** —— `project/info` 被每轮刷新的徽标拖着走，正文该走 `agent/get`。
+   * 也**不带任何端点或密钥**：`AgentInfo` 只装 `AGENT.md` frontmatter 里写的东西 + 路径 +
+   * `isDefault`，`profile` 只出名字。
+   */
+  agents: AgentInfo[]
+  /** 本项目默认绑哪个智能体（决策 2 的「设置页里能标一个本项目默认」），'' = 没设 */
+  defaultAgent: string
   mcp: McpServerStatus[]
   /**
    * MCP 开销提示。**措辞由 `mcpCostNotice` 统一出**，桌面端只负责摆位置 ——
@@ -169,6 +220,22 @@ export interface Session {
   status: SessionStatus
   /** 当前轮次的取消手柄，`abort` / `closeSession` 都要用 */
   controller?: AbortController
+  /**
+   * 这条会话绑的智能体名，**空串表示没有**。
+   *
+   * 名字被 `agent`（`Agent` 实例）占了，所以这里只能叫 `agentName`。别想着把两者合一：
+   * `persist()` 正是靠 `session.agent.snapshot()` 拿消息的。
+   */
+  agentName: string
+  /**
+   * 建会话那一刻解析好的智能体，**冻结**。工具 / 技能白名单、权限覆盖、模型覆盖全按它算。
+   *
+   * 不按名字回头重读 `AGENT.md`：改了智能体只该影响之后新开的会话（和「模型 / 端点只对
+   * 新会话生效」同一条理由）。冻结还顺手买到「删掉智能体之后老会话照样原样打开」。
+   */
+  agentSpec?: AgentSpec
+  /** 给了名字却解析不出来时的那个名字，空串 = 没事。界面据此弹一条通知 */
+  agentMissing: string
 }
 
 /** 一轮跑下来记的账：哪些工具会作废提示词、这一轮里有没有真的跑过 */
@@ -195,6 +262,32 @@ interface ProjectEntry {
 }
 
 /**
+ * 决定这条会话绑哪个智能体。**只有三条路**，没有第四条：
+ * - (a) **恢复**：`agentSpec` 这个键出现过（哪怕给的是 `null`）它就是权威，
+ *   **绝不看 `config.defaultAgent`**
+ * - (b) **新会话且名字非空**：拿名字去注册表解析
+ * - (c) 其余（没给名字 / 名字为空串）：没有智能体
+ *
+ * (a) 那条判据必须是 `'agentSpec' in opts` 而不是「值非 null」：一条从没绑过智能体的旧会话
+ * 恢复时传的正是 `agentSpec: null`，把它当成「没给」的话，那条会话会在用户什么都没点的
+ * 情况下悄悄套上当下的项目默认 —— 行为静默改变，最难查的一类。
+ *
+ * 名字找不到时**不抛**：一个删掉的智能体不该让自动恢复的会话打不开。返回 `missing` 让界面
+ * 出一条通知，而不是把用户扔在一个打不开的会话前面。
+ */
+function pickAgent(
+  project: SessionProject,
+  opts: { agent?: string; agentSpec?: AgentSpec | null },
+): { spec: AgentSpec | null; missing: string } {
+  if ('agentSpec' in opts) return { spec: opts.agentSpec ?? null, missing: '' }
+  const name = opts.agent ?? ''
+  if (!name) return { spec: null, missing: '' }
+  const resolved = project.agents?.resolve(name)
+  if (!resolved) return { spec: null, missing: name }
+  return { spec: toSpec(resolved), missing: '' }
+}
+
+/**
  * 多会话并行的核心。
  *
  * 三件事在这里必须做对，否则症状都是「卡住」而不是报错：
@@ -210,6 +303,10 @@ interface ProjectEntry {
  * 由此得到一条贯穿设置页的规则：**改配置只对之后新建的会话生效**。「接口地址」「厂商」
  * 「默认模型」三个入口都是这个语义，项目配置在这里只当模板。
  *
+ * 项目运行时的生命周期**不跟会话走**：会话开关只加减引用计数，界面选中的那个项目另外
+ * 把它钉住（`ensureProject`）。技能与 MCP 挂在这份运行时上，所以「一个会话都没开」
+ * 也得能拿到它 —— 否则设置页在那一刻只能显示空态。
+ *
  * 多厂商把「改哪一份」和「用哪一份」分成了两件事：**选中**（界面上左栏点谁）只决定
  * 编辑哪一份档案，**当前使用**（`activeProvider`）才决定新会话跟谁说话。两者混成一件
  * 的话，「同时配置多个厂商」就不成立了 —— 配 B 之前得先把 B 变成正在用的。
@@ -221,6 +318,16 @@ export class SessionManager {
   private readonly bridge: PermissionBridge
   /** 见 `SessionManagerOptions.createProvider` */
   private readonly createProvider: (config: ProviderConfig) => Provider
+  /**
+   * 正在建的项目运行时。**`openProject` 是异步的**，并发两条 `project/info` 会双双
+   * 看到「还没有」而各建一份 —— 多出来的那份带着没人关的 MCP 子进程。
+   */
+  private readonly opening = new Map<string, Promise<ProjectEntry>>()
+  /**
+   * 界面当前选中的项目目录。它把这份运行时**钉住**：没有会话引用也不销毁。
+   * 见 `ensureProject` / `dropProject`。
+   */
+  private pinnedCwd: string | null = null
   private seq = 0
 
   constructor(private readonly opts: SessionManagerOptions) {
@@ -236,12 +343,20 @@ export class SessionManager {
     })
   }
 
-  async openSession(cwd: string, opts: { id?: string; snapshot?: SessionSnapshot } = {}): Promise<Session> {
+  async openSession(
+    cwd: string,
+    opts: { id?: string; snapshot?: SessionSnapshot; agent?: string; agentSpec?: AgentSpec | null } = {},
+  ): Promise<Session> {
     const entry = await this.acquireProject(cwd)
     const id = opts.id ?? `s${++this.seq}`
+    const { spec, missing } = pickAgent(entry.project, opts)
 
     // 克隆而不是共用：`/model`、`/mode` 都直接写 config，共用会让一个会话的切换串到所有会话
     const config = structuredClone(entry.project.config)
+    // **这一句必须夹在克隆与建 provider 之间。** provider 构造后不可变（见下），晚一步就会出现
+    // 「提示词说用 A、请求打到 B」—— 提示词是按新 config 生成的，两边各说各话，而且**不报错**。
+    // 改这里之前先读 `apply.ts` 的 `applyAgentToConfig` 注释：逐键各管各（写了就盖，没写就沿用）。
+    if (spec) applyAgentToConfig(config, spec)
     const permissions = new PermissionManager(config.permissions, this.bridge.askerFor(id))
     const view = new IpcView(id, this.sessionSink())
     const agent = new Agent({
@@ -253,12 +368,33 @@ export class SessionManager {
       provider: this.createProvider(config.provider),
       view,
       permissions,
-      tools: entry.project.assembleTools(),
-      skills: entry.project.skills,
+      tools: entry.project.assembleTools(spec ?? undefined),
+      // 该智能体的**技能视图**（不是项目那份注册表）：提示词里的「可用技能」索引和 `skill`
+      // 工具能载入的范围必须在同一个白名单里，否则会出现「索引里写着、却载不进来」。
+      skills: entry.project.skills
+        ? scopedSkills(entry.project.skills, spec ?? undefined)
+        : undefined,
       memoryIndex: entry.project.memoryIndex,
+      agent: spec ? { name: spec.name, prompt: spec.prompt } : undefined,
+      // 对话里新建技能 / MCP 服务器之后，工具集合要当场重算（`Tool.invalidatesTools`）。
+      // 这里一律连提示词一起重建：技能和 MCP 的四个工具声明的是同一个标志，回调里分不出
+      // 刚跑的到底是哪一个（`memory_write` 那种只动提示词的另有 `invalidatesPrompt`）。多
+      // 重建一次的代价是打断一次前缀缓存，漏掉一次的代价是提示词里的技能索引永远是旧的。
+      onToolsChanged: () => this.refreshProjectTools(cwd, true),
     })
 
-    const session: Session = { id, cwd, config, permissions, view, agent, status: 'idle' }
+    const session: Session = {
+      id,
+      cwd,
+      config,
+      permissions,
+      view,
+      agent,
+      status: 'idle',
+      agentName: spec?.name ?? '',
+      agentSpec: spec ?? undefined,
+      agentMissing: missing,
+    }
     if (opts.snapshot) agent.restore(opts.snapshot)
     this.sessions.set(id, session)
     return session
@@ -310,6 +446,8 @@ export class SessionManager {
       sessionId: session.id,
       model: session.config.provider.model,
       snapshot: session.agent.snapshot(),
+      // 冻结的那份配方随会话落盘，下次恢复原样用回来（不是按名字重查 —— 见 `Session.agentSpec`）
+      agent: session.agentSpec,
     })
   }
 
@@ -347,16 +485,42 @@ export class SessionManager {
     const entry = this.projects.get(cwd)
     if (!entry) return
     await entry.project.mcp.setEnabled(name, enabled)
+    // 提示词不用重建：开关换的只是发给后端的 tools 数组，「## 可用技能」那段没动
+    this.refreshProjectTools(cwd, false)
+  }
+
+  /**
+   * 工具集合变了：把新的一份发给**同项目**的每个会话。
+   *
+   * 按 cwd 广播而不是只发给调用方那个会话 —— 技能与 MCP 都挂在**项目**运行时上，同项目的
+   * 其它会话手里是同一批工具的旧快照。只重算当前会话的话，用户以为加好了，切到旁边那个
+   * 会话里却没有。
+   *
+   * `promptToo` 控制要不要连系统提示词一起重建。**并非所有工具集变化都影响提示词**：
+   * 「## 可用技能」只跟技能注册表有关，而 MCP 增删换的是 tools 数组 —— 那种时候重建一次
+   * 是白白打断那几路的提示词前缀缓存。所以这**不是一个可以随手省掉的优化**，是两个真的
+   * 不同的影响面，调用点必须各自说清自己是哪一种。
+   */
+  private refreshProjectTools(cwd: string, promptToo: boolean): void {
+    const entry = this.projects.get(cwd)
+    if (!entry) return
     for (const session of this.sessions.values()) {
-      if (session.cwd === cwd) session.agent.setTools(entry.project.assembleTools())
+      if (session.cwd !== cwd) continue
+      // **每个会话各算各的**：同项目两个会话可以绑不同的智能体，外面算一份发下来会让
+      // 「一个关了 bash、另一个还能跑」—— 白名单就形同虚设了。
+      session.agent.setTools(entry.project.assembleTools(session.agentSpec))
+      if (promptToo) session.agent.refreshSystemPrompt()
     }
   }
 
-  /** 设置页的快照。会话或项目已经没了就返回 null，由 channel 层翻成 `{ok:false}` */
-  projectInfo(sessionId: string): ProjectInfo | null {
-    const session = this.sessions.get(sessionId)
-    if (!session) return null
-    const entry = this.projects.get(session.cwd)
+  /**
+   * 设置页的快照。**按 cwd 取，不按会话** —— 里面每一项都是项目级的（技能、MCP、
+   * 上下文、厂商档案），没有一个字段来自某个会话。
+   *
+   * 项目还没建运行时（或已经销毁）就返回 null，由 channel 层翻成 `{ok:false}`。
+   */
+  projectInfo(cwd: string): ProjectInfo | null {
+    const entry = this.projects.get(cwd)
     if (!entry) return null
 
     const { project } = entry
@@ -390,6 +554,17 @@ export class SessionManager {
         deny: [...cfg.permissions.deny],
       },
       skills: project.skills?.list() ?? [],
+      // 元数据只有一份（`list()` 的产物，**不重读文件、不带正文**）。要正文走 `agent/get`。
+      // 用展开而不是逐个字段抄：`AgentMeta` 全是可序列化的标量与数组、没有密钥，
+      // 而逐个抄会在有人给 `AgentMeta` 加字段时**静默漏掉**（`ProjectInfo` 却看不出来）
+      agents: (project.agents?.list() ?? []).map((a) => ({
+        ...a,
+        isDefault: a.name === cfg.defaultAgent,
+        // 「档案找不到，用的是项目当前那份」这类降级提示要在界面上标出来，
+        // 只写进日志等于让用户自己发现自己配错了
+        problem: agentProfileProblem(a, cfg.profiles),
+      })),
+      defaultAgent: cfg.defaultAgent,
       mcp: project.mcp.status(),
       mcpCost: mcpCostNotice(project.mcp, cfg.contextWindow),
     }
@@ -487,6 +662,147 @@ export class SessionManager {
     return file
   }
 
+  // ------------------------------------------------- 技能与 MCP 的增删（设置页 + 对话）
+
+  /**
+   * 新建一个技能：写盘 → 重扫注册表 → 广播新工具集。
+   *
+   * **顺序不能换。** 广播那一步重算的是 `assemble()`，它读 `skills.list()` —— 先广播再重扫
+   * 的话，算出来的还是旧名单：零技能时连 `skill` 工具都不在集合里，用户看到的正是
+   * 「技能页里有了，可它说没有这个技能」。
+   *
+   * 参数不合法（名字不合规）由 `writeSkill` 抛，这里不吞 —— 通道那层会翻成人话。
+   */
+  addSkill(cwd: string, input: { scope: SkillScope; name: string; description: string; body: string }): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，加不了技能')
+    const result = writeSkill({ ...input, cwd })
+    entry.project.skills?.refresh()
+    // 技能会让「## 可用技能」和工具集合**同时**变，所以是 true
+    this.refreshProjectTools(cwd, true)
+    return result.file
+  }
+
+  /**
+   * 删掉一个技能。入参是**名字**，路径从注册表里查 —— 界面和对话两边都只拿到名字，
+   * 让它们各自拼路径迟早会拼出一个不存在的目录。
+   */
+  removeSkill(cwd: string, name: string): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，删不了技能')
+    const meta = entry.project.skills?.get(name)
+    if (!meta) throw new Error(`没有名为 "${name}" 的技能`)
+    // 真正的护栏（目标必须在某个 skills 根下、里面真有 SKILL.md）在 writer.ts 里
+    const dir = removeSkill(meta.file)
+    entry.project.skills?.refresh()
+    this.refreshProjectTools(cwd, true)
+    return dir
+  }
+
+  /**
+   * 建 / 改一个智能体。同名**整份覆盖**，所以它同时是「新建」和「保存」—— 界面只发这一个动词。
+   *
+   * **刻意不调 `refreshProjectTools`**，和上面两个技能方法正好相反：改一个智能体只影响
+   * **之后新开的**会话（已在的会话手里是冻结的那份配方，见 `Session.agentSpec`）。广播过去的话，
+   * 「我把审查员调紧了一点」会当场改掉一段正在进行的对话的身份 —— 那正是决策 2 要排除的。
+   * 技能与 MCP 不是这个道理：它们是会话手里拿的工具，工具换了手里就得换。
+   */
+  addAgent(cwd: string, input: Omit<WriteAgentInput, 'cwd'>): { file: string; created: boolean } {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，加不了智能体')
+    const result = writeAgent({ ...input, cwd })
+    // 注册表是打开项目那一刻扫的一次性快照，不重扫的话「刚建的智能体当场开不了会话」
+    entry.project.agents?.refresh()
+    return result
+  }
+
+  /**
+   * 读一份智能体的**全部字段带正文** —— 设置页的编辑表单要正文。
+   *
+   * `project/info` 里那份**刻意不带正文**（它被每轮刷新的徽标拖着走），所以另开一条通道。
+   * 名字不存在就**抛**：静默返回个半份会让用户对着一个空表单以为「它本来就是空的」。
+   */
+  getAgent(cwd: string, name: string): ResolvedAgent {
+    const entry = this.projects.get(cwd)
+    const resolved = entry?.project.agents?.resolve(name)
+    if (!resolved) throw new Error(`没有名为 "${name}" 的智能体`)
+    return resolved
+  }
+
+  /**
+   * 删一个智能体（连目录）。入参是**名字**，路径从注册表里查 —— 界面只拿到名字，
+   * 让它自己拼路径迟早会拼出一个不存在的目录（同 `removeSkill`）。
+   *
+   * 真正的护栏（目标必须在某个 `agents` 根下、目录里真有 `AGENT.md`）在 `writer.ts` 里。
+   */
+  removeAgent(cwd: string, name: string): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，删不了智能体')
+    const meta = entry.project.agents?.get(name)
+    if (!meta) throw new Error(`没有名为 "${name}" 的智能体`)
+    const dir = removeAgentDir(meta.file)
+    entry.project.agents?.refresh()
+    return dir
+  }
+
+  /**
+   * 标「本项目默认」。只写 `config.json` 的一个键，并**同步内存里的模板** —— 不同步就是
+   * 「改了没生效」（同 `setProfileField` 那条）。
+   *
+   * 不校验这个名字存不存在：默认可以指向一个还没建的智能体（界面上选的时候自然拿不到）。
+   * 空串 = 取消默认。**只影响之后新开的会话** —— 旧会话的绑定是冻结的。
+   */
+  setDefaultAgent(cwd: string, name: string): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，改不了默认智能体')
+    const file = writeDefaultAgent(cwd, name)
+    entry.project.config.defaultAgent = name
+    return file
+  }
+
+  /**
+   * 加一个 MCP 服务器：**先落盘、再连接**。
+   *
+   * 顺序和 `mcp_add` 那个工具里同一条理由：写盘可能因为配置文件不是合法 JSON 而抛，
+   * 那时连接还没建，什么都不会留下。反过来则是「连接建好了、配置没写成」—— 一个
+   * 谁也找不到的孤儿进程，重启就没了，用户还以为是保存成功了。
+   *
+   * 连不上时会**抛**（`addServer` 的契约），但配置已经写下去了：那是用户能看见也能在
+   * MCP 页里删掉的状态，比静默回退强。
+   */
+  async addMcpServer(
+    cwd: string,
+    scope: 'global' | 'project',
+    name: string,
+    cfg: McpServerConfig,
+  ): Promise<string> {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，加不了 MCP 服务器')
+    const file =
+      scope === 'global'
+        ? writeMcpServer(path.join(claudaHome(), 'config.json'), name, cfg)
+        : writeMcpServer(configPath(cwd), name, cfg)
+    await entry.project.mcp.addServer(name, cfg)
+    // MCP 换的是 tools 数组，「## 可用技能」那段没动 —— 不重建提示词，省一次前缀缓存
+    this.refreshProjectTools(cwd, false)
+    return file
+  }
+
+  /**
+   * 删掉一个 MCP 服务器：先摘运行期、再按优先级从配置里删。
+   *
+   * 运行期那份是**合并之后**的，所以「有没有这个名字」问它才对；配置那边找哪个文件由
+   * `removeMcpServerAnywhere` 按项目优先的顺序决定 —— 合并之后看不出某一条来自哪份文件。
+   */
+  async removeMcpServer(cwd: string, name: string): Promise<string> {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，删不了 MCP 服务器')
+    await entry.project.mcp.removeServer(name)
+    const file = removeMcpServerAnywhere(cwd, name)
+    this.refreshProjectTools(cwd, false)
+    return file
+  }
+
   /**
    * 往哪个档案上写：界面给的那个（左栏选中的）> 当前使用的那份。
    *
@@ -559,6 +875,12 @@ export class SessionManager {
 
   async disposeAll(): Promise<void> {
     for (const id of [...this.sessions.keys()]) await this.closeSession(id)
+    // 被 `ensureProject` 钉住的那份没有会话引用，`closeSession` 带不走它。退出时一样要
+    // 收干净 —— MCP 子进程留着的话事件循环不会结束，表现是关窗之后进程不消失
+    this.pinnedCwd = null
+    const remaining = [...this.projects.values()]
+    this.projects.clear()
+    for (const entry of remaining) await entry.project.dispose()
   }
 
   private setStatus(session: Session, status: SessionStatus): void {
@@ -586,7 +908,7 @@ export class SessionManager {
   /** 每轮开始时现算一次：MCP 开关会改变工具集，缓存下来会漏掉新接入的工具 */
   private beginTurnMark(session: Session): void {
     const entry = this.projects.get(session.cwd)
-    const tools = entry ? entry.project.assembleTools() : []
+    const tools = entry ? entry.project.assembleTools(session.agentSpec) : []
     const invalidating = new Set(tools.filter((t) => t.invalidatesPrompt).map((t) => t.name))
     this.marks.set(session.id, { invalidating, dirty: false })
   }
@@ -599,16 +921,53 @@ export class SessionManager {
     }
   }
 
-  private async acquireProject(cwd: string): Promise<ProjectEntry> {
-    const existing = this.projects.get(cwd)
-    if (existing) {
-      existing.refs++
-      return existing
+  /**
+   * 按项目目录拿运行时，没有就建，并把它**钉住**。
+   *
+   * 为什么要钉：技能与 MCP 挂在项目运行时上（MCP 子进程的宿主就是它），而运行时原本
+   * 只在开会话时才建、最后一个会话关掉就销毁。于是「还没开会话」和「刚关掉会话」这两个
+   * 状态下，模型 / 技能 / MCP 三页只剩一句「还没有打开的会话」—— 可配技能和 MCP 恰恰是
+   * 开第一个会话**之前**想做的事。
+   *
+   * 钉的是**最后一次调用的那个目录**：换项目时上一份要是已经没人用（refs 归零）就顺手
+   * 销毁，不然每换一次目录都会留一份带着 MCP 子进程的运行时。
+   */
+  async ensureProject(cwd: string): Promise<SessionProject> {
+    const previous = this.pinnedCwd
+    if (previous && previous !== cwd) {
+      this.pinnedCwd = null
+      await this.dropProject(previous)
     }
-    const project = await this.opts.openProject(cwd)
-    const entry: ProjectEntry = { project, refs: 1 }
-    this.projects.set(cwd, entry)
+    this.pinnedCwd = cwd
+    const entry = await this.getOrCreateProject(cwd)
+    return entry.project
+  }
+
+  private async acquireProject(cwd: string): Promise<ProjectEntry> {
+    const entry = await this.getOrCreateProject(cwd)
+    entry.refs++
     return entry
+  }
+
+  /**
+   * 建（或复用）一份运行时，**不记引用计数** —— 「有没有会话在用」和「运行时在不在」
+   * 从这一步起是两件事，前者由 `refs` 记，后者由 `ensureProject` 的钉子兜底。
+   */
+  private getOrCreateProject(cwd: string): Promise<ProjectEntry> {
+    const existing = this.projects.get(cwd)
+    if (existing) return Promise.resolve(existing)
+    const inflight = this.opening.get(cwd)
+    if (inflight) return inflight
+
+    const pending = Promise.resolve(this.opts.openProject(cwd))
+      .then((project) => {
+        const entry: ProjectEntry = { project, refs: 0 }
+        this.projects.set(cwd, entry)
+        return entry
+      })
+      .finally(() => this.opening.delete(cwd))
+    this.opening.set(cwd, pending)
+    return pending
   }
 
   private async releaseProject(cwd: string): Promise<void> {
@@ -616,6 +975,20 @@ export class SessionManager {
     if (!entry) return
     entry.refs--
     if (entry.refs > 0) return
+    await this.dropProject(cwd)
+  }
+
+  /**
+   * 没人用、也没被选中，就真正销毁。
+   *
+   * **两个条件都不能少**：被 `ensureProject` 钉着的那份不能销毁（否则「关掉最后一个
+   * 会话」那个瞬间菜单徽标和三个设置页一起变空，而那正是想改配置的时候）；还有会话在
+   * 跑的更不能 —— `ensureProject` 换项目时会直接调到这里，那时 `refs` 可能大于零。
+   */
+  private async dropProject(cwd: string): Promise<void> {
+    if (cwd === this.pinnedCwd) return
+    const entry = this.projects.get(cwd)
+    if (!entry || entry.refs > 0) return
     this.projects.delete(cwd)
     await entry.project.dispose()
   }

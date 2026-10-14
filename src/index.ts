@@ -5,6 +5,8 @@ import { Agent } from './agent/agent.js'
 import { latestSessionId, listSessions, loadSession, newSessionId } from './agent/session.js'
 import { listMemories } from './agent/memory-store.js'
 import { memoryInitPrompt } from './agent/system-prompt.js'
+import { applyAgentToConfig, scopedSkills, toSpec } from './agents/apply.js'
+import { AgentRegistry } from './agents/registry.js'
 import { loadConfig, type PermissionMode, type CliOverrides } from './config.js'
 import { McpManager } from './mcp/manager.js'
 import { PermissionManager, type Asker } from './permissions.js'
@@ -13,6 +15,9 @@ import { mcpCostNotice } from './runtime/mcp-cost.js'
 import { persistSession } from './runtime/persist.js'
 import { createToolAssembly } from './runtime/tools-assembly.js'
 import { SkillRegistry } from './skills/registry.js'
+import { makeMcpAddTool, makeMcpRemoveTool } from './tools/mcp.js'
+import { makeSkillRemoveTool, makeSkillWriteTool } from './tools/skill.js'
+import type { Tool } from './tools/types.js'
 import { PlainView } from './ui/plain-view.js'
 import { Repl } from './ui/repl.js'
 import { TerminalView } from './ui/terminal-view.js'
@@ -109,6 +114,26 @@ async function main(): Promise<void> {
   const prompt = opts.print ?? positional
   const headless = prompt !== undefined || opts.init === true
 
+  /**
+   * CLI 的智能体：**只有「本项目默认」这一条路**（没有 `--agent` 开关）。
+   *
+   * 桌面端写进 `config.json` 的 `defaultAgent` 如果在命令行上完全无效，那个键就是个半截功能。
+   * `resolve()` 找不到名字时**不报错**：一个被删掉的智能体不该让命令行起不来 —— 按「没有智能体」
+   * 装配，只在交互模式下说一声。
+   *
+   * **CLI 没有会话级绑定**：它不读 `SessionRecord.agent`，`--resume` 恢复出来的对话也不会自带
+   * 当初那份配方（桌面端才有）。这一点写进了 `CLAUDA.md`。
+   */
+  const cliAgents = AgentRegistry.discover(cwd)
+  const cliResolved = config.defaultAgent ? cliAgents.resolve(config.defaultAgent) : null
+  const cliSpec = cliResolved ? toSpec(cliResolved) : undefined
+  // 名字写进配置却找不到实现：**不 fail**（一个被删掉的智能体不该让命令行起不来），
+  // 交互模式下说一声。这一刻 `view` 还没建，所以先记下来、建完再报
+  const missingDefaultAgent = config.defaultAgent && !cliResolved ? config.defaultAgent : ''
+  // **必须夹在 `loadConfig` 与建 provider 之间**：provider 构造后不可变（同桌面端那条），
+  // 晚一步就成了「提示词说用 A、请求打到 B」而且不报错
+  if (cliSpec) applyAgentToConfig(config, cliSpec)
+
   const provider = new OpenAICompatibleProvider(config.provider)
 
   // 权限回调依赖 Repl，而 Repl 又依赖 Agent —— 用一层间接引用打破循环
@@ -120,6 +145,12 @@ async function main(): Promise<void> {
   const view = headless
     ? new PlainView({ silentAssistant: opts.outputFormat === 'json' })
     : new TerminalView()
+  if (missingDefaultAgent && !headless) {
+    view.warn(
+      `配置里指定的默认智能体「${missingDefaultAgent}」不在了，本次按默认配置运行` +
+        `（用 clauda 的桌面端或在 ${path.join(cwd, '.clauda', 'agents')} 里建一个同名智能体）`,
+    )
+  }
 
   const skills = SkillRegistry.discover(cwd)
 
@@ -127,8 +158,15 @@ async function main(): Promise<void> {
   await mcp.start()
   activeMcp = mcp
 
-  // 配方放在 runtime 里是因为桌面端要用同一份 —— 各写各的迟早会漂
-  const { assemble } = createToolAssembly(skills, mcp)
+  // 配方放在 runtime 里是因为桌面端要用同一份 —— 各写各的迟早会漂。
+  // 第三个参数是「对话里增删技能 / MCP 服务器」的四个工具，桌面端在 `project.ts` 里同样装
+  const extraTools: Tool[] = [
+    makeSkillWriteTool(skills, { cwd }),
+    makeSkillRemoveTool(skills),
+    makeMcpAddTool(mcp, { cwd }),
+    makeMcpRemoveTool(mcp, { cwd }),
+  ]
+  const { assemble } = createToolAssembly(skills, mcp, extraTools)
 
   const mcpCost = mcpCostNotice(mcp, config.contextWindow)
   if (mcpCost.infoText) view.info(style.dim(mcpCost.infoText))
@@ -140,10 +178,17 @@ async function main(): Promise<void> {
     provider,
     view,
     permissions,
-    tools: assemble(),
-    skills,
+    // 白名单按 `cliSpec` 过一遍（没有智能体时 `assemble(undefined)` 就是全量）
+    tools: assemble(cliSpec),
+    // 该智能体的技能视图：提示词里的「可用技能」索引和 `skill` 工具能载入的范围必须同源。
+    // 交给 `scopedSkills` 而不是在这儿手裁 —— 桌面端用的是同一个函数
+    skills: scopedSkills(skills, cliSpec),
     // 传函数而不是快照：memory_write 在会话中途新增的记忆，当轮就要出现在索引里
     memoryIndex: () => listMemories(),
+    agent: cliSpec ? { name: cliSpec.name, prompt: cliSpec.prompt } : undefined,
+    // 对话里加完技能 / MCP 服务器之后当场重算工具集。这里引用了下面那个 `agent` 自己 ——
+    // 回调只在工具真的跑完之后才被调用，那时它早就赋好值了（同上面 `asker` 那层间接引用）
+    onToolsChanged: () => agent.setTools(assemble(cliSpec)),
   })
 
   // 可变：`/new` 要换一个全新的 id，`/resume` 要接管被恢复会话的 id。
@@ -204,7 +249,10 @@ async function main(): Promise<void> {
     cwd,
     skills,
     mcp,
-    assembleTools: assemble,
+    // 包一层是因为 `Repl` 只认 `() => Tool[]`，而智能体是**进程级**定下来的（CLI 没有
+    // 会话级绑定）。`(spec) => Tool[]` 本来就能赋给 `() => Tool[]`，包一层只是为了让
+    // 「CLI 用哪份智能体」在这里一眼看得见
+    assembleTools: () => assemble(cliSpec),
     onNewSession: () => {
       sessionId = newSessionId()
     },

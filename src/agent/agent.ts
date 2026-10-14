@@ -25,12 +25,29 @@ export interface AgentOptions {
   view: View
   permissions: PermissionManager
   tools?: Tool[]
+  /**
+   * 本会话绑的智能体，只取「名字 + 一段正文」—— 模型 / 温度 / 权限 / 白名单早在建会话时
+   * 就折进 `config` 和 `tools` 了，这里只剩系统提示词里那段人格。
+   *
+   * 冻结语义（改智能体只影响之后新开的会话）正是靠**构造后不再变**来保证的：`refreshSystemPrompt()`
+   * 读的是同一份 `opts`，所以模式切换、恢复会话、`invalidatesPrompt` 三条路重建出来的提示词
+   * 都还是建会话那一刻那一份。
+   */
+  agent?: { name: string; prompt: string }
   skills?: { list(): SkillSummary[] }
   /**
    * 记忆库索引。传的是**函数**而不是快照：`memory_write` 可以在会话中途新增记忆，
    * 那一刻之后系统提示词里的索引必须跟着变，否则当轮写的记忆要等下次会话才可见。
    */
   memoryIndex?: () => { entries: MemorySummary[]; total: number }
+  /**
+   * 工具集合可能变了，请重新装配一遍。
+   *
+   * 由声明了 `invalidatesTools` 的工具触发（对话里新建/删除技能与 MCP 服务器）。
+   * 和 `memoryIndex` 是函数同一个道理：那一刻的真相只有外面那个持有项目运行时的人知道 ——
+   * Agent 自己手里只有一个**已经过期**的工具数组，重算得从技能注册表、MCP 管理器重新拼。
+   */
+  onToolsChanged?: () => void
 }
 
 export interface TurnOutcome {
@@ -134,6 +151,7 @@ export class Agent {
       mode: this.opts.permissions.mode,
       skills: this.opts.skills,
       memoryIndex: this.opts.memoryIndex?.(),
+      agent: this.opts.agent,
     })
   }
 
@@ -339,6 +357,13 @@ export class Agent {
       // 代价是这一轮改了 messages[0]，会打断后端的提示词前缀缓存 —— 但只在真的写了
       // 记忆时发生一次，换来的是一条记忆当轮就可见，值得。
       if (tool.invalidatesPrompt) this.refreshSystemPrompt()
+      // 改了工具集合的工具（新建/删除技能与 MCP 服务器）跑完要重新装配。**顺序在
+      // refreshSystemPrompt 之后不重要，但必须在 `run` 返回之后**：装配读的是技能注册表
+      // 和 MCP 管理器的当前状态，得等写盘那一步真的落了地。
+      //
+      // 这里不直接 `this.setTools(...)`：Agent 只拿得到一份过期的工具数组，重算要回到
+      // 持有项目运行时的那一层，所以是回调。回调内部会把新集合塞回来（见 SessionManager）。
+      if (tool.invalidatesTools) this.opts.onToolsChanged?.()
       return this.capResult(out || '（工具执行完成，无输出）')
     } catch (err) {
       const elapsed = Date.now() - started

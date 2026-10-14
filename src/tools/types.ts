@@ -34,6 +34,28 @@ export interface Tool<A = any> {
    * `toolSpecs()` 也不会拷它，不影响 token 预算。
    */
   invalidatesPrompt?: boolean
+  /**
+   * 这个工具运行后会改变**工具集合本身**，跑完要让新一轮请求带上新工具集。
+   *
+   * 目前是「对话里新建/删除技能与 MCP 服务器」那四个工具在用。没有它的话，`skill_write`
+   * 跑完，同一轮里紧接着的下一次工具调用仍然看不到 `skill` —— 用户看到的是
+   * 「它说建好了，可是一让它用就说没有这个技能」，得新开一个会话才恢复。
+   *
+   * 和 `invalidatesPrompt` 分两个声明位是因为它们**确实是两件事**：写记忆只换提示词里的
+   * 索引，工具集合一个都没变；写技能两样都变。合并成一个的话，写记忆也得白跑一趟
+   * 全套工具重算。
+   */
+  invalidatesTools?: boolean
+  /**
+   * 授权弹窗上的风险说明。不填就按 `permission` 走通用文案（见 `permissions.ts` 的
+   * `describeRisk`）。
+   *
+   * 需要它的理由是 `describeRisk` 只对 `bash` 有专门一条，其余 `exec` 类工具返回空串 ——
+   * `mcp_add` 这种「替你起一个子进程跑一条命令」的工具会弹出一个只有标题的框，用户看不出
+   * 自己在批准什么。做成工具自己的声明而不是在 `describeRisk` 里认工具名，理由同
+   * `invalidatesPrompt`：让那层不必认识具体工具。
+   */
+  risk?(args: A): string
   /** 用于 UI 显示的一行摘要，如 `Read(src/index.ts)` */
   summary(args: A): string
   run(args: A, ctx: ToolContext): Promise<string>
