@@ -169,6 +169,28 @@ export class DesktopApp {
           return { ok: true, dir: this.manager.removeSkill(cwd, str(payload, 'name')) }
         }
 
+        /**
+         * 技能页那个开关。
+         *
+         * 参数叫 `disabled` 而不是 `enabled`：界面那侧是个「关掉这个技能」的开关，直接传
+         * 目标状态，「开」= 没勾。传 `enabled` 的话这里要写一次取反，而取反写错是那种
+         * 「开关方向和显示相反」的 bug —— 真出现时没人会想到去看 IPC 这一行。
+         *
+         * `scope` **和 `skill/add` 的默认值相反**（那边默认 project）：这里默认 global。
+         * 技能本来就是全局装的多（`~/.clauda/skills` 那一批），而它省下来的 token 是
+         * **每个项目**都省的 —— 默认写项目等于让人一个一个项目关过去。
+         */
+        case 'skill/set-disabled': {
+          const cwd = str(payload, 'cwd')
+          if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
+          await this.manager.ensureProject(cwd)
+          const scope = str(payload, 'scope') === 'project' ? 'project' : 'global'
+          return {
+            ok: true,
+            files: this.manager.setSkillDisabled(cwd, str(payload, 'name'), bool(payload, 'disabled'), scope),
+          }
+        }
+
         case 'mcp/add': {
           const cwd = str(payload, 'cwd')
           if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
@@ -190,6 +212,48 @@ export class DesktopApp {
           if (!cwd) return { ok: false, reason: '缺少参数 cwd' }
           await this.manager.ensureProject(cwd)
           return { ok: true, file: await this.manager.removeMcpServer(cwd, str(payload, 'name')) }
+        }
+
+        /**
+         * 一台服务器的工具明细。**没有塞进 `project/info`**：那一份每轮徽标刷新都要重算，
+         * 而 88 条工具的说明加起来比整份 `ProjectInfo` 还大。谁展开那一行谁付这笔钱。
+         */
+        case 'mcp/tools/get': {
+          const cwd = str(payload, 'cwd')
+          const name = str(payload, 'name')
+          if (!cwd || !name) return { ok: false, reason: '缺少参数 cwd / name' }
+          await this.manager.ensureProject(cwd)
+          return { ok: true, tools: this.manager.mcpToolCatalog(cwd, name) }
+        }
+
+        /**
+         * 改一台服务器的工具白名单。
+         *
+         * `tools` 收的是**三态**，别拿 `strList()` 那一套来收：`null` 是「不要白名单了」
+         * （全接），数组是「就要这几个」—— 空数组是其中的一档，意思是「一个都不接」。
+         * 把 `null` 和 `[]` 合并成 `undefined` 的话，「一个都不接」这个诉求就永远表达不出来，
+         * 而它恰好是唯一能把一台服务器接上却不让它占一行 schema 的写法。
+         *
+         * 类型不对**拒掉**而不是猜：往任何一侧猜都是替用户改了他没说的东西。
+         */
+        case 'mcp/tools/set': {
+          const cwd = str(payload, 'cwd')
+          const name = str(payload, 'name')
+          if (!cwd || !name) return { ok: false, reason: '缺少参数 cwd / name' }
+          const raw = field(payload, 'tools')
+          if (raw !== null && !Array.isArray(raw)) {
+            return { ok: false, reason: 'tools 得是字符串数组或 null' }
+          }
+          await this.manager.ensureProject(cwd)
+          const tools =
+            raw === null
+              ? undefined
+              : raw.filter((x): x is string => typeof x === 'string' && x.length > 0)
+          const file = this.manager.setMcpTools(cwd, name, tools)
+          // 名字在运行期有、两份配置里都没有，只可能是「运行期临时加的服务器」。报错而不是
+          // 假装成功：界面要是显示改好了，用户重启一次就会发现白改
+          if (!file) return { ok: false, reason: `没找到「${name}」写在哪个配置文件里，白名单没改` }
+          return { ok: true, file, tools: this.manager.mcpToolCatalog(cwd, name) }
         }
 
         /**

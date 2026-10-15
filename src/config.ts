@@ -118,6 +118,16 @@ export interface ClaudaConfig {
   defaultAgent: string
   permissions: PermissionsConfig
   pricing: PricingConfig
+  /**
+   * 本次不用的技能名（`SkillRegistry` 的 `name`，也就是 `/` 后面那串）。
+   *
+   * 技能的正文是**按需载入**的，每轮请求只付「名字 + 一句话说明」的钱；但它有 103 个时
+   * 这份索引本身就值 5k token。开关只是让这一条**不出现在索引里**，`SKILL.md` 一个字不动
+   * —— 所以它和「删除」是两回事，删了要重新找回来就得有原件。
+   *
+   * 全局与项目的这两份取**并集**（见 `merge()`），不是在哪儿禁用就在哪儿生效。
+   */
+  disabledSkills: string[]
   /** MCP 服务器，key 是服务器名 */
   mcpServers?: Record<string, McpServerConfig>
   /** 模型上下文窗口，用于决定何时压缩 */
@@ -167,6 +177,7 @@ function defaultConfig(): ClaudaConfig {
       deny: [],
     },
     pricing: { input: 0, output: 0, currency: 'USD' },
+    disabledSkills: [],
     contextWindow: 128_000,
     autoCompact: true,
     compactThreshold: 0.75,
@@ -214,6 +225,12 @@ function merge(base: ClaudaConfig, patch: RawConfig): ClaudaConfig {
     defaultAgent: patch.defaultAgent ?? base.defaultAgent,
     permissions: { ...base.permissions, ...(patch.permissions ?? {}) },
     pricing: { ...base.pricing, ...(patch.pricing ?? {}) },
+    // **并集**，不是 `??` 覆盖：禁用是「限制」，限制只该越合越紧。覆盖语义下同一个技能
+    // 在全局禁过、又被项目那份的整张列表顶掉，结果取决于哪一份后读 —— 没人说得清。
+    // 代价是**启用必须两份都清**，否则另一份还说着「禁用」，开关弹不回去（见 setSkillDisabled）
+    disabledSkills: [
+      ...new Set([...(base.disabledSkills ?? []), ...(patch.disabledSkills ?? [])]),
+    ],
     // 必须显式列出：`...patch` 是浅合并，项目配置里只要出现 mcpServers 这一整个键，
     // 全局配的那些服务器就会被整个顶掉。这里按**服务器名**合并，同名时项目级的整体
     // 替换全局的（不做字段级深合并）—— 想改全局某个服务器的单个字段，得把它整个重写。
@@ -621,6 +638,113 @@ export function removeMcpServerAnywhere(cwd: string, name: string): string {
   if (removeMcpServer(projectFile, name)) return projectFile
   const globalFile = path.join(claudaHome(), 'config.json')
   return removeMcpServer(globalFile, name) ? globalFile : ''
+}
+
+/**
+ * 改一个服务器的工具白名单，返回**这个文件里有没有那一台**。
+ *
+ * 返回值是「有没有」而不是「写没写」：没写的两种情况是「这台不在这个文件里」（该去下一份
+ * 找）和「本来就长这样」（找对了，不必再找）—— 把后者报成 `false` 会让调用方接着去全局
+ * 那份找，那里可能正好有个同名的**另一台**服务器，于是改错了对象。
+ *
+ * 单独一个函数而不是复用 `writeMcpServer`：那个是**整条替换**，只传 `{ tools }` 进去会把
+ * `command` / `args` / `env` 一起抹掉 —— 那些是用户手写的，抹掉等于把他配的服务器删了。
+ * 这里只碰 `tools` 一个键。底线同 `writeMcpServer`：读磁盘原文、绝不拿 `loadConfig()` 的
+ * 结果回写（那里面 `${MY_TOKEN}` 已经变成真密钥了）。
+ *
+ * `tools` 给 `undefined` 是**删掉这个键**（= 不设白名单，该服务器的工具全接）。注意这不等于
+ * 给空数组：`[]` 在 `allowed()` 里是「一个都不许」，那是个能表达的意思，别替用户合并掉。
+ */
+export function setMcpServerTools(file: string, name: string, tools: string[] | undefined): boolean {
+  const raw = readJsonObjectForWrite(file)
+  const servers = asObject(raw.mcpServers)
+  const entry = servers[name]
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+
+  const server = { ...(entry as Record<string, unknown>) }
+  const current = Array.isArray(server.tools) ? (server.tools as unknown[]) : undefined
+  if (!sameTools(current, tools)) {
+    if (tools === undefined) delete server.tools
+    else server.tools = tools
+    servers[name] = server
+    raw.mcpServers = servers
+    writeJson(file, raw)
+  }
+  return true
+}
+
+/**
+ * 白名单改到**真正定义着那一台**的那份配置里：先看项目那份，项目里没有才落到全局那份。
+ *
+ * 和 `removeMcpServerAnywhere` 同一条理由：`mcpServers` 在 `merge()` 里按名字合并，合并之后
+ * 看不出某一条来自哪个文件 —— 往项目文件里写一个其实定义在全局的服务器，结果是
+ * 「改了，重启又变回去了」。返回真正写着它的那个文件；两处都没有则返回 `''`。
+ */
+export function setMcpServerToolsAnywhere(
+  cwd: string,
+  name: string,
+  tools: string[] | undefined,
+): string {
+  const projectFile = configPath(cwd)
+  if (setMcpServerTools(projectFile, name, tools)) return projectFile
+  const globalFile = path.join(claudaHome(), 'config.json')
+  return setMcpServerTools(globalFile, name, tools) ? globalFile : ''
+}
+
+/** 磁盘上那个值（可能压根没有）和要给的值是不是一回事。空数组和「没设」不是一回事 */
+function sameTools(current: unknown[] | undefined, next: string[] | undefined): boolean {
+  if (current === undefined || next === undefined) return current === next
+  return current.length === next.length && current.every((v, i) => v === next[i])
+}
+
+/**
+ * 打开 / 关掉一个技能（技能页每行那个开关）。返回**真正改到的文件**，一个都没改就是空数组。
+ *
+ * 两处不对称，都是被 `merge()` 里那条并集逼出来的：
+ *
+ * - **关掉只写 `scope` 指的那一份**：用户的动作是「在这个范围里别用它」，写出去的就是这个意思。
+ * - **打开要把两份都清掉**。并集语义下「这个名字来自哪一份」在合并之后**看不出来**，只清一份
+ *   的话另一份还在说着「禁用」，于是开关弹回去又自己弹回来 —— 同 `removeMcpServerAnywhere`
+ *   那条「合并之后看不出某一条来自哪个文件」的教训。
+ *
+ * 已经是目标状态时**一个字节都不写**（返回空数组）：开关重画时不该顺手碰用户的文件。
+ *
+ * `scope` 只在「关掉」时有意义 —— 「打开」本来就是「两份都别再说它被禁用」，没有范围可挑。
+ */
+export function writeSkillDisabled(
+  files: { global: string; project: string },
+  scope: 'global' | 'project',
+  name: string,
+  disabled: boolean,
+): string[] {
+  const targets = disabled ? [files[scope]] : [files.global, files.project]
+  const changed: string[] = []
+  for (const file of targets) {
+    if (toggleDisabledSkill(file, name, disabled)) changed.push(file)
+  }
+  return changed
+}
+
+/**
+ * 只动 `disabledSkills` 这一个键，读的是**磁盘原文**（解析不了就抛，不覆盖）——
+ * 同 `writeMcpServer` 那套底线：绝不拿 `loadConfig()` 的结果回写，那里面 `$VAR` 已经
+ * 被换成真密钥了。
+ *
+ * 列表空了就把这个键**删掉**而不是留一个 `[]`：配置文件是给人看的，一个空数组只会
+ * 让人以为「这里配过什么」。
+ */
+function toggleDisabledSkill(file: string, name: string, disabled: boolean): boolean {
+  const raw = readJsonObjectForWrite(file)
+  const current = Array.isArray(raw.disabledSkills)
+    ? raw.disabledSkills.filter((x): x is string => typeof x === 'string')
+    : []
+  if (current.includes(name) === disabled) return false
+
+  const next = disabled ? [...current, name] : current.filter((n) => n !== name)
+  if (next.length > 0) raw.disabledSkills = next
+  else delete raw.disabledSkills
+  writeJson(file, raw)
+  return true
 }
 
 /**

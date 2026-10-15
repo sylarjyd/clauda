@@ -152,7 +152,7 @@ async function main(): Promise<void> {
     )
   }
 
-  const skills = SkillRegistry.discover(cwd)
+  const skills = SkillRegistry.discover(cwd, config.disabledSkills)
 
   const mcp = new McpManager(config.mcpServers ?? {}, { version: VERSION, view })
   await mcp.start()

@@ -156,8 +156,12 @@ export async function bootRenderer() {
   const savedRemovals = []
   const savedSkillAdds = []
   const savedSkillRemovals = []
+  /** `skill/set-disabled` 的每一份 payload。断言「开关有没有把 disabled 反过来发」只能看它 */
+  const savedSkillDisables = []
   const savedMcpAdds = []
   const savedMcpRemovals = []
+  /** `mcp/tools/set` 的每一份 payload。断言「全勾上发的是 null 还是名单」只能看它 */
+  const savedMcpToolSets = []
   const savedAgentAdds = []
   const savedAgentRemovals = []
   const savedAgentDefaults = []
@@ -280,20 +284,41 @@ export async function bootRenderer() {
     vendors: VENDORS,
     context: { window: 128000, autoCompact: true, compactThreshold: 0.8, maxSteps: 40 },
     permissions: { mode: 'default', allow: ['Read'], deny: ['Bash(rm:*)'] },
+    // 一条开着的、一条关掉的：开关和「已关掉」那块折叠区各要一个能验证的目标
     skills: [
       {
         name: 'demo',
         description: '演示技能',
         dir: 'C:/p/.clauda/skills/demo',
         file: 'C:/p/.clauda/skills/demo/SKILL.md',
+        disabled: false,
+      },
+      {
+        name: 'heavy',
+        description: '很占地方的那个技能',
+        dir: 'C:/p/.clauda/skills/heavy',
+        file: 'C:/p/.clauda/skills/heavy/SKILL.md',
+        disabled: true,
       },
     ],
     mcp: [
-      { name: 'demo', transport: 'stdio', state: 'connected', toolCount: 2 },
+      // 3 个工具里挑过 2 个：带分母的那一版文案（`工具 2/3`）和「挑选工具」那个三角
+      // 都得有个能验证的目标。没挑过的那台在 `broken` 上（它压根没连上）
+      {
+        name: 'demo',
+        transport: 'stdio',
+        state: 'connected',
+        toolCount: 2,
+        toolTotal: 3,
+        toolLabel: '工具 2/3',
+      },
       // 刻意配错、连不上的那台。用例靠它验「开关失败必须报出来」
-      { name: 'broken', transport: 'http', state: 'disabled', toolCount: 0 },
+      { name: 'broken', transport: 'http', state: 'disabled', toolCount: 0, toolTotal: 0, toolLabel: '工具 0' },
     ],
     mcpCost: { tokens: 900, servers: 1, tools: 2, infoText: '已接入 MCP：1 个服务器 / 2 个工具', warnText: '' },
+    // 技能成本汇总，**每次 `project/info` 现算**（见 `recountSkills`）。早先在这儿抄过
+    // 一份字面量，于是「关掉一个之后页脚的数字变了没有」永远测不出 —— 抄来的数字不会变
+    skillCost: null,
     // 智能体。**只到这六个字段为止**（见 `agentBrief`）；正文要正文走 `agent/get`
     agents: [
       agentBrief(agentStore['code-review'], true),
@@ -302,6 +327,67 @@ export async function bootRenderer() {
     // 本项目默认。有它，`#new-session-agent` 那一格才有个可验证的初始选中项
     defaultAgent: 'code-review',
   }
+
+  /**
+   * 每台服务器**上报过的全部工具**，`mcp/tools/get` 的返回。`allowed` 由白名单算出来，
+   * 真后端那边是 `allowed()` 现判的。
+   *
+   * `search` 那一条的 `localName` 和 `name` **故意不一样**：消毒去重之后本地名字会变，
+   * 界面上得把它印出来，否则用户在授权弹窗里看到的名字对不上号。
+   */
+  const mcpToolStore = {
+    demo: [
+      { name: 'create_issue', localName: 'create_issue', description: '新建一个 issue', tokens: 320, allowed: true },
+      { name: 'search', localName: 'mcp__demo__search', description: '搜索已有条目', tokens: 180, allowed: true },
+      { name: 'delete_all', localName: 'delete_all', description: '删光所有条目', tokens: 90, allowed: false },
+    ],
+    broken: [],
+  }
+
+  /** 按 `skills` 现算成本汇总 —— 真后端也是每轮从注册表重算一遍。
+   *
+   * 桩要**算**而不是**存**，是因为开关和增删都会动到它：存下来的数字不跟着变，而「关掉一个
+   * 之后页脚少了多少 token」恰好是这一页主要想告诉人的事。
+   *
+   * 数字不照着 `mcpCost` 那套量级（一台上千）走：技能索引一行才几 token，真按 40/120 编
+   * 得离谱反而会掩盖「这一页在讲省了多少」的判断。
+   */
+  function recountSkills() {
+    const on = projectInfo.skills.filter((s) => !s.disabled)
+    const off = projectInfo.skills.filter((s) => s.disabled)
+    projectInfo.skillCost = {
+      tokens: on.length * 40,
+      saved: off.length * 120,
+      on: on.length,
+      off: off.length,
+      infoText:
+        off.length > 0
+          ? `技能索引：${projectInfo.skills.length} 个里开着 ${on.length} 个，约 +${on.length * 40} token 上下文；关掉的 ${off.length} 个若全开着再多约 +${off.length * 120}`
+          : `${on.length} 个技能全部开着，约 +${on.length * 40} token 上下文（每轮请求都要付一遍）`,
+      warnText: '',
+    }
+  }
+  recountSkills()
+
+  /**
+   * 按工具清单现算 `toolCount` / `toolTotal` / `toolLabel` 三个数 —— 真后端也是从白名单
+   * 现算的（`allowed()`），而不是把「接进来几个」单独存一份。
+   *
+   * 三兄弟必须一起走：`toolLabel` 是主进程出的那句 `工具 2/3`，桩里要是不跟着改，
+   * 「勾掉一个之后那一行的话变了没有」就永远测不出来。
+   */
+  function syncMcpToolCount(name) {
+    const server = projectInfo.mcp.find((s) => s.name === name)
+    const tools = mcpToolStore[name]
+    if (!server || !tools) return
+    server.toolTotal = tools.length
+    server.toolCount = tools.filter((t) => t.allowed).length
+    server.toolLabel =
+      server.toolTotal > server.toolCount
+        ? `工具 ${server.toolCount}/${server.toolTotal}`
+        : `工具 ${server.toolCount}`
+  }
+  for (const name of Object.keys(mcpToolStore)) syncMcpToolCount(name)
 
   globalThis.document = {
     getElementById: (id) => byId.get(id) ?? null,
@@ -367,7 +453,11 @@ export async function bootRenderer() {
             rejected: picker.rejected ?? [],
           }
         }
-        if (channel === 'project/info') return { ok: true, info: projectInfo }
+        // 每份快照都现算一遍成本汇总：渲染层只在这儿拿项目信息，放这一处就够
+        if (channel === 'project/info') {
+          recountSkills()
+          return { ok: true, info: projectInfo }
+        }
         if (channel === 'project/set-default-model' || channel === 'project/set-base-url') {
           if (channel === 'project/set-default-model') savedModels.push(payload)
           else savedBaseUrls.push(payload)
@@ -508,6 +598,8 @@ export async function bootRenderer() {
             description: payload.description,
             dir: `${root}/${payload.name}`,
             file,
+            // 新建的必然是开着的 —— 真后端那边新技能也不在 `disabledSkills` 里
+            disabled: false,
           })
           return { ok: true, file }
         }
@@ -517,6 +609,15 @@ export async function bootRenderer() {
           if (at < 0) return { ok: false, reason: `没有这个技能：${payload.name}` }
           const [gone] = projectInfo.skills.splice(at, 1)
           return { ok: true, dir: gone.dir }
+        }
+        if (channel === 'skill/set-disabled') {
+          savedSkillDisables.push(payload)
+          const target = projectInfo.skills.find((s) => s.name === payload.name)
+          if (!target) return { ok: false, reason: `没有这个技能：${payload.name}` }
+          // 汇总不在这一支重算 —— 渲染层改完必再要一次 `project/info`，那儿统一算
+          target.disabled = payload.disabled === true
+          const file = payload.scope === 'project' ? projectInfo.configFile : 'C:/home/.clauda/config.json'
+          return { ok: true, files: [file] }
         }
         if (channel === 'mcp/add') {
           savedMcpAdds.push(payload)
@@ -531,7 +632,15 @@ export async function bootRenderer() {
             transport: payload.config.type ?? (payload.config.url ? 'http' : 'stdio'),
             state: 'connected',
             toolCount: 2,
+            toolTotal: 2,
+            toolLabel: '工具 2',
           })
+          // 刚接上的服务器也有一份清单：没有它，展开那一行只会说「这台报了 0 个工具」
+          mcpToolStore[payload.name] = [
+            { name: 'ping', localName: 'ping', description: '探活', tokens: 100, allowed: true },
+            { name: 'stats', localName: 'stats', description: '看统计', tokens: 120, allowed: true },
+          ]
+          syncMcpToolCount(payload.name)
           return { ok: true, file }
         }
         if (channel === 'mcp/remove') {
@@ -539,7 +648,25 @@ export async function bootRenderer() {
           const at = projectInfo.mcp.findIndex((s) => s.name === payload.name)
           if (at < 0) return { ok: false, reason: `没有名为 "${payload.name}" 的 MCP 服务器` }
           projectInfo.mcp.splice(at, 1)
+          delete mcpToolStore[payload.name]
           return { ok: true, file: projectInfo.configFile }
+        }
+        if (channel === 'mcp/tools/get') {
+          const tools = mcpToolStore[payload.name]
+          // 真后端没连上就是空数组（`perServer` 里没有它），不是报错
+          if (!tools) return { ok: true, tools: [] }
+          return { ok: true, tools: tools.map((t) => ({ ...t })) }
+        }
+        if (channel === 'mcp/tools/set') {
+          savedMcpToolSets.push(payload)
+          const tools = mcpToolStore[payload.name]
+          if (!tools) return { ok: false, reason: `没找到「${payload.name}」写在哪个配置文件里，白名单没改` }
+          // `tools: null` = 不要白名单（全接）；数组 = 就要这几个（**空数组是「一个都不接」**，
+          // 不是「没给」—— 这一条正是这个通道收三态而不是收数组的全部理由）
+          const wanted = payload.tools === null ? null : new Set(payload.tools)
+          for (const t of tools) t.allowed = wanted === null || wanted.has(t.name)
+          syncMcpToolCount(payload.name)
+          return { ok: true, file: projectInfo.configFile, tools: tools.map((t) => ({ ...t })) }
         }
         return { ok: true }
       },
@@ -583,8 +710,10 @@ export async function bootRenderer() {
     savedRemovals,
     savedSkillAdds,
     savedSkillRemovals,
+    savedSkillDisables,
     savedMcpAdds,
     savedMcpRemovals,
+    savedMcpToolSets,
     savedAgentAdds,
     savedAgentRemovals,
     savedAgentDefaults,

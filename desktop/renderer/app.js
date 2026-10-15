@@ -305,8 +305,10 @@ function renderRail() {
     els.navSkills,
     els.badgeSkills,
     'skills',
-    project ? String(project.skills.length) : '',
-    '当前项目发现的技能',
+    // **开着的个数**，不是磁盘上有几个。徽标是「现在有多少在起作用」，而关掉的那些
+    // 偏偏是这一页最不关心的东西 —— 全开着时两个数本来就相等，没有行为变化
+    project ? String(project.skillCost?.on ?? project.skills.length) : '',
+    '当前项目启用中的技能（点进技能页看被关掉的那些）',
   )
   paintNav(els.navMcp, els.badgeMcp, 'mcp', mcpBadge(project), '已连接 / 已配置的 MCP 服务器')
 
@@ -392,6 +394,31 @@ const mcpForm = {
 let pendingSkillRemove = null
 let pendingMcpRemove = null
 
+/**
+ * 技能页那一列开关**写到哪个范围**（`global` = `~/.clauda/config.json`，`project` = 本项目）。
+ *
+ * 做成一个页面级的选择而不是每行一个下拉：一行里再塞第二个控件，一屏一百行会糊成一片，
+ * 而「我现在在调的是全局还是本项目」本来就是一次性决定的事。
+ *
+ * 默认 **global**，和 `skill/add` 表单的默认（那里是 global）一致，也和这个开关的用途一致
+ * —— 技能大多是全局装的，省下的 token 是每个项目都省的。
+ *
+ * 它**要进 `settingsKey` 指纹**：换了范围却重画不出来，用户会以为没点上。
+ */
+let skillToggleScope = 'global'
+
+/**
+ * 展开的那一行 MCP 工具明细：`{ name, tools, error }`，`tools` 为 `null` 表示还在取。
+ *
+ * **按需取**是这块的全部要点：`project/info` 里只有个数（`toolCount`/`toolTotal`），而明细
+ * 是每条工具的名字 + 说明 + token，八九十条加起来比整份 `ProjectInfo` 还大。那一份是每轮
+ * 徽标刷新都要重算的，塞不得。
+ *
+ * 同时只留一份（而不是每行一份）：「一次展开一行」本来就是交互约定，只留一份就不存在
+ * 「两份对不上」这回事，指纹里也只要盯住一个名字。
+ */
+let mcpToolPanel = null
+
 /** 换项目、或者项目运行时还没就绪时，把两个表单和两处待删一起归位 */
 function resetSettingsForms() {
   skillForm.open = false
@@ -412,6 +439,12 @@ function resetSettingsForms() {
   pendingSkillRemove = null
   pendingMcpRemove = null
   pendingAgentRemove = null
+  // 展开的那份明细属于**上一个项目的那台服务器**，留着会拿 A 项目的工具清单去改 B 项目
+  mcpToolPanel = null
+  // 这个选择指向**具体的一份配置文件**，换项目之后留着「本项目」会让人以为开关还落在
+  // 原来那个项目上。其它几个表单字段没跟着归位是因为它们连着输入框、清掉更烦人，
+  // 而这一项没有输入框，重画就是回到安静的默认值
+  skillToggleScope = 'global'
 }
 
 function renderSettings() {
@@ -453,8 +486,13 @@ function renderSettings() {
       .join(','),
     mcpFingerprint(project),
     // 技能列表原先**不在指纹里**：加完一个技能不会重画，列表看起来纹丝不动。
-    // 只并名字和路径 —— 描述和正文改了也该重画，但那两样只有从磁盘重读时才变
-    (project.skills ?? []).map((s) => `${s.name}:${s.file}`).join(','),
+    // 只并名字和路径 —— 描述和正文改了也该重画，但那两样只有从磁盘重读时才变。
+    // `disabled` 必须并进来：点了开关不重画的话，那个勾看着像没点上
+    (project.skills ?? []).map((s) => `${s.name}:${s.file}:${s.disabled}`).join(','),
+    // 换范围不重画的话，用户看不出开关要写到哪儿去了
+    skillToggleScope,
+    // 关掉几个之后那行汇总的数要跟着变（它现在是页脚的主角）
+    `${project.skillCost?.on ?? 0}/${project.skillCost?.off ?? 0}`,
     // 智能体那份同理，外加 `isDefault`（点「设为默认」必须当场看见）和 `problem`
     // （档案删了之后那句降级提示得浮出来）
     (project.agents ?? []).map((a) => `${a.name}:${a.isDefault}:${a.problem}`).join(','),
@@ -480,9 +518,20 @@ function renderSettings() {
   else els.settingsBody.replaceChildren(...mcpBlocks(project))
 }
 
-/** 只要服务器的状态变了就得重画（开关、连接失败、工具数变化） */
+/**
+ * 只要服务器的状态变了就得重画（开关、连接失败、工具数变化）。
+ *
+ * `toolTotal` 也要并：改了白名单之后 `toolCount` 和它都会变，只并前者的那版指纹在
+ * 「总数变了但接进来的一样多」时不会重画。展开态那行同样要并 —— 不并的话点「挑选工具」
+ * 那个三角不动，看着像没点上。
+ */
 function mcpFingerprint(project) {
-  return (project.mcp ?? []).map((s) => `${s.name}:${s.state}:${s.toolCount}`).join(',')
+  const servers = (project.mcp ?? []).map((s) => `${s.name}:${s.state}:${s.toolCount}/${s.toolTotal}`)
+  // 明细条数并进来：取回来那一刻要重画一次，否则展开的那块永远停在「正在取…」上
+  const panel = mcpToolPanel
+    ? `${mcpToolPanel.name}:${mcpToolPanel.tools === null ? '…' : mcpToolPanel.tools.length}:${mcpToolPanel.error}`
+    : ''
+  return `${servers.join(',')}|${panel}`
 }
 
 // ------------------------------------------------------------ 模型配置页
@@ -1352,15 +1401,78 @@ function skillsBlock(project) {
       ),
     )
   } else {
+    const off = skills.filter((s) => s.disabled)
+
+    blocks.push(skillScopeRow())
     const list = document.createElement('div')
     list.className = 'set-rows'
-    for (const skill of skills) list.append(skillRow(skill))
+    // 开着的排前面：这一页的主业是「把用不上的关掉」，关过的那一堆不该一直顶在最上面
+    for (const skill of skills.filter((s) => !s.disabled)) list.append(skillRow(skill))
     blocks.push(list)
+    // 关掉的一整块折叠着 —— 它只会越来越长，而平时没人要看它
+    if (off.length > 0) blocks.push(offBlock(off))
   }
 
   // 空态时也要有新增入口 —— 一个技能都没有的时候，恰恰是最想加一个的时候
   blocks.push(skillFormBlock(project))
+
+  // 两句措辞由 `skillCostNotice` 统一出（src/runtime/skill-cost.ts），桌面端只负责摆位置
+  if (project.skillCost?.infoText) blocks.push(footNote(project.skillCost.infoText, false))
+  if (project.skillCost?.warnText) blocks.push(footNote(project.skillCost.warnText, true))
   return blocks
+}
+
+/**
+ * 「开关写到哪一份配置」那一行，外加一句「这一页在调什么」。
+ *
+ * 放在列表**上面**：它管着下面每一行的开关，摆到列表底下就变成「先做后问」。
+ */
+function skillScopeRow() {
+  const box = document.createElement('div')
+  box.className = 'skill-scope'
+
+  const label = document.createElement('span')
+  label.className = 'skill-scope-label'
+  label.textContent = '开关写到'
+
+  const select = formSelect(
+    '开关写到哪一份配置',
+    [
+      ['global', '全局（~/.clauda/config.json，所有项目都生效）'],
+      ['project', '本项目（<项目>/.clauda/config.json）'],
+    ],
+    skillToggleScope,
+  )
+  select.dataset.role = 'skill-scope'
+  select.addEventListener('change', () => {
+    skillToggleScope = select.value
+    render()
+  })
+
+  const hint = document.createElement('span')
+  hint.className = 'skill-scope-hint'
+  hint.textContent = '关掉的技能不进系统提示词，文件一个字节都不动'
+
+  box.append(label, select, hint)
+  return box
+}
+
+/** 「已关掉」那一组。整块折叠着，平时不占视线 —— 它只会越来越长 */
+function offBlock(skills) {
+  const box = document.createElement('details')
+  box.className = 'skill-off'
+
+  const summary = document.createElement('summary')
+  summary.className = 'skill-off-summary'
+  summary.textContent = `已关掉 ${skills.length} 个`
+  summary.title = '关掉的只是不进提示词，SKILL.md 还在磁盘上，随时能再打开'
+  box.append(summary)
+
+  const list = document.createElement('div')
+  list.className = 'set-rows'
+  for (const skill of skills) list.append(skillRow(skill))
+  box.append(list)
+  return box
 }
 
 /**
@@ -1388,11 +1500,57 @@ function skillRow(skill) {
   file.textContent = skill.file
 
   text.append(name, desc, file)
-  row.append(text)
+  // 开关在文字**前面**：和 MCP 那页的排法一致（那边也是开关打头），两页扫下来是同一个手势
+  row.dataset.disabled = String(skill.disabled)
+  row.append(skillSwitch(skill), text)
   row.append(
     pendingSkillRemove === skill.name ? skillRemoveConfirm(skill) : skillRemoveButton(skill),
   )
   return row
+}
+
+/**
+ * 这一行那个开关。**勾上 = 这个技能开着**，取消 = 关掉它（不进系统提示词，文件留着）。
+ *
+ * 不做二次确认：关掉随时可以再打开，而「关掉九十来个」本来就是这一页的常见动作，
+ * 每个都弹一次确认会变成两百次点击。真正不可逆的是旁边那个「删除」，那边才有确认。
+ *
+ * `invoke` 失败时把指纹作废再重拉，理由同 `toggleMcp`：失败时快照没变、指纹也不变，
+ * 不作废的话界面会停在用户刚拨过去的那一侧，看起来像成功了。
+ */
+function skillSwitch(skill) {
+  const toggle = document.createElement('input')
+  toggle.type = 'checkbox'
+  toggle.className = 'switch'
+  toggle.checked = !skill.disabled
+  toggle.dataset.role = 'skill-switch'
+  toggle.setAttribute('aria-label', `使用技能 ${skill.name}`)
+  toggle.addEventListener('change', () => void setSkillDisabled(skill, !toggle.checked))
+  return toggle
+}
+
+async function setSkillDisabled(skill, disabled) {
+  if (!cwd) return
+  const res = await invoke('skill/set-disabled', {
+    cwd,
+    name: skill.name,
+    disabled,
+    scope: skillToggleScope,
+  })
+  if (res.ok) {
+    const files = res.files ?? []
+    notice(
+      'info',
+      `${disabled ? '已关掉' : '已打开'}技能「${skill.name}」` +
+        (files.length > 0 ? `（写在 ${files.join('、')}）` : '（配置里本来就是这样的）'),
+    )
+  } else {
+    notice('error', `没能改「${skill.name}」的开关：${res.reason}`)
+    settingsKey = null
+  }
+  await refreshProjectInfo()
+  const session = activeSession()
+  if (session) await refreshSession(session.id)
 }
 
 function skillRemoveButton(skill) {
@@ -1552,7 +1710,9 @@ function mcpRow(server) {
   name.textContent = server.name
   const meta = document.createElement('div')
   meta.className = 'mcp-meta'
-  meta.textContent = `${server.transport} · 工具 ${server.toolCount}`
+  // 带分母的那句（`工具 2/3`）措辞由主进程出，这儿只管摆。别自己拼 `工具 ${toolCount}`，
+  // 那样被白名单卡着的服务器在列表上看着和全接的一样
+  meta.textContent = `${server.transport} · ${server.toolLabel}`
   main.append(name, meta)
 
   const status = document.createElement('span')
@@ -1567,6 +1727,13 @@ function mcpRow(server) {
       ? mcpRemoveConfirm(server)
       : mcpRemoveButton(server),
   )
+
+  // 「挑选工具」只在**连上、且真的报了工具**的服务器上出现。没连上的那份清单根本不存在，
+  // 摆一个点开是空白的按钮，比没有它更让人以为坏了
+  if (server.state === 'connected' && server.toolTotal > 0) {
+    row.append(mcpToolsButton(server))
+    if (mcpToolPanel?.name === server.name) row.append(mcpToolsPanel())
+  }
 
   // 失败原因铺满一整行。挤在状态那列里会被截断，而用户正是靠它判断哪儿配错了。
   // 放在删除按钮**之后**（它那条 `grid-column: 1/-1` 会另起一行，不挤着按钮）
@@ -1612,6 +1779,149 @@ async function removeMcp(server) {
     return
   }
   notice('info', `已移除 MCP 服务器「${server.name}」（${res.file || '运行时临时加的'}）`)
+  await refreshProjectInfo()
+  const session = activeSession()
+  if (session) await refreshSession(session.id)
+}
+
+/**
+ * 「挑选工具」。文案带上「接进来几个 / 总共几个」，不展开也能看出这台被白名单卡过。
+ *
+ * 不用 `.form-open` 那个类名：测试靠 `find(className === 'form-open')` 找「+ 新增」那个
+ * 三角，多一个同名的会把第一次匹配抢走。
+ */
+function mcpToolsButton(server) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'mcp-tools-open'
+  button.dataset.role = 'mcp-tools-open'
+  button.textContent = mcpToolPanel?.name === server.name ? '收起' : '挑选工具'
+  button.title =
+    `这台报了 ${server.toolTotal} 个工具，接进来 ${server.toolCount} 个。` +
+    '接进来几个就每轮请求付几条 schema 的 token，用不上的可以摘掉'
+  button.addEventListener('click', () => void toggleMcpTools(server))
+  return button
+}
+
+/** 展开 / 收起某一行。展开时才去问主进程要明细（见 `mcpToolPanel`） */
+async function toggleMcpTools(server) {
+  if (mcpToolPanel?.name === server.name) {
+    mcpToolPanel = null
+    settingsKey = null
+    render()
+    return
+  }
+  // 先立一个「正在取」的牌子再问，取回来之前那个三角就该转过来
+  mcpToolPanel = { name: server.name, tools: null, error: '' }
+  settingsKey = null
+  render()
+
+  const res = await invoke('mcp/tools/get', { cwd, name: server.name })
+  mcpToolPanel = {
+    name: server.name,
+    tools: res.ok ? (res.tools ?? []) : null,
+    error: res.ok ? '' : (res.reason ?? '取不到工具列表'),
+  }
+  settingsKey = null
+  render()
+}
+
+/** 展开出来的那一块。`grid-column: 1/-1` 让它独占一行，和失败原因那行同一个排法 */
+function mcpToolsPanel() {
+  const box = document.createElement('div')
+  box.className = 'mcp-tools'
+
+  if (mcpToolPanel.error) {
+    box.append(span(`取工具列表失败：${mcpToolPanel.error}`, 'mcp-tools-hint'))
+    return box
+  }
+  const tools = mcpToolPanel.tools
+  if (tools === null) {
+    box.append(span('正在取工具列表…', 'mcp-tools-hint'))
+    return box
+  }
+  if (tools.length === 0) {
+    box.append(span('这台服务器报了 0 个工具。', 'mcp-tools-hint'))
+    return box
+  }
+
+  const on = tools.filter((t) => t.allowed).length
+  box.append(
+    span(
+      `共 ${tools.length} 个，接进来 ${on} 个。全勾上就是不设白名单 —— 它会连以后新增的工具一起接。`,
+      'mcp-tools-hint',
+    ),
+  )
+  for (const tool of tools) box.append(mcpToolRow(tool))
+  return box
+}
+
+function mcpToolRow(tool) {
+  const row = document.createElement('div')
+  row.className = 'mcp-tool'
+  row.dataset.name = tool.name
+
+  const box = document.createElement('input')
+  box.type = 'checkbox'
+  box.className = 'switch'
+  box.dataset.role = 'mcp-tool-switch'
+  box.checked = tool.allowed
+  box.setAttribute('aria-label', `接入工具 ${tool.name}`)
+  box.addEventListener('change', () => void setMcpTool(tool, box.checked))
+
+  const name = document.createElement('span')
+  name.className = 'mcp-tool-name'
+  name.textContent = tool.name
+  // 消毒去重后的名字和服务器上的不一样时印出来，否则用户在授权弹窗里看到的名字对不上号
+  if (tool.localName !== tool.name) {
+    const local = document.createElement('span')
+    local.className = 'mcp-tool-local'
+    // 空格并进文字里，不另起一个裸文本节点：桩里的 `append` 只收节点
+    local.textContent = ` clauda 里叫 ${tool.localName}`
+    name.append(local)
+  }
+
+  const desc = document.createElement('span')
+  desc.className = 'mcp-tool-desc'
+  desc.textContent = tool.description || '（没写说明）'
+
+  const cost = document.createElement('span')
+  cost.className = 'mcp-tool-cost'
+  cost.textContent = `+${tool.tokens}`
+
+  row.append(box, name, desc, cost)
+  return row
+}
+
+/**
+ * 勾掉 / 勾上一个工具。
+ *
+ * **全勾上发的是 `null`，不是那一串名字**：名单是「挑过」的痕迹，全选之后再留一份，
+ * 以后服务器新增了工具，用户还得回来手工勾第二个。`null` 是「不设白名单」，两种状态下
+ * 现在接进来的一样多，区别在下一次服务器变卦的时候。
+ */
+async function setMcpTool(tool, checked) {
+  if (!cwd || !mcpToolPanel) return
+  const all = mcpToolPanel.tools ?? []
+  const kept = all.filter((t) => t.allowed).map((t) => t.name)
+  const next = checked ? [...new Set([...kept, tool.name])] : kept.filter((n) => n !== tool.name)
+  const payload = next.length === all.length ? null : next
+
+  const res = await invoke('mcp/tools/set', { cwd, name: mcpToolPanel.name, tools: payload })
+  if (!res.ok) {
+    notice('error', `没能改「${mcpToolPanel.name}」的工具：${res.reason}`)
+    // 同 `toggleMcp`：失败时快照没变、指纹也不变，不作废缓存的话界面会停在用户刚勾的那一侧
+    settingsKey = null
+    await refreshProjectInfo()
+    return
+  }
+  mcpToolPanel = { name: mcpToolPanel.name, tools: res.tools ?? [], error: '' }
+  notice(
+    'info',
+    payload === null
+      ? `「${mcpToolPanel.name}」不设白名单了，${all.length} 个工具全接（写在 ${res.file}）`
+      : `「${mcpToolPanel.name}」接进来 ${next.length}/${all.length} 个工具（写在 ${res.file}）`,
+  )
   await refreshProjectInfo()
   const session = activeSession()
   if (session) await refreshSession(session.id)

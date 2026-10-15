@@ -10,11 +10,13 @@ import {
   normalizeBaseUrl,
   removeMcpServerAnywhere,
   removeProjectProfile,
+  setMcpServerToolsAnywhere,
   writeActiveProfile,
   writeDefaultAgent,
   writeMcpServer,
   writeProjectProfile,
   writeProjectProvider,
+  writeSkillDisabled,
   type ClaudaConfig,
   type McpServerConfig,
   type PermissionMode,
@@ -23,16 +25,17 @@ import {
   type ProviderProfile,
 } from '../config.js'
 import { VENDORS, vendorByBaseUrl, type VendorPreset } from '../provider/vendors.js'
-import type { McpServerStatus } from '../mcp/manager.js'
+import type { McpServerStatus, McpToolInfo } from '../mcp/manager.js'
 import { PermissionManager } from '../permissions.js'
 import { OpenAICompatibleProvider } from '../provider/openai.js'
 import type { Provider } from '../provider/types.js'
-import type { SkillMeta, SkillSource } from '../skills/types.js'
+import type { SkillAdmin, SkillMeta, SkillSource } from '../skills/types.js'
 import { removeSkill, writeSkill, type SkillScope } from '../skills/writer.js'
 import type { Tool } from '../tools/types.js'
 import type { UserAttachment } from '../types.js'
 import { IpcView, type ViewEvent } from './ipc-view.js'
 import { mcpCostNotice, type McpCostNotice } from './mcp-cost.js'
+import { skillCostNotice, type SkillCostNotice } from './skill-cost.js'
 import { persistSession } from './persist.js'
 import {
   PermissionBridge,
@@ -78,7 +81,7 @@ export interface SessionProject {
    * （`scopedSkills` 收 `SkillSource`，返回的视图也要能塞回 `AgentOptions.skills`）——
    * 提示词里的「可用技能」索引必须和工具集合看到的是同一份名单。
    */
-  readonly skills?: SkillSource & { refresh(): void }
+  readonly skills?: SkillSource & SkillAdmin & { refresh(): void }
   /**
    * 智能体注册表。可选，和 `skills` 同一个理由：这个接口只承诺「项目里有哪些智能体」，
    * 而没有智能体的调用方（测试里那些假的 project）不必为此造一个。
@@ -110,6 +113,13 @@ export interface SessionProject {
     addServer(name: string, cfg: McpServerConfig): Promise<void>
     /** 运行期摘掉一个服务器。名字不存在时抛 */
     removeServer(name: string): Promise<void>
+    /**
+     * 改一台服务器的工具白名单，只动运行期这一份（落盘由 `setMcpTools` 负责）。
+     * `undefined` = 不设白名单（全接），空数组 = 一个都不接。
+     */
+    setTools(name: string, tools: string[] | undefined): void
+    /** 一台服务器上报的全部工具，设置页展开那一行时才取 */
+    toolCatalog(name: string): McpToolInfo[]
     status(): McpServerStatus[]
     tokenHint(): number
     /** 只要 MCP 那几个，`assembleTools()` 是全部工具。`mcpCostNotice` 要靠它数工具个数 */
@@ -208,6 +218,11 @@ export interface ProjectInfo {
    * 两端各写一套的话，改了阈值或口径没人会想起来去对齐另一边。
    */
   mcpCost: McpCostNotice
+  /**
+   * 技能索引的开销提示。和 `mcpCost` 一样**措辞由 `skillCostNotice` 统一出**，
+   * 桌面端只负责摆位置。技能页列着上百行却看不出它们正在花钱，这个数字就是给那个看的。
+   */
+  skillCost: SkillCostNotice
 }
 
 export interface Session {
@@ -553,7 +568,9 @@ export class SessionManager {
         allow: [...cfg.permissions.allow],
         deny: [...cfg.permissions.deny],
       },
-      skills: project.skills?.list() ?? [],
+      // `listAll()` 而不是 `list()`：设置页要画出**被关掉的那些**，否则开关一关这一行就没了，
+      // 再也点不回来。喂给模型的那几处走的是 `list()`（注册表里已经滤过），这里只多不少
+      skills: project.skills?.listAll() ?? [],
       // 元数据只有一份（`list()` 的产物，**不重读文件、不带正文**）。要正文走 `agent/get`。
       // 用展开而不是逐个字段抄：`AgentMeta` 全是可序列化的标量与数组、没有密钥，
       // 而逐个抄会在有人给 `AgentMeta` 加字段时**静默漏掉**（`ProjectInfo` 却看不出来）
@@ -567,6 +584,8 @@ export class SessionManager {
       defaultAgent: cfg.defaultAgent,
       mcp: project.mcp.status(),
       mcpCost: mcpCostNotice(project.mcp, cfg.contextWindow),
+      // 同 `mcpCost`：措辞由 `skillCostNotice` 统一出，桌面端只负责摆位置
+      skillCost: skillCostNotice(project.skills, cfg.contextWindow),
     }
   }
 
@@ -690,13 +709,53 @@ export class SessionManager {
   removeSkill(cwd: string, name: string): string {
     const entry = this.projects.get(cwd)
     if (!entry) throw new Error('项目运行时还没就绪，删不了技能')
-    const meta = entry.project.skills?.get(name)
+    // `find()` 而不是 `get()`：**关掉的技能也得删得掉**。`get()` 当它不存在，用它的话
+    // 「禁用之后再也删不了」—— 一个死结，而且症状是「明明在设置页里看着它，就是删不掉」
+    const meta = entry.project.skills?.find(name)
     if (!meta) throw new Error(`没有名为 "${name}" 的技能`)
     // 真正的护栏（目标必须在某个 skills 根下、里面真有 SKILL.md）在 writer.ts 里
     const dir = removeSkill(meta.file)
     entry.project.skills?.refresh()
     this.refreshProjectTools(cwd, true)
     return dir
+  }
+
+  /**
+   * 打开 / 关掉一个技能 —— 技能页每行那个开关。
+   *
+   * 关掉只是让它**不进「## 可用技能」**（`skill` 工具、斜杠命令一并当它不存在），
+   * `SKILL.md` 一个字不动。要真删还是走 `removeSkill`。
+   *
+   * **必须落盘**：只改内存的话重开项目就全回来了。而落盘之后**还要把内存那份补成一样的** ——
+   * 它是新建会话和下次拆装工具集的来源，漏一步就表现成「点了开关，当轮是好的，重开又回来了」。
+   *
+   * 内存那份**自己算**，不回读磁盘：`loadConfig` 会跑 dotenv（改全局 `process.env`），
+   * 理由见 `patchTemplate` 那条注释。算法比看上去简单 —— 上面 `setSkillDisabled` 的两种
+   * 情形各自的结果都是「并集里加一个 / 并集里去掉一个」，与 scope 无关。
+   *
+   * `refreshProjectTools(cwd, true)`：技能同时改提示词（那段索引）和工具集（关到一个不剩时
+   * `skill` 工具该摘掉），所以是 true，同 `addSkill`。
+   */
+  setSkillDisabled(cwd: string, name: string, disabled: boolean, scope: SkillScope): string[] {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，改不了技能开关')
+    // 名字先认：不然开关能关掉一个压根不存在的技能，配置文件里就多一条永远不生效的记录
+    if (!entry.project.skills?.find(name)) throw new Error(`没有名为 "${name}" 的技能`)
+
+    const changed = writeSkillDisabled(
+      { global: path.join(claudaHome(), 'config.json'), project: configPath(cwd) },
+      scope,
+      name,
+      disabled,
+    )
+
+    const cfg = entry.project.config
+    cfg.disabledSkills = disabled
+      ? [...new Set([...cfg.disabledSkills, name])]
+      : cfg.disabledSkills.filter((n) => n !== name)
+    entry.project.skills.setDisabled(cfg.disabledSkills)
+    this.refreshProjectTools(cwd, true)
+    return changed
   }
 
   /**
@@ -799,6 +858,40 @@ export class SessionManager {
     if (!entry) throw new Error('项目运行时还没就绪，删不了 MCP 服务器')
     await entry.project.mcp.removeServer(name)
     const file = removeMcpServerAnywhere(cwd, name)
+    this.refreshProjectTools(cwd, false)
+    return file
+  }
+
+  /**
+   * 一台服务器的工具明细（设置页展开那一行时才要）。**只读，不落盘**。
+   *
+   * 单独一个方法而不是塞进 `ProjectInfo`：工具明细比状态行大两个数量级，而 `ProjectInfo`
+   * 是每轮徽标刷新都要重算一遍的。谁展开谁付这笔钱。
+   */
+  mcpToolCatalog(cwd: string, name: string): McpToolInfo[] {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，看不了 MCP 工具')
+    return entry.project.mcp.toolCatalog(name)
+  }
+
+  /**
+   * 改一台服务器的工具白名单：**先落盘、再改运行期**（顺序同 `addMcpServer`）。
+   *
+   * 反过来的话，配置写失败（不是合法 JSON）时运行期已经变了，界面显示改成功、重启回原样。
+   *
+   * `tools` 给空数组就是「一个都不接」—— 调用方（设置页）把「全勾上」翻成 `undefined`，
+   * 因为那是**不设白名单**，和空数组是两件事（见 `setMcpServerTools`）。
+   *
+   * 返回真正写着这台服务器的那个文件；两处都没有时返回 `''`，此时运行期也没动 —— 那种
+   * 情况只可能是「运行期临时加的服务器」（`mcp_add` 写完盘又手工删了配置），不该假装成功。
+   */
+  setMcpTools(cwd: string, name: string, tools: string[] | undefined): string {
+    const entry = this.projects.get(cwd)
+    if (!entry) throw new Error('项目运行时还没就绪，改不了 MCP 工具白名单')
+    const file = setMcpServerToolsAnywhere(cwd, name, tools)
+    if (!file) return ''
+    entry.project.mcp.setTools(name, tools)
+    // 同 `addMcpServer`：换的是 tools 数组，「## 可用技能」没动，提示词不用重建
     this.refreshProjectTools(cwd, false)
     return file
   }

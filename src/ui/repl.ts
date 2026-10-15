@@ -228,7 +228,16 @@ export class Repl {
   private async runSkill(name: string, arg: string): Promise<void> {
     const body = this.opts.skills?.read(name)
     if (body == null) {
-      this.info(style.red(`技能 ${name} 读取失败，文件可能已被删除。`))
+      // 关掉的技能 `read()` 也不给正文（`get()` 当它不存在），但那**不是**「文件没了」。
+      // 它不在「## 可用技能」里，用户多半是从记忆里敲的名字 —— 不区分开就说不出原因，
+      // 而「文件可能已被删除」会让人跑去 skills 目录里找一份好端端放着的 SKILL.md
+      this.info(
+        style.red(
+          this.opts.skills?.find(name)?.disabled
+            ? `技能 ${name} 已被关闭（把 config.json 的 disabledSkills 里的它去掉就能用）。`
+            : `技能 ${name} 读取失败，文件可能已被删除。`,
+        ),
+      )
       return
     }
     const parts = [`我调用了技能「${name}」，请按以下指引执行。`]
@@ -451,11 +460,17 @@ export class Repl {
             : s.state === 'failed' ? style.red('失败')
             : style.dim('未启用')
           const detail = s.error ? style.dim(`  ${s.error.split('\n')[0]}`) : ''
-          return `  ${style.cyan(s.name.padEnd(16))} ${s.transport.padEnd(5)} ${mark}  ${style.dim(`工具 ${s.toolCount}`)}${detail}`
+          // 「工具 3/8」那截话由 `McpManager.status()` 统一出（见 `toolCountLabel`）：桌面端
+          // 走 app:// 协议 import 不到 dist，措辞只能由主进程下发，两端才不会各说各的
+          return `  ${style.cyan(s.name.padEnd(16))} ${s.transport.padEnd(5)} ${mark}  ${style.dim(s.toolLabel)}${detail}`
         })
         const tokens = mcp.tokenHint()
         if (tokens > 0) {
           out.push('', style.dim(`这些工具的 schema 每次请求都要发，约 ${tokens} token。用 /mcp off <名字> 可以摘掉。`))
+        }
+        // 白名单只能在配置文件里改（终端没有勾选框），所以顺带指个方向
+        if (list.some((s) => s.toolTotal > s.toolCount)) {
+          out.push(style.dim('  带分母的那几台被 tools 白名单卡着，改 config.json 里对应的 tools 就能放出来。'))
         }
         this.info(out.join('\n'))
         break

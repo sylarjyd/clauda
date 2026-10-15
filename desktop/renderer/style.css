@@ -1395,6 +1395,65 @@ button.new-session:hover:not(:disabled) {
   overflow-wrap: anywhere;
 }
 
+/* 开关那一列。`.skill-row` 是 flex + `align-items: flex-start`，不顶一下的话
+   开关会跟「/技能名」那一行错开半行 */
+.skill-row > .switch {
+  margin-top: 2px;
+}
+
+/* 关掉的整行压暗。**不能只靠开关的位置去认** —— 一屏里全是同样的行，
+   哪个开着哪个关着要一眼扫得出来 */
+.skill-row[data-disabled="true"] .skill-text {
+  opacity: 0.55;
+}
+
+/* 「开关写到」那一行。摆在列表上面：它管着下面每一行的开关 */
+.skill-scope {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.skill-scope select {
+  max-width: 320px;
+}
+
+.skill-scope-hint {
+  font-size: 11.5px;
+}
+
+/* 「已关掉 N 个」那一块。`<details>` 原生折叠，不另造一套展开状态 ——
+   这页已经有三个展开态了（两个表单、一堆开关），再加一个要跟着指纹走的状态不值 */
+.skill-off {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+
+.skill-off-summary {
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.skill-off .set-rows {
+  border-top: 1px solid var(--line);
+}
+
+/* 折叠区里的行是暗的，里面的开关也跟着暗，免得看着比开着的那些还显眼 */
+.skill-off .skill-row[data-disabled="true"] .skill-text {
+  opacity: 0.75;
+}
+
 /* ---- MCP ---- */
 
 /* 第四列是删除按钮。**开关必须留在第一列** —— `children[0]` 是测试钉住的契约，
@@ -1437,6 +1496,86 @@ button.new-session:hover:not(:disabled) {
 
 .mcp-state.disabled {
   color: var(--text-faint);
+}
+
+/* 「挑选工具」那个三角。样式贴着 `.form-open`（同一个手势：点开一块折叠区），
+   但类名另起：测试靠 `className === 'form-open'` 找「+ 新增」，同名会把第一次匹配抢走 */
+.mcp-tools-open {
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.mcp-tools-open:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+/* 展开的工具清单。和失败原因那行同一个排法：`1/-1` 独占一行铺满 */
+.mcp-tools {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-sunken);
+}
+
+.mcp-tools-hint {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* 四列：勾选框 / 工具名 / 说明 / 这一条值多少 token。
+   说明那一列 `minmax(0, 1fr)` 才会被压缩并省略，不然长说明会把整行撑到屏幕外 */
+.mcp-tool {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 2fr) auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.mcp-tool + .mcp-tool {
+  border-top: 1px solid var(--line);
+}
+
+.mcp-tool-name {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.mcp-tool-local {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.mcp-tool-desc {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-tool-cost {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* 没接进来的那些压暗一点：一眼看出哪些正占着上下文 */
+.mcp-tool:has(.switch:not(:checked)) .mcp-tool-name,
+.mcp-tool:has(.switch:not(:checked)) .mcp-tool-desc {
+  opacity: 0.5;
 }
 
 /* 失败原因独占一行铺满，别挤在状态那一列里被截掉 —— 用户要靠它判断哪儿配错了 */

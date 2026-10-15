@@ -284,7 +284,37 @@ function agentConfig(extra = {}) {
     autoCompact: true,
     compactThreshold: 0.75,
     maxSteps: 40,
+    // `setSkillDisabled` 会读它（并集里加一个 / 去掉一个），假配置漏了就会抛
+    disabledSkills: [],
     ...extra,
+  }
+}
+
+/**
+ * 假的技能注册表，给那些「不需要真技能、但 `projectInfo` 要能算开销」的用例。
+ *
+ * `listAll` / `find` / `setDisabled` 一个都不能少：`projectInfo` 现在走 `listAll()`，
+ * 删技能走 `find()`，开关走 `setDisabled()` —— 少一个就是运行到那一步才炸的
+ * `is not a function`，而那种错看着像 App 坏了而不是假件不全。
+ *
+ * 空的那一份用 `fakeSkills().registry`，要带技能的传数组
+ */
+function fakeSkills(skills = []) {
+  const all = [...skills]
+  return {
+    registry: {
+      list: () => all.filter((s) => !s.disabled),
+      listAll: () => all,
+      get: (n) => all.find((s) => s.name === n && !s.disabled),
+      find: (n) => all.find((s) => s.name === n),
+      has: (n) => all.some((s) => s.name === n && !s.disabled),
+      read: () => null,
+      setDisabled(names) {
+        for (const s of all) s.disabled = names.includes(s.name)
+      },
+      refresh() {},
+    },
+    all,
   }
 }
 const makeAgent = (extra) =>
@@ -974,6 +1004,42 @@ const { makeSkillTool } = await import(`${dist}tools/skill.js`)
     bad.error,
   )
 
+  // ---- 逐技能开关：关掉的在「在用」那一侧等于不存在，在设置页那一侧还得看得见
+  //
+  // 过滤只做在注册表这一处，四处受益（提示词 / `skill` 工具 / 斜杠命令 / 设置页）。这里盯的
+  // 是两个视图分得开：`list()` 是「现在有什么在起作用」，`listAll()` 是「磁盘上有什么」。
+  const off = SkillRegistry.discover(proj, ['only-global'])
+  check('关掉的不在 list() 里', !off.list().some((s) => s.name === 'only-global'), JSON.stringify(off.list().map((s) => s.name)))
+  check(
+    '关掉的也不在提示词的技能索引里',
+    !buildSystemPrompt({ cwd: proj, config: agentConfig(), mode: 'default', skills: off }).includes('only-global'),
+  )
+  check('get() 当作不存在（skill 工具因此取不到正文）', off.get('only-global') === undefined)
+  check('read() 同样取不到', off.read('only-global') === null)
+  check('has() 说没有', off.has('only-global') === false)
+
+  const allSkills = off.listAll()
+  const gone = allSkills.find((s) => s.name === 'only-global')
+  check('listAll() 还列着它（设置页要靠这一份才关得回来）', gone !== undefined, JSON.stringify(allSkills.map((s) => s.name)))
+  check(
+    '它身上标着 disabled，没关的标 false',
+    gone?.disabled === true && allSkills.find((s) => s.name === 'shared')?.disabled === false,
+    JSON.stringify(allSkills.map((s) => [s.name, s.disabled])),
+  )
+  check('find() 不看开关，关掉的也找得到（删除路径要用）', off.find('only-global')?.description === '只在全局', JSON.stringify(off.find('only-global')))
+  check('list() 出来的一律 disabled:false', off.list().every((s) => s.disabled === false))
+
+  // 开关当场生效：设置页拨一下不该等到重开项目
+  off.setDisabled([])
+  check('setDisabled([]) 之后当场又能用了', off.has('only-global') && off.get('only-global')?.disabled === false)
+  off.setDisabled(['shared'])
+  check('再关另一个，先前那个不受影响', !off.has('shared') && off.has('only-global'))
+
+  // 重扫换的是**另一批对象**，标记不会自己跟过来 —— 漏掉这一步，开关会在刷新之后弹回去
+  off.refresh()
+  check('refresh() 之后关掉的仍关着', !off.has('shared'), JSON.stringify(off.list().map((s) => s.name)))
+  check('refresh() 之后 listAll() 上的标记也还在', off.listAll().find((s) => s.name === 'shared')?.disabled === true)
+
   if (prevHome === undefined) delete process.env.CLAUDA_HOME
   else process.env.CLAUDA_HOME = prevHome
   fs.rmSync(home, { recursive: true, force: true })
@@ -1417,15 +1483,31 @@ console.log('\n== 智能体：会话装配与恢复 ==')
     },
   })
   let mcpOn = false
-  const skillList = () => [
-    { name: 'a', description: 'SKILL-A', dir: '/x/a', file: '/x/a/SKILL.md' },
-    { name: 'b', description: 'SKILL-B', dir: '/x/b', file: '/x/b/SKILL.md' },
-  ]
+  // 开关状态存在外面：`skillList()` 每次都是新对象，标在对象上留不住
+  const off = new Set()
+  const skillListAll = () =>
+    [
+      { name: 'a', description: 'SKILL-A', dir: '/x/a', file: '/x/a/SKILL.md' },
+      { name: 'b', description: 'SKILL-B', dir: '/x/b', file: '/x/b/SKILL.md' },
+    ].map((s) => ({ ...s, disabled: off.has(s.name) }))
+
+  /**
+   * 假注册表。**`list()` 已经把关掉的滤掉了**，和真 `SkillRegistry` 一样 ——
+   * 假件在这里「帮忙」把全部给出去的话，`projectInfo` / 提示词那几处到底看的是哪一份
+   * 就永远测不出来，而那正是这个开关唯一要保证的事。
+   */
   const skills = {
-    list: skillList,
-    get: (n) => skillList().find((s) => s.name === n),
-    has: (n) => n === 'a' || n === 'b',
-    read: (n) => (n === 'a' ? 'A正文' : n === 'b' ? 'B正文' : null),
+    list: () => skillListAll().filter((s) => !s.disabled),
+    listAll: skillListAll,
+    get: (n) => skillListAll().find((s) => s.name === n && !s.disabled),
+    find: (n) => skillListAll().find((s) => s.name === n),
+    has: (n) => skillListAll().some((s) => s.name === n && !s.disabled),
+    read: (n) => (off.has(n) ? null : n === 'a' ? 'A正文' : n === 'b' ? 'B正文' : null),
+    setDisabled(names) {
+      off.clear()
+      for (const n of names) off.add(n)
+    },
+    refresh() {},
   }
 
   const openProject = (dir) => {
@@ -1769,7 +1851,8 @@ console.log('\n== MCP 权限规则 ==')
 // 一起重写了」或者「把 ${VAR} 展开成明文密钥落盘」。
 console.log('\n== MCP 配置写盘 ==')
 {
-  const { writeMcpServer, removeMcpServer, removeMcpServerAnywhere, configPath } = await import(`${dist}config.js`)
+  const { writeMcpServer, removeMcpServer, removeMcpServerAnywhere, setMcpServerTools, setMcpServerToolsAnywhere, configPath } =
+    await import(`${dist}config.js`)
 
   const prevHome = process.env.CLAUDA_HOME
   const prevSecret = process.env.MCP_SECRET
@@ -1853,10 +1936,156 @@ console.log('\n== MCP 配置写盘 ==')
   check('只在全局定义的就删全局那份', removeMcpServerAnywhere(proj, 'onlyGlobal') === globalFile)
   check('哪份都没有时返回空串（调用方据此说「没这条」）', removeMcpServerAnywhere(proj, 'never') === '')
 
+  // ---- tools 白名单：改一个键，别的什么都不许动
+  //
+  // 走 `writeMcpServer` 做不到这件事 —— 那个接口是**整条替换**，只传 `{tools}` 会把
+  // command/args/env 一起抹掉。设置页那个勾选框每次都只打算改名单，所以另开一条路。
+  check('改白名单：返回真表示这条在这份文件里', setMcpServerTools(file, 'demo', ['echo']) === true)
+  let demo = JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.demo
+  check('名单写进去了', JSON.stringify(demo.tools) === '["echo"]', JSON.stringify(demo))
+  check('同一个条目的 command/args 一个字节没动', demo.command === 'npx' && demo.args?.[1] === 'old', JSON.stringify(demo))
+  check('别的服务器也没被连累', JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.another.command === 'node')
+
+  // 没变就不写盘。这不是省事：勾一下重写一遍的话文件 mtime 一直跳，外面那种
+  // 「盯着配置文件变了就重载」的工具会被白刷一轮
+  const past = new Date('2020-01-01T00:00:00Z')
+  fs.utimesSync(file, past, past)
+  check('同一份名单再写一次也算成功（返回值的意思是「这条在这份文件里」）', setMcpServerTools(file, 'demo', ['echo']) === true)
+  check('……但一个字节都没写（mtime 没动）', Math.abs(fs.statSync(file).mtimeMs - past.getTime()) < 60_000, String(fs.statSync(file).mtimeMs))
+
+  // 「一个都不接」和「没设白名单」是两种状态：前者要落成 `[]`，后者是**键不存在**。
+  // 合并成一种的话，用户勾掉最后一个工具 ≠ 打开全接，而界面上这两下长得一样
+  setMcpServerTools(file, 'demo', [])
+  check('空数组是一个真实的值，不是「没设」', JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.demo.tools) === '[]')
+  setMcpServerTools(file, 'demo', undefined)
+  check('传 undefined 是把那个键删掉（回到「全接」）', !('tools' in JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.demo))
+  const rawTools = fs.readFileSync(file, 'utf8')
+  check('写白名单走的也是磁盘原文，占位符没被展开成明文', rawTools.includes('${MCP_SECRET}') && !rawTools.includes('sk-mcp-真密钥'), rawTools)
+
+  check(
+    '名字对不上时报 false，绝不顺手新建一条半成品',
+    setMcpServerTools(file, 'nope', ['x']) === false && !('nope' in JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers),
+  )
+  // 手写的配置里这地方可能是字符串。按「服务器」处理会写出一份谁都读不懂的配置
+  const weirdFile = path.join(path.dirname(file), 'weird.json')
+  fs.writeFileSync(weirdFile, JSON.stringify({ mcpServers: { weird: 'not-an-object' } }), 'utf8')
+  check('条目形状不对时报 false，不炸也不改它', setMcpServerTools(weirdFile, 'weird', ['x']) === false && fs.readFileSync(weirdFile, 'utf8').includes('not-an-object'))
+
+  const badTools = await catchErr(() => setMcpServerTools(broken, 'demo', ['echo']))
+  check('配置文件不是合法 JSON 时抛', badTools.error !== null, String(badTools.error))
+  check('抛的时候原文一个字节没动', fs.readFileSync(broken, 'utf8') === '{ 这不是 JSON')
+
+  // 运行期那份是合并之后的，看不出某一条来自哪份文件 —— 同 `removeMcpServerAnywhere`，
+  // 只能按「项目优先」定：先找到的那份负责，另一份不许跟着一起写
+  writeMcpServer(file, 'both', { command: 'p' })
+  check('两处都定义了就先写项目那份', setMcpServerToolsAnywhere(proj, 'both', ['a']) === file)
+  check('项目那份写上了', JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.both.tools) === '["a"]')
+  check('全局那份一个字没动（不是两处一起写）', JSON.parse(fs.readFileSync(globalFile, 'utf8')).mcpServers.both.tools === undefined)
+  // 上面那条删除用例把 `onlyGlobal` 从全局那份里摘掉了，重新种一条回来
+  writeMcpServer(globalFile, 'onlyGlobal', { command: 'x' })
+  check('只在全局定义的就写全局那份', setMcpServerToolsAnywhere(proj, 'onlyGlobal', ['b']) === globalFile)
+  check('哪份都没有时返回空串（调用方据此说「没这条」）', setMcpServerToolsAnywhere(proj, 'never', ['c']) === '')
+
   if (prevHome === undefined) delete process.env.CLAUDA_HOME
   else process.env.CLAUDA_HOME = prevHome
   if (prevSecret === undefined) delete process.env.MCP_SECRET
   else process.env.MCP_SECRET = prevSecret
+  fs.rmSync(home, { recursive: true, force: true })
+  fs.rmSync(proj, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------- 技能开关写盘
+// 关掉只是不进提示词，`SKILL.md` 一个字节不动 —— 所以这一组盯的是**只动 disabledSkills 这
+// 一个键**，以及两份配置的合成语义：禁用取并集（限制只该越合越紧），代价是「打开」必须两份
+// 都清 —— 合并之后看不出某一条来自哪份文件。
+console.log('\n== 技能开关写盘 ==')
+{
+  const { writeSkillDisabled, configPath, loadConfig } = await import(`${dist}config.js`)
+
+  const prevHome = process.env.CLAUDA_HOME
+  const prevSecret = process.env.SKILL_SECRET
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-skillhome-'))
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-skillproj-'))
+  process.env.CLAUDA_HOME = home
+  // 同 MCP 那一组：占位符指向的变量得真实存在，否则「没被展开成明文」是句空话
+  process.env.SKILL_SECRET = 'sk-skill-真密钥'
+
+  // 两份配置都还没这个键的时候得是**空数组**：注册表那边是 `new Set(disabled)` 直接吃的，
+  // 给个 undefined 就是打开项目当场炸
+  check('谁都没禁过时是空数组，不是 undefined', Array.isArray(loadConfig(proj).disabledSkills) && loadConfig(proj).disabledSkills.length === 0, JSON.stringify(loadConfig(proj).disabledSkills))
+
+  const globalFile = path.join(home, 'config.json')
+  const projectFile = configPath(proj)
+  fs.mkdirSync(path.dirname(projectFile), { recursive: true })
+  // 两份都摆「什么都有」的内容：每条断言都要求除 disabledSkills 之外一个字不动
+  fs.writeFileSync(
+    globalFile,
+    JSON.stringify(
+      {
+        profiles: { default: { baseUrl: 'https://api.deepseek.com/v1', apiKey: '${SKILL_SECRET}', model: 'm' } },
+        activeProvider: 'default',
+        mcpServers: { demo: { command: 'npx', args: ['-y', 'old'] } },
+        disabledSkills: ['global-off'],
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  fs.writeFileSync(
+    projectFile,
+    JSON.stringify(
+      {
+        provider: { timeoutMs: 20000 },
+        permissions: { mode: 'auto', allow: ['Read'], deny: [] },
+        disabledSkills: ['project-off'],
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+
+  const files = { global: globalFile, project: projectFile }
+  const readAt = (f) => JSON.parse(fs.readFileSync(f, 'utf8'))
+
+  check('关一个，只写选中的那份', writeSkillDisabled(files, 'project', 'noisy', true).join() === projectFile)
+  check('关的那份记上了（连原有的那条一起）', readAt(projectFile).disabledSkills.join() === 'project-off,noisy', JSON.stringify(readAt(projectFile).disabledSkills))
+  check('另一份一个字没动', readAt(globalFile).disabledSkills.join() === 'global-off', JSON.stringify(readAt(globalFile).disabledSkills))
+  check(
+    '别的段落一个字没动',
+    readAt(projectFile).permissions?.mode === 'auto' && readAt(projectFile).provider?.timeoutMs === 20000 && readAt(globalFile).mcpServers?.demo?.args?.[1] === 'old',
+    JSON.stringify(readAt(globalFile)),
+  )
+  // 同 MCP 那一组的防线：`loadConfig()` 会把 `${SKILL_SECRET}` 换成真密钥，拿它的结果回写
+  // 就是把密钥明文落盘
+  const rawGlobal = fs.readFileSync(globalFile, 'utf8')
+  check('写回的是磁盘原文，占位符没被展开成明文', rawGlobal.includes('${SKILL_SECRET}') && !rawGlobal.includes('sk-skill-真密钥'))
+
+  check('重复关同一个不落盘（返回空数组）', writeSkillDisabled(files, 'project', 'noisy', true).length === 0)
+  check('打开一个本来就没禁用的也不落盘', writeSkillDisabled(files, 'global', 'never-off', false).length === 0)
+
+  const union = loadConfig(proj).disabledSkills
+  check('两份是并集，不是后者整张顶掉前者', union.slice().sort().join() === 'global-off,noisy,project-off', JSON.stringify(union))
+
+  // 并集语义下「打开」看不出那一条来自哪份文件，所以两份一起清
+  const cleared = writeSkillDisabled(files, 'project', 'global-off', false)
+  check('打开时两份一起清（全局那份里也有它）', cleared.join() === globalFile, JSON.stringify(cleared))
+  check('清完之后合并结果里没有它', !loadConfig(proj).disabledSkills.includes('global-off'), JSON.stringify(loadConfig(proj).disabledSkills))
+  // 清空的列表要整键删掉：留一个 `[]` 在那儿，下次读的人分不清「没设过」和「关过又全开了」
+  check('清空的列表整键删掉，不留空数组', readAt(globalFile).disabledSkills === undefined, fs.readFileSync(globalFile, 'utf8'))
+  check('清掉全局那份不影响项目那份禁止的那些', readAt(projectFile).disabledSkills.join() === 'project-off,noisy', JSON.stringify(readAt(projectFile).disabledSkills))
+
+  const broken = path.join(home, 'broken.json')
+  fs.writeFileSync(broken, '{ 这不是 JSON', 'utf8')
+  const bad = await catchErr(() => writeSkillDisabled({ global: broken, project: broken }, 'global', 'x', true))
+  check('配置不是合法 JSON 时抛', bad.error !== null, String(bad.error))
+  check('抛的时候原文一个字节没动', fs.readFileSync(broken, 'utf8') === '{ 这不是 JSON')
+
+  if (prevHome === undefined) delete process.env.CLAUDA_HOME
+  else process.env.CLAUDA_HOME = prevHome
+  if (prevSecret === undefined) delete process.env.SKILL_SECRET
+  else process.env.SKILL_SECRET = prevSecret
   fs.rmSync(home, { recursive: true, force: true })
   fs.rmSync(proj, { recursive: true, force: true })
 }
@@ -1873,11 +2102,24 @@ console.log('\n== McpManager 的增删接口 ==')
   const st = mgr.status()
   check('加进去的服务器会出现在状态列表里', st.length === 1 && st[0].name === 'off-by-config', JSON.stringify(st))
   check('配置里标了 enabled:false 就是 disabled，不去连', st[0].state === 'disabled' && st[0].toolCount === 0, JSON.stringify(st[0]))
+  // 措辞由 `status()` 统一出（终端和桌面端都直接印它）。桌面端走 app:// 协议，
+  // import 不到 dist，两边各自拼一句的话迟早会不一样
+  check('每一台都带着给界面印的那句话', st.every((s) => s.toolLabel === '工具 0'), JSON.stringify(st))
   check('没连上就没有工具进集合', mgr.tools().length === 0, String(mgr.tools().length))
   check('名字和参数对不上时删一条会抛（界面不能说「已删除」而配置里还留着）', await catchErr(async () => mgr.removeServer('nope')).then((r) => r.error !== null))
   await mgr.removeServer('off-by-config')
   check('删干净了：状态、工具、配置名字一起没的', mgr.status().length === 0 && mgr.tools().length === 0, JSON.stringify(mgr.status()))
   check('删过之后再删同一个名字会抛', (await catchErr(async () => mgr.removeServer('off-by-config'))).error !== null)
+
+  // 白名单那两条接口的契约。真正的过滤（名单外的工具不进对话）在 e2e 里用真服务器验：
+  // 这里只钉「改名单**不重连**」这条设计 —— 每个勾选框重启一次子进程是不可接受的，
+  // 所以名单只在装配时过一遍，也就意味着这两条接口不该碰任何连接状态
+  const wl = new McpManager({}, { version: '0.0.0-test', view: { warn() {} } })
+  await wl.addServer('off', { command: 'npx', enabled: false })
+  const wlSet = await catchErr(() => wl.setTools('off', ['echo']))
+  check('给没连上的服务器改名单不抛，也不假装连上了', wlSet.error === null && wl.status()[0].toolCount === 0, String(wlSet.error ?? JSON.stringify(wl.status())))
+  check('名字对不上时改名单会抛（同 removeServer 的契约，界面不能说「已改」）', (await catchErr(() => wl.setTools('nope', []))).error !== null)
+  check('取没连上的服务器的工具明细给空数组，不抛（界面可能比服务器先到）', wl.toolCatalog('off').length === 0)
 
   // `closeAll` 是不可逆的（`closed` 标志），加服务器必须挡在这道门外面 —— 放进去就是一个
   // 谁都关不掉的子进程
@@ -2539,7 +2781,7 @@ console.log('\n== 会话管理：并发守卫与配置隔离 ==')
   const openProject = (dir) => ({
     cwd: dir,
     config: agentConfig(),
-    skills: { list: () => [] },
+    skills: fakeSkills().registry,
     assembleTools: () => ALL_TOOLS,
     mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
     dispose: () => { disposed.push(dir) },
@@ -2692,7 +2934,7 @@ console.log('\n== 会话管理：切厂商写盘、活会话冻结 ==')
     const project = {
       cwd: projDir,
       config,
-      skills: { list: () => [] },
+      skills: fakeSkills().registry,
       assembleTools: () => ALL_TOOLS,
       mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
       dispose: () => {},
@@ -2823,7 +3065,7 @@ console.log('\n== 项目运行时：没会话也拿得到，切目录 / 退出�
       const project = {
         cwd,
         config,
-        skills: { list: () => [] },
+        skills: fakeSkills().registry,
         assembleTools: () => ALL_TOOLS,
         mcp: { setEnabled: async () => {}, status: () => [], tokenHint: () => 0, tools: () => [] },
         disposed: false,
@@ -2953,7 +3195,7 @@ console.log('\n== 会话管理：授权等待、MCP 与记忆广播 ==')
   const openProject = (d) => ({
     cwd: d,
     config: agentConfig({ permissions: { mode: 'default', allow: [], deny: [] } }),
-    skills: { list: () => [] },
+    skills: fakeSkills().registry,
     assembleTools: () => (mcpOn ? [...ALL_TOOLS, mcpTool] : [...ALL_TOOLS]),
     mcp: {
       setEnabled(name, enabled) {
@@ -3045,7 +3287,7 @@ console.log('\n== 会话管理：记忆写入后广播给同项目其它会话 =
       cwd: d,
       // auto 模式：记忆工具是 write 权限，不然会卡在授权框上
       config: agentConfig({ permissions: { mode: 'auto', allow: [], deny: [] } }),
-      skills: { list: () => [] },
+      skills: fakeSkills().registry,
       assembleTools: () => [...ALL_TOOLS, ...makeMemoryTools()],
       memoryIndex: () => { const entries = listMemories().entries; return { entries, total: entries.length } },
       mcp: { setEnabled() {} },
@@ -4252,6 +4494,86 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   check('删掉的那台从列表里消失了', rowOfMcp('broken') === null)
   check('剩下的那台还在', rowOfMcp('demo') !== null)
 
+  // ---- MCP：工具白名单（勾选框）
+  //
+  // 列表上那个 `2/3` 只说了「被卡过」，怎么改得能点进去。这一块验三件事：明细是**按需**
+  // 取的（不能塞进每轮刷新的那份快照）、勾一下真的落到 payload 上、全勾上发的是「不要
+  // 白名单」而不是那一串名字。
+  const panelNow = () => find(app.el('settings-body'), (n) => n.className === 'mcp-tools')
+  const toolSwitch = (name) => find(panelNow(), (n) => n.dataset?.name === name)?.children[0]
+  const rowTextOf = (name) => textOf(rowOfMcp(name))
+
+  check(
+    '没展开就不去取工具明细',
+    !app.calls.includes('mcp/tools/get'),
+    JSON.stringify(app.calls.filter((c) => c.startsWith('mcp/tools'))),
+  )
+  check('行上写着带分母的说法（措辞由主进程出）', rowTextOf('demo').includes('工具 2/3'), rowTextOf('demo'))
+  check('两个数相等时不带分母', rowTextOf('filesystem').includes('工具 2') && !rowTextOf('filesystem').includes('2/2'), rowTextOf('filesystem'))
+
+  const toolsBtn = find(rowOfMcp('demo'), (n) => n.dataset?.role === 'mcp-tools-open')
+  check('连上的那行有「挑选工具」', toolsBtn?.textContent === '挑选工具', toolsBtn?.textContent)
+  toolsBtn.click()
+  await tick()
+  check('点了才去取明细', app.calls.includes('mcp/tools/get'), JSON.stringify(app.calls.slice(-3)))
+  check('取明细不刷会话、也不动项目快照', app.savedMcpToolSets.length === 0)
+
+  const toolNames = findAll(panelNow(), (n) => n.className === 'mcp-tool').map((r) => r.dataset.name)
+  check('展开列出这台的全部工具，**包括没接进来的那条**', toolNames.join() === 'create_issue,search,delete_all', toolNames.join())
+  check('接进来的那条是勾上的', toolSwitch('search').checked === true)
+  check('没接进来的那条是没勾上的', toolSwitch('delete_all').checked === false, String(toolSwitch('delete_all').checked))
+  check(
+    '本地名字和服务器上不一样时印出来（授权弹窗里看到的是本地名）',
+    textOf(find(panelNow(), (n) => n.dataset?.name === 'search')).includes('mcp__demo__search'),
+    textOf(find(panelNow(), (n) => n.dataset?.name === 'search')),
+  )
+  check(
+    '每条工具带着自己那份 token 估算',
+    textOf(find(panelNow(), (n) => n.dataset?.name === 'create_issue')).includes('320'),
+    textOf(find(panelNow(), (n) => n.dataset?.name === 'create_issue')),
+  )
+
+  const toolSetsBefore = app.savedMcpToolSets.length
+  toolSwitch('delete_all').checked = true
+  toolSwitch('delete_all').fire('change')
+  await tick()
+  const toolSet = app.savedMcpToolSets.at(-1)
+  check('勾上一条发了 mcp/tools/set', app.savedMcpToolSets.length === toolSetsBefore + 1, JSON.stringify(app.savedMcpToolSets))
+  check(
+    '勾上最后一条之后全齐了，发的是 null（不设白名单）',
+    toolSet?.name === 'demo' && toolSet.tools === null,
+    JSON.stringify(toolSet),
+  )
+  check('行上的数跟着变，全接上就不带分母了', rowTextOf('demo').includes('工具 3') && !rowTextOf('demo').includes('/'), rowTextOf('demo'))
+  check('改完那块还开着（不该把人踢出去）', panelNow() !== null)
+
+  // 取消勾选走的是另一条路：名单是「剩下的那几条」，不能连没勾的一起发上去
+  toolSwitch('create_issue').checked = false
+  toolSwitch('create_issue').fire('change')
+  await tick()
+  check(
+    '取消勾选发的是剩下的那几条',
+    JSON.stringify(app.savedMcpToolSets.at(-1)?.tools) === '["search","delete_all"]',
+    JSON.stringify(app.savedMcpToolSets.at(-1)),
+  )
+
+  // 再全勾回去：这一下必须是 `null`（不要白名单），不是那串名字。名单是「挑过」的痕迹，
+  // 在配置里留一份的话，以后服务器新增了工具，用户还得回来手工勾第二个
+  toolSwitch('create_issue').checked = true
+  toolSwitch('create_issue').fire('change')
+  await tick()
+  check(
+    '全勾上发 null（不设白名单），不是那一串名字',
+    app.savedMcpToolSets.at(-1)?.tools === null,
+    JSON.stringify(app.savedMcpToolSets.at(-1)),
+  )
+
+  find(rowOfMcp('demo'), (n) => n.dataset?.role === 'mcp-tools-open').click()
+  await tick()
+  // `find` 找不到时给的是 `null`（不是 `undefined`），别写成 `=== undefined` —— 那样这条
+  // 永远绿，塌不塌都看不出来
+  check('再点一下收起来', panelNow() === null)
+
   // ---- 技能页：新增表单 + 两步删除
   app.el('nav-skills').click()
   await tick()
@@ -4319,6 +4641,77 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   )
   check('删掉的那个从列表里消失了', skillRowOf('weekly-report') === null)
   check('技能数跟着退回去', app.el('badge-skills').textContent === '1', app.el('badge-skills').textContent)
+
+  // ---- 技能页：逐技能开关
+  //
+  // 关掉只是**不进提示词**，`SKILL.md` 一个字节都不动。要验三件事：拨过去发的是「关掉」那
+  // 一侧（发反了界面看着照样对，磁盘上却反着来）、关掉的行挪进折叠区、页脚的账跟着变
+  const rowsIn = (node) => findAll(node, (n) => n.className === 'skill-row').map((r) => r.dataset.name)
+  const switchOf = (name) => find(skillRowOf(name), (n) => n.dataset?.role === 'skill-switch')
+  // 主列表永远是第一个 `.set-rows`（折叠区排在它后面），空列表也占着这个位置
+  const rowsInMain = () => rowsIn(find(skillBody, (n) => n.className === 'set-rows'))
+
+  check('开着的技能排在主列表里', rowsInMain().join(',') === 'demo', rowsInMain().join(','))
+  check('开关是勾上的', switchOf('demo')?.checked === true, String(switchOf('demo')?.checked))
+
+  const offBox = find(skillBody, (n) => n.className === 'skill-off')
+  const offSummary = offBox === undefined ? '' : (find(offBox, (n) => n.className === 'skill-off-summary')?.textContent ?? '')
+  check(
+    '关掉的那条折进「已关掉」，摘要带着个数',
+    offSummary === '已关掉 1 个' && rowsIn(offBox).join(',') === 'heavy',
+    `${offSummary} / ${offBox === undefined ? '(没有这一块)' : rowsIn(offBox).join(',')}`,
+  )
+  check(
+    '折叠区里也留着开关，否则关掉就再也开不回来',
+    find(offBox, (n) => n.dataset?.role === 'skill-switch') !== undefined,
+  )
+  check(
+    '默认写到全局那份（配一次到处能用）',
+    ctlIn(skillBody, '开关写到哪一份配置').value === 'global',
+    ctlIn(skillBody, '开关写到哪一份配置').value,
+  )
+  check('页脚先讲清了这份索引值多少', textOf(skillBody).includes('2 个里开着 1 个'), textOf(skillBody))
+
+  // 换成写项目那份，验选择器真的通到了 payload 上 —— 选错文件同样是「看着成功了」
+  const scopeSelect = ctlIn(skillBody, '开关写到哪一份配置')
+  scopeSelect.value = 'project'
+  scopeSelect.fire('change')
+  await tick()
+
+  const disablesBefore = app.savedSkillDisables.length
+  switchOf('demo').checked = false
+  switchOf('demo').fire('change')
+  await tick()
+  const disablePayload = app.savedSkillDisables.at(-1)
+  check(
+    '拨开关发了 skill/set-disabled',
+    app.savedSkillDisables.length === disablesBefore + 1,
+    JSON.stringify(app.savedSkillDisables),
+  )
+  check(
+    '传的是「关掉」那一侧，没把开关值原样透传',
+    disablePayload?.disabled === true && disablePayload?.name === 'demo' && disablePayload?.cwd === 'C:/p',
+    JSON.stringify(disablePayload),
+  )
+  check('范围选择器跟着传下去', disablePayload?.scope === 'project', JSON.stringify(disablePayload))
+
+  check('关掉的行从主列表挪走了', rowsInMain().join(',') === '', rowsInMain().join(','))
+  const offNow = find(skillBody, (n) => n.className === 'skill-off')
+  check('两条都进了折叠区', rowsIn(offNow).join(',') === 'demo,heavy', rowsIn(offNow).join(','))
+  check('页脚的账跟着重算', textOf(skillBody).includes('2 个里开着 0 个'), textOf(skillBody))
+  check('徽标跟着掉到 0', app.el('badge-skills').textContent === '0', app.el('badge-skills').textContent)
+
+  // 再打开一次：折叠区里的那个开关就是唯一的回头路，它必须能发 disabled:false
+  switchOf('demo').checked = true
+  switchOf('demo').fire('change')
+  await tick()
+  check(
+    '再打开发的是 false，不是又发一遍「关掉」',
+    app.savedSkillDisables.at(-1)?.disabled === false,
+    JSON.stringify(app.savedSkillDisables.at(-1)),
+  )
+  check('打开后回到主列表', rowsInMain().join(',') === 'demo', rowsInMain().join(','))
+  check('徽标跟着回到 1', app.el('badge-skills').textContent === '1', app.el('badge-skills').textContent)
 
   // ---- 空态也得能新增
   //

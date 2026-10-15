@@ -17,8 +17,40 @@ export interface McpServerStatus {
   name: string
   transport: McpTransportKind
   state: McpServerState
+  /** **真正接进来的**条数（白名单里的那些）。没连上时是 0 */
   toolCount: number
+  /**
+   * 服务器上报的工具**总数**。和 `toolCount` 不等就说明白名单卡掉了一些 ——
+   * 界面上的「3/8」就是这两个数。
+   *
+   * 只数个数、不带明细：这一份是每轮刷新都要下发的，而工具明细（名字 + 说明 + schema）
+   * 走 `toolCatalog()` 按需取。
+   */
+  toolTotal: number
+  /**
+   * 状态行上那截话：`工具 3/8`（两个数不等才带分母）。**措辞在主进程里出** ——
+   * renderer 走 `app://` 协议 import 不到 `dist/`，两端各写一套早晚走散（同 `mcpCost.infoText`）。
+   */
+  toolLabel: string
   error?: string
+}
+
+/**
+ * 一台服务器上报的一条工具，给设置页那个白名单勾选框用。
+ *
+ * **只在用户展开某一行时才取**（`mcp/tools/get`）：工具明细比 `McpServerStatus` 大两个
+ * 数量级，塞进每轮刷新的 `ProjectInfo` 就是让每一轮都为它付一次序列化的钱。
+ */
+export interface McpToolInfo {
+  /** 服务器上报的原名 —— 写进配置 `tools` 数组的就是它，不是下面那个 */
+  name: string
+  /** clauda 里的名字（消毒 + 去重之后）。授权弹窗和 `/tools` 上看到的是它 */
+  localName: string
+  description: string
+  /** 这一条的 schema 每轮要付的 token 估算 */
+  tokens: number
+  /** 当前接进来了没有。没设白名单时全为 true */
+  allowed: boolean
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -35,8 +67,13 @@ const STDERR_TAIL = 400
  */
 export class McpManager {
   private readonly clients = new Map<string, Client>()
-  /** 按服务器名存状态，`/mcp` 运行期开关要能就地改 */
-  private readonly statuses = new Map<string, McpServerStatus>()
+  /**
+   * 按服务器名存状态，`/mcp` 运行期开关要能就地改。
+   *
+   * 存的这一份**不带 `toolLabel`** —— 那句话是从两个数现算的，存下来就有第二个真相。
+   * 对外只经 `status()`，它在出口处补上。
+   */
+  private readonly statuses = new Map<string, Omit<McpServerStatus, 'toolLabel'>>()
   /** 每个服务器拉到的工具，关掉再打开时不用重新 listTools */
   private readonly perServer = new Map<string, Tool[]>()
   /** 用户用 `/mcp off` 关掉的服务器 —— 和配置里的 `enabled:false` 是两码事，别合并 */
@@ -66,7 +103,7 @@ export class McpManager {
     const enabled: Array<[string, McpServerConfig]> = []
     for (const [name, cfg] of Object.entries(this.config)) {
       if (cfg.enabled === false) {
-        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0 })
+        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0, toolTotal: 0 })
         continue
       }
       enabled.push([name, cfg])
@@ -89,10 +126,11 @@ export class McpManager {
           transport: transportOf(cfg),
           state: 'connected',
           toolCount: r.value.tools.length,
+          toolTotal: r.value.tools.length,
         })
       } else {
         const error = describe(r.reason)
-        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, error })
+        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, toolTotal: 0, error })
         this.opts.view.warn(`MCP 服务器 ${name} 连接失败，已跳过：${error}`)
       }
     }
@@ -122,7 +160,7 @@ export class McpManager {
           // 断不掉就算了，工具已经从集合里摘走了
         }
       }
-      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0 })
+      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0, toolTotal: 0 })
       this.rebuildActive()
       return
     }
@@ -137,10 +175,11 @@ export class McpManager {
           transport: transportOf(cfg),
           state: 'connected',
           toolCount: tools.length,
+          toolTotal: tools.length,
         })
       } catch (e) {
         const error = describe(e)
-        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, error })
+        this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, toolTotal: 0, error })
         this.rebuildActive()
         throw new Error(error)
       }
@@ -163,7 +202,7 @@ export class McpManager {
     this.offByUser.delete(name)
 
     if (cfg.enabled === false) {
-      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0 })
+      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'disabled', toolCount: 0, toolTotal: 0 })
       this.rebuildActive()
       return
     }
@@ -176,6 +215,7 @@ export class McpManager {
         transport: transportOf(cfg),
         state: 'connected',
         toolCount: tools.length,
+        toolTotal: tools.length,
       })
     } catch (e) {
       // `connectOne` 失败时会把半开的连接还回去，但 pid / 超时是在 connect 成功之后
@@ -183,7 +223,7 @@ export class McpManager {
       this.pids.delete(name)
       this.timeouts.delete(name)
       const error = describe(e)
-      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, error })
+      this.statuses.set(name, { name, transport: transportOf(cfg), state: 'failed', toolCount: 0, toolTotal: 0, error })
       this.rebuildActive()
       throw new Error(error)
     }
@@ -221,6 +261,43 @@ export class McpManager {
     this.rebuildActive()
   }
 
+  /**
+   * 运行期改一台服务器的工具白名单（设置页每勾一个都走这里）。
+   *
+   * **不重连、不重新 listTools**：过滤发生在装配那一刻（见 `rebuildActive`），所以改完当场
+   * 生效。给 `undefined` 是「不设白名单」（全接），给空数组是「一个都不接」—— 后者是个能
+   * 表达的意思，两者不能混。
+   *
+   * 只动运行期这一份，落盘由调用方负责（顺序在调用方那边，见 `setMcpTools`）：写盘可能因为
+   * 配置文件不是合法 JSON 而抛，那种时候运行期也不该已经改了。
+   */
+  setTools(name: string, tools: string[] | undefined): void {
+    const cfg = this.config[name]
+    if (!cfg) throw new Error(`没有名为 "${name}" 的 MCP 服务器`)
+    cfg.tools = tools
+    this.rebuildActive()
+  }
+
+  /**
+   * 一台服务器上报过的全部工具，给设置页那个勾选框用。**没连上就是空数组**。
+   *
+   * 名字取 `source.tool`（服务器上的原名）而不是 `tool.name`：配置里写的、以及
+   * `allowed()` 比的是前者，后者是消毒去重之后的展示名。
+   */
+  toolCatalog(name: string): McpToolInfo[] {
+    const cfg = this.config[name]
+    const tools = this.perServer.get(name) ?? []
+    return tools.map((t) => ({
+      name: t.source?.kind === 'mcp' ? t.source.tool : t.name,
+      localName: t.name,
+      description: t.description,
+      // 单条各估各的：总和会比 `tokenHint()` 略小（少掉外层 `[]` 和逗号的几 token）。
+      // 这一列是用来**排序**「哪几个占地方」的，不是用来对账的。
+      tokens: estimateTokens(JSON.stringify(toolSpecs([t]))),
+      allowed: allowed(cfg, remoteNameOf(t)),
+    }))
+  }
+
   /** 接入的工具，交给 Agent 拼进工具集 */
   tools(): Tool[] {
     return this.active
@@ -228,7 +305,7 @@ export class McpManager {
 
   /** 供 `/mcp` 展示，顺序与配置里的书写顺序一致 */
   status(): McpServerStatus[] {
-    return [...this.statuses.values()]
+    return [...this.statuses.values()].map((s) => ({ ...s, toolLabel: toolCountLabel(s) }))
   }
 
   /**
@@ -311,7 +388,10 @@ export class McpManager {
         timeoutMs,
         `MCP 服务器 ${name} 响应 tools/list 超时`,
       )
-      const specs = (listed.tools ?? []).filter((t) => allowed(cfg, t.name))
+      // **不在这里按白名单过滤**：过滤挪到了 `rebuildActive()`（装配那一刻）。
+      // 在这里过滤的话，改一次白名单就得重连一次服务器才生效，而设置页上每勾一下都会改一次。
+      // 连带的性质是本地名字只跟着**整份清单**分配，勾一个工具不会让别的工具改名。
+      const specs = listed.tools ?? []
       // assign 按传入顺序返回，所以下标和 specs 一一对应
       const assigned = assignMcpToolNames(specs.map((t) => ({ server: name, tool: t.name })))
 
@@ -344,12 +424,23 @@ export class McpManager {
     }
   }
 
-  /** 工具集是 perServer 减掉用户关掉的那些，顺序沿用配置里的书写顺序 */
+  /**
+   * 工具集 = perServer 减掉用户关掉的服务器、再减掉白名单外的工具，顺序沿用配置里的书写顺序。
+   *
+   * 白名单是在**这里**过的，不是在连接时（见 `connectOne`）：装配是每轮都要走一遍的便宜事，
+   * 重连不是。改一次白名单因此是即时的，服务器没连上时改也照样算数。
+   *
+   * 顺带把状态行上的 `toolCount` 修成「真正接进来几条」—— 界面上的「3/8」和页脚那个
+   * token 数必须说的是同一件事，各存一份迟早对不上。
+   */
   private rebuildActive(): void {
     const out: Tool[] = []
     for (const [name, tools] of this.perServer) {
-      if (this.offByUser.has(name)) continue
-      out.push(...tools)
+      const status = this.statuses.get(name)
+      const cfg = this.config[name]
+      const use = this.offByUser.has(name) ? [] : tools.filter((t) => allowed(cfg, remoteNameOf(t)))
+      if (status && status.state === 'connected') status.toolCount = use.length
+      out.push(...use)
     }
     this.active = out
   }
@@ -395,8 +486,24 @@ function createTransport(cfg: McpServerConfig, kind: McpTransportKind) {
   })
 }
 
-function allowed(cfg: McpServerConfig, toolName: string): boolean {
-  return cfg.tools === undefined || cfg.tools.includes(toolName)
+/**
+ * 这条工具在白名单里没有。
+ *
+ * `tools` **没设**和**是空数组**是两件事：没设 = 全接，空数组 = 一个都不接。空数组不是
+ * 「没设」的简写，它是唯一能表达「这台先连着，但工具一个都别用」的写法。
+ */
+function allowed(cfg: McpServerConfig | undefined, toolName: string): boolean {
+  return cfg?.tools === undefined || cfg.tools.includes(toolName)
+}
+
+/** 工具在服务器上的**原名**。抹掉它的话白名单就只能比消毒后的名字，一改就叫不上了 */
+function remoteNameOf(t: Tool): string {
+  return t.source?.kind === 'mcp' ? t.source.tool : t.name
+}
+
+/** 状态行上那截话。两个数相等时不带分母 —— 「工具 8/8」是把同一个数说了两遍 */
+function toolCountLabel(s: { toolCount: number; toolTotal: number }): string {
+  return s.toolTotal > s.toolCount ? `工具 ${s.toolCount}/${s.toolTotal}` : `工具 ${s.toolCount}`
 }
 
 function describe(e: unknown): string {

@@ -42,7 +42,8 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
     restoreEnv(envBefore)
   }
 
-  const skills = SkillRegistry.discover(opts.cwd)
+  // 开关来自配置：被 `disabledSkills` 关掉的技能不进「## 可用技能」，`skill` 工具也载不进
+  const skills = SkillRegistry.discover(opts.cwd, config.disabledSkills)
   // 智能体和技能同构：打开项目时扫一次，之后 `refresh()` 原地重扫
   const agents = AgentRegistry.discover(opts.cwd)
   const mcp = new McpManager(config.mcpServers ?? {}, {
@@ -76,6 +77,10 @@ export async function createProjectRuntime(opts: ProjectRuntimeOptions): Promise
       // 而不是显示「已添加」却一个工具都没多
       addServer: (name, cfg) => mcp.addServer(name, cfg),
       removeServer: (name) => mcp.removeServer(name),
+      // 这两个是同步的：白名单的过滤发生在装配那一刻（`rebuildActive`），改完当场生效，
+      // 既不用重连也不用重新 listTools
+      setTools: (name, tools) => mcp.setTools(name, tools),
+      toolCatalog: (name) => mcp.toolCatalog(name),
       status: () => mcp.status(),
       tokenHint: () => mcp.tokenHint(),
       tools: () => mcp.tools(),

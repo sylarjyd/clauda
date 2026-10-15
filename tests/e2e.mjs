@@ -383,6 +383,43 @@ console.log('\n== MCP：stdio 接入、/mcp、/mcp off ==')
   fs.rmSync(home, { recursive: true, force: true })
 }
 
+// `tools` 是配置里早就有的字段，但一直是「手写才有、界面看不见」的状态。这一组盯的是
+// 它真能决定对话里有哪些工具：列表上那句 `工具 1/2` 不是装饰，被挡在外面的那个不该
+// 出现在 /tools 里。
+console.log('\n== MCP：tools 白名单 ==')
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clauda-mcp-wl-'))
+  const mock = { command: process.execPath, args: [path.join(PROJECT, 'tests', 'mock-mcp.mjs')] }
+  fs.writeFileSync(
+    path.join(home, 'config.json'),
+    JSON.stringify({
+      mcpServers: {
+        // 挑了一个：同一个服务器上的 `item.get` 该被挡在外面
+        picked: { ...mock, tools: ['echo'] },
+        // 空数组是「一个都不接」，和「没设白名单」是两种状态，别混成一种
+        bare: { ...mock, tools: [] },
+      },
+    }),
+    'utf8',
+  )
+
+  // 只拿 stdout 做判断：`已接入 MCP 服务器` 那类运行期提示走的是 stderr，
+  // 把两股流拼在一起的 `all` 里下标顺序没有意义
+  const { stdout } = await runClauda([...baseArgs], '/mcp\n/tools\n/exit\n', { CLAUDA_HOME: home })
+  check('/mcp 报出「接进来几个 / 总共几个」', stdout.includes('工具 1/2') && stdout.includes('工具 0/2'), stdout.slice(0, 900))
+  check('带分母的那几台在 /mcp 上有解释', stdout.includes('tools 白名单'), stdout.slice(0, 900))
+  check('/tools 只装了白名单挑中的那个', stdout.includes('mcp__picked__echo'), stdout)
+  check('白名单外的那个工具没装进来', !stdout.includes('mcp__picked__item_get'), stdout)
+  check('空数组那台一个工具都没接', !stdout.includes('mcp__bare__'), stdout)
+
+  // 白名单挂在**装配**上（不在 connect 上）：摘掉再装回来仍然要听它的。
+  // 这一轮里没有更早的 /tools，所以「stdout 里有没有」就够判了
+  const second = await runClauda([...baseArgs], '/mcp off picked\n/mcp on picked\n/tools\n/exit\n', { CLAUDA_HOME: home })
+  check('重新连上之后白名单照样管用', second.stdout.includes('mcp__picked__echo') && !second.stdout.includes('mcp__picked__item_get'), second.stdout.slice(0, 900))
+
+  fs.rmSync(home, { recursive: true, force: true })
+}
+
 // 服务器握手成功却在 tools/list 上装死，是真实存在的故障模式。没有超时的话
 // clauda 从这里就起不来了。用一个很短的 timeoutMs 验，别把 e2e 拖成十几秒。
 console.log('\n== MCP：tools/list 超时 ==')
@@ -887,6 +924,62 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
       JSON.stringify(d.projectInfoAfterSkillRemove?.info?.skills),
     )
 
+    // 技能开关：这一刻只剩 `house-style` 一个技能，关掉它之后 `skill` 工具**本身**也该
+    // 从集合里摘掉（零技能不挂那份 schema）。这条是「关到底真的省了」唯一看得见的证据
+    check(
+      '关掉技能只写选中的那份范围（这里是全局那份）',
+      d.skillDisable?.ok === true && (d.skillDisable.files ?? []).length === 1 && String(d.skillDisable.files[0]).includes('clauda-desk-home'),
+      JSON.stringify(d.skillDisable),
+    )
+    const disabledGlobal = JSON.parse(d.skillDisableFiles?.[0] ?? '{}')
+    const disabledProject = JSON.parse(d.skillDisableFiles?.[1] ?? '{}')
+    check(
+      '关掉的名字进了全局配置，项目那份一个字没动',
+      JSON.stringify(disabledGlobal.disabledSkills) === '["house-style"]' && disabledProject.disabledSkills === undefined,
+      JSON.stringify({ g: disabledGlobal.disabledSkills, p: disabledProject.disabledSkills }),
+    )
+    const skillOff = (d.projectInfoAfterSkillDisable?.info?.skills ?? []).find((s) => s.name === 'house-style')
+    check(
+      '快照里它还列着（技能页要能把关掉的再打开），但标着 disabled',
+      skillOff?.disabled === true,
+      JSON.stringify(skillOff),
+    )
+    check(
+      '关到最后一个之后 skill 工具当场从集合里消失',
+      !(d.stateAfterSkillDisable?.session?.tools ?? []).includes('skill'),
+      JSON.stringify(d.stateAfterSkillDisable?.session?.tools),
+    )
+    check('关掉不是删掉：SKILL.md 还在磁盘上', d.skillFileAfterDisable === true)
+    // 禁用名单在两份配置之间是**并集**（限制只该越合越紧），代价是「打开」必须两份都清 ——
+    // 合并之后看不出某一条来自哪份文件
+    check(
+      '再关一次（这回写项目那份）两份配置里就都有了',
+      d.skillDisableProject?.ok === true &&
+        (d.skillDisableProjectFiles ?? []).every((txt) => JSON.stringify(JSON.parse(String(txt)).disabledSkills) === '["house-style"]'),
+      JSON.stringify(d.skillDisableProjectFiles),
+    )
+    check(
+      '打开是两份一起清（少清一份就表现为「关得掉、开不回来」）',
+      d.skillEnable?.ok === true && (d.skillEnable.files ?? []).length === 2,
+      JSON.stringify(d.skillEnable),
+    )
+    check(
+      '两份配置里都不再有它（名单空了整个键就该删掉，不留一个 `[]`）',
+      (d.skillEnableFileContents ?? []).every((txt) => !String(txt).includes('disabledSkills')),
+      JSON.stringify(d.skillEnableFileContents).slice(0, 300),
+    )
+    check(
+      '打开之后 skill 工具回来了，快照里也不带 disabled',
+      (d.stateAfterSkillEnable?.session?.tools ?? []).includes('skill') &&
+        (d.projectInfoAfterSkillEnable?.info?.skills ?? []).find((s) => s.name === 'house-style')?.disabled === false,
+      JSON.stringify({ tools: d.stateAfterSkillEnable?.session?.tools }),
+    )
+    check(
+      '关一个不存在的技能会失败（否则配置里多一条永远不生效的记录）',
+      d.skillDisableMissing?.ok === false && String(d.skillDisableMissing.reason).includes('nope'),
+      JSON.stringify(d.skillDisableMissing),
+    )
+
     // MCP：真起一个子进程（tests/mock-mcp.mjs，两个工具）再删掉。状态是 connected、
     // 工具数是**真数出来**的 2 而不是回显配置 —— 这条才有资格叫「加完就能用」
     check('mcp/add 起来了那个子进程', d.mcpAdd?.ok === true, JSON.stringify(d.mcpAdd))
@@ -915,6 +1008,49 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
         d.configAfterMcpAdd.includes('${CLAUDA_API_KEY}') === true,
       JSON.stringify({ active: afterMcpAdd.activeProvider, provider: afterMcpAdd.provider }),
     )
+    // 工具白名单：明细按需取（`mcp/tools/get`），改完**当场**生效且不重连。
+    // 这条覆盖的是通道层的三个分支 —— 渲染层的桩没法替代它
+    check(
+      'mcp/tools/get 报出这台的全部工具和各自接没接',
+      d.mcpToolsGet?.ok === true &&
+        (d.mcpToolsGet.tools ?? []).length === 2 &&
+        (d.mcpToolsGet.tools ?? []).every((t) => t.allowed === true && typeof t.tokens === 'number'),
+      JSON.stringify(d.mcpToolsGet),
+    )
+    const afterMcpTools = d.configAfterMcpTools ? JSON.parse(d.configAfterMcpTools) : {}
+    check(
+      'mcp/tools/set 只往配置里加 tools 一个键（command/args 没被抹掉）',
+      d.mcpToolsSet?.ok === true &&
+        JSON.stringify(afterMcpTools.mcpServers?.['desk-mock']?.tools) === '["echo"]' &&
+        afterMcpTools.mcpServers?.['desk-mock']?.command === process.execPath,
+      JSON.stringify(afterMcpTools.mcpServers?.['desk-mock']),
+    )
+    const mcpAfterTools = (d.projectInfoAfterMcpTools?.info?.mcp ?? []).find((s) => s.name === 'desk-mock')
+    check(
+      '改完当场少一个工具，而且是「接进来 1 / 总共 2」',
+      mcpAfterTools?.state === 'connected' && mcpAfterTools.toolCount === 1 && mcpAfterTools.toolTotal === 2 && mcpAfterTools.toolLabel === '工具 1/2',
+      JSON.stringify(mcpAfterTools),
+    )
+    check(
+      '名字对不上时报「没找到写在哪份文件里」，不静默成功',
+      d.mcpToolsMissing?.ok === false && String(d.mcpToolsMissing.reason).includes('nope'),
+      JSON.stringify(d.mcpToolsMissing),
+    )
+    check(
+      'tools 不是数组也不是 null 时挡掉（一个字符串落进配置会把整份文件读废）',
+      d.mcpToolsBadShape?.ok === false && String(d.mcpToolsBadShape.reason).includes('tools'),
+      JSON.stringify(d.mcpToolsBadShape),
+    )
+    // 「清掉名单」删的是键，不是写一份空名单 —— 后者是**一个都不接**，正好相反
+    const afterClear = d.configAfterMcpToolsClear ? JSON.parse(d.configAfterMcpToolsClear) : {}
+    check(
+      'tools: null 是「不要白名单了」：键被删掉，服务器还留着',
+      d.mcpToolsClear?.ok === true &&
+        afterClear.mcpServers?.['desk-mock']?.command === process.execPath &&
+        !('tools' in (afterClear.mcpServers?.['desk-mock'] ?? {})),
+      JSON.stringify(afterClear.mcpServers?.['desk-mock']),
+    )
+
     // 连不上的服务器：`addServer` 抛，通道翻成 `{ok:false, reason}`。**不能**静默报成功 ——
     // 那是「界面说接上了、工具一个没多」那条老回归
     check(

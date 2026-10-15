@@ -105,9 +105,29 @@ const out = {
   skillGone: null,
   skillRemoveMissing: null,
   projectInfoAfterSkillRemove: null,
+  skillDisable: null,
+  skillDisableFiles: null,
+  projectInfoAfterSkillDisable: null,
+  stateAfterSkillDisable: null,
+  skillFileAfterDisable: null,
+  skillDisableProject: null,
+  skillDisableProjectFiles: null,
+  skillEnable: null,
+  skillEnableFileContents: null,
+  projectInfoAfterSkillEnable: null,
+  stateAfterSkillEnable: null,
+  skillDisableMissing: null,
   mcpAdd: null,
   configAfterMcpAdd: null,
   projectInfoAfterMcpAdd: null,
+  mcpToolsGet: null,
+  mcpToolsSet: null,
+  configAfterMcpTools: null,
+  projectInfoAfterMcpTools: null,
+  mcpToolsMissing: null,
+  mcpToolsBadShape: null,
+  mcpToolsClear: null,
+  configAfterMcpToolsClear: null,
   badMcp: null,
   configAfterBadMcp: null,
   mcpRemove: null,
@@ -215,12 +235,21 @@ try {
       }),
   })
 
+  /**
+   * 取一份**过完 IPC 的**快照。Electron 的 `ipcMain.handle` 会把返回值结构化克隆一份给
+   * renderer，这里 `app.handle` 是直接调用 —— 拿到的和主进程里是同一个对象，项目快照里的
+   * `skills` 干脆就是注册表自己那个数组。不克隆的话，后面「再把技能打开」会连前面存下的
+   * 快照一起改掉，断言看到的是**最终**状态：按中间状态写的会红（`disabled === true` 那一条
+   * 就是这么红的），按最终状态写的却可能因为**中间那一步压根没生效**而假绿。
+   */
+  const snapshot = async (channel, payload) => structuredClone(await app.handle(channel, payload))
+
   out.initialProjects = await app.handle('project/list')
 
   // **一个会话都没开**的时候就得能拿到设置页的快照。技能与 MCP 挂在项目运行时上，
   // 而配技能和 MCP 正是开第一个会话之前想做的事 —— 这条通道早先按 sessionId 取，
   // 那一刻三个页面只能显示「还没有打开的会话」
-  out.projectInfoNoSession = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoNoSession = await snapshot('project/info', { cwd: projectDir })
 
   // 同一项目开两个会话：顺带验证 project 是按 cwd 复用（引用计数）而不是各起一份
   const a = await app.handle('session/open', { cwd: projectDir })
@@ -242,13 +271,13 @@ try {
 
   // 右栏（待办 / 改动文件）和中栏顶栏（模型、模式、上下文条）靠这个刷新
   out.tools = {
-    a: await app.handle('session/state', { sessionId: a.session.id }),
-    b: await app.handle('session/state', { sessionId: b.session.id }),
+    a: await snapshot('session/state', { sessionId: a.session.id }),
+    b: await snapshot('session/state', { sessionId: b.session.id }),
   }
   out.opened = { a: a.session, b: b.session }
 
   // 设置页（模型 / 技能 / MCP）唯一的数据源。这条通道要是坏了，三个页面一起空白
-  out.projectInfo = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfo = await snapshot('project/info', { cwd: projectDir })
 
   // 故意用一个没配置过的名字：`McpManager.setEnabled` 会抛，channel 层必须翻成
   // `{ok:false, reason}`。这条通道早先是无条件 `{ok:true}` 的，界面显示「已接入」
@@ -271,7 +300,7 @@ try {
   // 从历史里重新打开：先关掉当前那个（同一个 id 不能同时开着两份），再接回来
   out.closed = await app.handle('session/close', { sessionId: a.session.id })
   out.resumed = await app.handle('session/resume', { cwd: projectDir, id: a.session.id })
-  out.resumedState = await app.handle('session/state', { sessionId: a.session.id })
+  out.resumedState = await snapshot('session/state', { sessionId: a.session.id })
 
   // 改「默认模型」：写回项目配置文件，并且只影响**之后**新建的会话。
   // 必须排在 `session/resume` 之后 —— 恢复会话走的是 `structuredClone(project.config)`，
@@ -338,13 +367,13 @@ try {
   out.addProfile = await app.handle('project/add-profile', { cwd: projectDir, vendorKey: 'deepseek' })
   out.configAfterAdd = fs.readFileSync(configFile, 'utf8')
   // 设置页读的就是这条：新那份得在列表里、且**不**是「当前使用」那一份
-  out.projectInfoAfterAdd = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterAdd = await snapshot('project/info', { cwd: projectDir })
 
   // 显式切过去 —— 这是唯一会换厂商的动作
   out.setVendor = await app.handle('project/set-active-provider', { cwd: projectDir, profileKey: 'deepseek' })
   out.configAfterVendor = fs.readFileSync(configFile, 'utf8')
   // 设置页读的就是这条：它回来的 `vendorKey` 必须与新地址一致，否则界面会显示旧厂商
-  out.projectInfoAfterVendor = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterVendor = await snapshot('project/info', { cwd: projectDir })
   const d = await app.handle('session/open', { cwd: projectDir })
   out.openedAfterVendor = d.ok ? d.session : null
   if (d.ok) out.sessionIds.push(d.session.id)
@@ -372,10 +401,10 @@ try {
   })
   // 断言盯的是**磁盘上的文件**：通道回一个路径不代表文件真写出来了
   out.skillFile = fs.existsSync(skillFile) ? fs.readFileSync(skillFile, 'utf8') : null
-  out.projectInfoAfterSkill = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterSkill = await snapshot('project/info', { cwd: projectDir })
   // 立刻生效那句得能验收：同一批会话的工具集与提示词都要跟上（`refreshProjectTools`），
   // 否则「对话里加完当场能用」是空话
-  out.stateAfterSkill = await app.handle('session/state', { sessionId: b.session.id })
+  out.stateAfterSkill = await snapshot('session/state', { sessionId: b.session.id })
 
   // 全局那份落在 CLAUDA_HOME 下，和项目那份是**两个根** —— 这条才证明 scope 真的分流了
   out.skillAddGlobal = await app.handle('skill/add', {
@@ -403,7 +432,47 @@ try {
   out.skillGone = !fs.existsSync(skillFile)
   // 删一个不存在的：得报「没有」，不能静默成功（界面上那行会留在原地）
   out.skillRemoveMissing = await app.handle('skill/remove', { cwd: projectDir, name: 'weekly-report' })
-  out.projectInfoAfterSkillRemove = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterSkillRemove = await snapshot('project/info', { cwd: projectDir })
+
+  // 技能开关：关掉之后**当场**从工具集里消失，`SKILL.md` 一个字节不动。
+  // 挑这个时刻验是因为此刻只剩 `house-style` 一个技能 —— 关掉它之后 `skill` 工具本身
+  // 也该从集合里摘掉（零技能不挂那份 schema），这是「关到底」唯一看得见的证据
+  const globalConfig = path.join(home, 'config.json')
+  out.skillDisable = await app.handle('skill/set-disabled', {
+    cwd: projectDir,
+    name: 'house-style',
+    disabled: true,
+    scope: 'global',
+  })
+  out.skillDisableFiles = [globalConfig, configFile].map((f) => fs.readFileSync(f, 'utf8'))
+  out.projectInfoAfterSkillDisable = await snapshot('project/info', { cwd: projectDir })
+  out.stateAfterSkillDisable = await snapshot('session/state', { sessionId: b.session.id })
+  out.skillFileAfterDisable = fs.existsSync(path.join(home, 'skills', 'house-style', 'SKILL.md'))
+  // 再关一次，这回落到**项目**那份上：禁用名单在两份配置之间是并集，所以两次之后
+  // 两份文件里都有这个名字 —— 下面「打开」那一下要能**两份一起清**，靠的就是这个前置状态
+  out.skillDisableProject = await app.handle('skill/set-disabled', {
+    cwd: projectDir,
+    name: 'house-style',
+    disabled: true,
+    scope: 'project',
+  })
+  out.skillDisableProjectFiles = [globalConfig, configFile].map((f) => fs.readFileSync(f, 'utf8'))
+  out.skillEnable = await app.handle('skill/set-disabled', {
+    cwd: projectDir,
+    name: 'house-style',
+    disabled: false,
+    scope: 'project',
+  })
+  out.skillEnableFileContents = [globalConfig, configFile].map((f) => fs.readFileSync(f, 'utf8'))
+  out.projectInfoAfterSkillEnable = await snapshot('project/info', { cwd: projectDir })
+  out.stateAfterSkillEnable = await snapshot('session/state', { sessionId: b.session.id })
+  // 名字不对：得抛。不认名字的话开关能关掉一个不存在的技能，配置里就多一条永不生效的记录
+  out.skillDisableMissing = await app.handle('skill/set-disabled', {
+    cwd: projectDir,
+    name: 'nope',
+    disabled: true,
+    scope: 'global',
+  })
 
   // MCP：真起一个子进程（`tests/mock-mcp.mjs`，两个工具），连上、看快照、再删掉。
   // 这条是「设置页加完就能用」唯一的证据 —— 状态是 `connected`、工具数是真数出来的
@@ -414,10 +483,25 @@ try {
     config: { command: process.execPath, args: [path.join(PROJECT, 'tests', 'mock-mcp.mjs')] },
   })
   out.configAfterMcpAdd = fs.readFileSync(configFile, 'utf8')
-  out.projectInfoAfterMcpAdd = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterMcpAdd = await snapshot('project/info', { cwd: projectDir })
 
   // 连不上的服务器：`addServer` 会抛，通道层翻成 `{ok:false, reason}`。配置**是**写下去了
   // （那是用户能在 MCP 页里删掉的状态），所以下面那条断言盯的是「项目里那几条一字未动」
+  // 工具白名单：同一台真服务器上验两条通道。`mcp/tools/set` 只该改配置里的 `tools`
+  // （`writeMcpServer` 是整条替换，用它会连 command/args 一起抹掉），而且**当场**换掉
+  // 这台接进来的工具 —— 快照里那句 `工具 1/2` 就是证据：分母还是 2，说明子进程没重连
+  out.mcpToolsGet = await app.handle('mcp/tools/get', { cwd: projectDir, name: 'desk-mock' })
+  out.mcpToolsSet = await app.handle('mcp/tools/set', { cwd: projectDir, name: 'desk-mock', tools: ['echo'] })
+  out.configAfterMcpTools = fs.readFileSync(configFile, 'utf8')
+  out.projectInfoAfterMcpTools = await snapshot('project/info', { cwd: projectDir })
+  // 名字对不上：得说「没找到写在哪份文件里」，而不是空手返回成功（界面会以为改上了）
+  out.mcpToolsMissing = await app.handle('mcp/tools/set', { cwd: projectDir, name: 'nope', tools: ['x'] })
+  // 形状不对：数组或 `null` 之外的都挡掉 —— 让一个字符串落进配置会把整份文件读废
+  out.mcpToolsBadShape = await app.handle('mcp/tools/set', { cwd: projectDir, name: 'desk-mock', tools: 'echo' })
+  // `null` 是「不要白名单了」（全接），界面全勾上发的就是它
+  out.mcpToolsClear = await app.handle('mcp/tools/set', { cwd: projectDir, name: 'desk-mock', tools: null })
+  out.configAfterMcpToolsClear = fs.readFileSync(configFile, 'utf8')
+
   out.badMcp = await app.handle('mcp/add', {
     cwd: projectDir,
     scope: 'project',
@@ -431,7 +515,7 @@ try {
 
   out.mcpRemove = await app.handle('mcp/remove', { cwd: projectDir, name: 'desk-mock' })
   out.configAfterMcpRemove = fs.readFileSync(configFile, 'utf8')
-  out.projectInfoAfterMcpRemove = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterMcpRemove = await snapshot('project/info', { cwd: projectDir })
   // 顺手把连不上的那条也删掉，好让最后那条「mcpServers 回到空」成立
   await app.handle('mcp/remove', { cwd: projectDir, name: 'bad-mock' })
 
@@ -466,7 +550,7 @@ try {
   out.agentGet = await app.handle('agent/get', { cwd: projectDir, name: 'code-review' })
   // 写智能体**不该动配置**：它落的是 AGENT.md，配置那几段（档案 / MCP / 权限）一个字都不许变
   out.configAfterAgentAdd = fs.readFileSync(configFile, 'utf8')
-  out.projectInfoAfterAgentAdd = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterAgentAdd = await snapshot('project/info', { cwd: projectDir })
 
   // 名字不合规当场拒掉，且磁盘上不留痕 —— 静默改名会让界面上的名字和目录名对不上。
   // 这同时是路径穿越（`../`）那道闸门在智能体这条路上的复验
@@ -481,7 +565,7 @@ try {
   // 标「本项目默认」：**只写 config.json 的一个键**，其余键一字未动、`${VAR}` 仍是占位符
   out.setDefaultAgent = await app.handle('project/set-default-agent', { cwd: projectDir, name: 'code-review' })
   out.configAfterDefaultAgent = fs.readFileSync(configFile, 'utf8')
-  out.projectInfoAfterDefaultAgent = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterDefaultAgent = await snapshot('project/info', { cwd: projectDir })
 
   // 开新会话。**主进程没有「没给名字就套默认」这条魔法** —— 「套默认」只发生在界面那一格
   // 下拉框的初始值里（渲染层总发一个具体值进来）。所以下面两条必须不一样：
@@ -515,7 +599,7 @@ try {
   out.agentDirGone = !fs.existsSync(path.dirname(agentFile))
   // 再 get 一次：**必须报「没有」而不是静默成功**（静默成功会让界面留着一个空表单）
   out.agentGetMissing = await app.handle('agent/get', { cwd: projectDir, name: 'code-review' })
-  out.projectInfoAfterAgentRemove = await app.handle('project/info', { cwd: projectDir })
+  out.projectInfoAfterAgentRemove = await snapshot('project/info', { cwd: projectDir })
   // 而先前那条绑过它的老会话照样能打开、提示词还是它那份 —— 配方冻在会话里，
   // 不依赖那个目录还在。这是「冻结」而不是「恢复时按名字重查」最直接的正面证据
   out.agentSessionAfterRemove = await app.handle('session/resume', {

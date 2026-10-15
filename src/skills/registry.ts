@@ -31,16 +31,21 @@ const MAX_DESCRIPTION = 200
 export class SkillRegistry {
   /** 扫描基准目录。**存下来**是为了 `refresh()` 能在原地重扫，见那里的注释 */
   private skills: SkillMeta[]
+  /** 被 `config.disabledSkills` 关掉的名字。**可变** —— 设置页那个开关要能当场改 */
+  private disabled: Set<string>
 
   private constructor(
     private readonly cwd: string,
+    disabled: Set<string>,
     skills: SkillMeta[],
   ) {
+    this.disabled = disabled
     this.skills = skills
+    this.mark()
   }
 
-  static discover(cwd: string): SkillRegistry {
-    return new SkillRegistry(cwd, scanAll(cwd))
+  static discover(cwd: string, disabled: string[] = []): SkillRegistry {
+    return new SkillRegistry(cwd, new Set(disabled), scanAll(cwd))
   }
 
   /**
@@ -54,13 +59,55 @@ export class SkillRegistry {
    */
   refresh(): void {
     this.skills = scanAll(this.cwd)
+    // 重扫换的是**新的一批对象**，标记不会自己跟过来
+    this.mark()
   }
 
+  /**
+   * 换一批「关掉的名字」。调用方负责落盘，这里只管当场生效 ——
+   * 设置页点一下开关要立刻看到它从名单里消失，等下次重开项目就太晚了。
+   */
+  setDisabled(names: string[]): void {
+    this.disabled = new Set(names)
+    this.mark()
+  }
+
+  /**
+   * 把 `disabled` 刷到名单上。`mark()` 是**唯一**的写入口：名单（`skills`）和开关
+   * （`disabled`）是两个可变状态，两边各自维护标记的话，`refresh()` 之后必然有一边忘了同步。
+   */
+  private mark(): void {
+    for (const s of this.skills) s.disabled = this.disabled.has(s.name)
+  }
+
+  /** **能用的**技能。提示词、`skill` 工具、斜杠命令、智能体白名单全都走这里 */
   list(): SkillMeta[] {
+    return this.skills.filter((s) => !s.disabled)
+  }
+
+  /**
+   * 磁盘上的**全部**技能，含被关掉的那些。只给设置页用 —— 它要能把关掉的再打开，
+   * 而 `list()` 里那些根本没有行可点。
+   *
+   * 别拿它去喂模型：那正是这个开关想减掉的东西。
+   */
+  listAll(): SkillMeta[] {
     return this.skills
   }
 
+  /**
+   * 按名字找**能用的**那个。关掉的技能在这里查不到 —— `skill` 工具和斜杠命令因此
+   * 会当它不存在，这正是「关掉」应有的效果。
+   */
   get(name: string): SkillMeta | undefined {
+    return this.skills.find((s) => s.name === name && !s.disabled)
+  }
+
+  /**
+   * 按名字找，**不管开没开**。只给删除路径用：关掉的技能也得删得掉，
+   * 而 `get()` 会把它当成不存在，于是「禁用之后再也删不了」——那是个死结。
+   */
+  find(name: string): SkillMeta | undefined {
     return this.skills.find((s) => s.name === name)
   }
 
@@ -188,6 +235,8 @@ function readMeta(file: string, dirName: string): SkillMeta | null {
     description: truncate(description, MAX_DESCRIPTION),
     dir: path.dirname(file),
     file,
+    // 扫出来的这一刻还不知道开关：`mark()` 随后会按 `disabled` 集合补上
+    disabled: false,
   }
 }
 

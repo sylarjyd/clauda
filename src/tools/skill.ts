@@ -150,7 +150,9 @@ export function makeSkillRemoveTool(skills: SkillRegistry): Tool<{
     summary: (a) => a?.name ?? '',
     async run(args) {
       const name = requireString(args as any, 'name')
-      const meta = skills.get(name)
+      // `find()` 而不是 `get()`：关掉的技能也要删得掉（`get()` 当它不存在）。名字是模型
+      // 从「可用技能」里取的，正常情况下取不到关掉的那个，但用户可以直接说「把那个禁用的删了」
+      const meta = skills.find(name)
       if (!meta) {
         const available = skills.list().map((s) => s.name)
         throw new Error(
