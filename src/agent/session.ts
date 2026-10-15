@@ -79,6 +79,21 @@ export function saveSession(cwd: string, rec: SessionRecord): string {
   return file
 }
 
+/**
+ * 删掉一个会话文件，返回被删掉的路径。
+ *
+ * **抛而不是返回 false**：`saveSession` 同一条取向 —— 返回一个「删好了」的路径却没删，
+ * 调用方（界面那个红按钮）没法知道，只会表现成「点了没反应」。id 非法照旧在
+ * `sessionFile` 挡下；文件不在（已经被删过、或 id 拼错）也抛，用户该看到原因。
+ */
+export function deleteSession(cwd: string, id: string): string {
+  const file = sessionFile(cwd, id)
+  if (!file) throw new Error(`非法会话 id：${id}`)
+  if (!fs.existsSync(file)) throw new Error(`找不到会话：${id}`)
+  fs.unlinkSync(file)
+  return file
+}
+
 export function loadSession(cwd: string, id: string): SessionRecord | null {
   const file = sessionFile(cwd, id)
   if (!file) return null

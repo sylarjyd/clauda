@@ -133,8 +133,8 @@ select:focus {
 .app {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr) 280px;
-  /* 第二行是通知栏，空的时候塌成 0 高。它通栏，所以三个主列都钉在第 1 行 */
-  grid-template-rows: minmax(0, 1fr) auto;
+  /* 一行，三列各占一格。原先底下还有一行通栏通知栏，去掉了 */
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -433,6 +433,8 @@ button.new-session:hover:not(:disabled) {
   background: transparent;
   border: 1px solid transparent;
   text-align: left;
+  /* 这一行是 `<div role="button">`（行里还有个删除按钮，按钮不能再套按钮） */
+  cursor: pointer;
 }
 
 .session-row:hover {
@@ -463,6 +465,39 @@ button.new-session:hover:not(:disabled) {
   font-variant-numeric: tabular-nums;
 }
 
+/* 会话行尾那个删除。平时只是淡色小 ×，悬停整行时才变红 —— 侧边栏本来就窄，
+   常驻一个显眼的红按钮会把标题挤掉。用中文「删除」放不下，也没必要 */
+.session-del {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  line-height: 1;
+  font-size: 14px;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.session-del:hover {
+  color: var(--danger);
+  border-color: var(--line-strong);
+}
+
+/* 确认那一对（第二下才是删除）。挤在窄行里，压得比别处的确认按钮小一号 */
+.session-del-confirm {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.session-del-confirm button {
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
 /* 状态点：空闲 / 运行中 / 等待授权。等授权是呼吸的，切走窗口也能一眼看见 */
 .dot {
   flex: none;
@@ -486,42 +521,6 @@ button.new-session:hover:not(:disabled) {
   50% {
     opacity: 0.25;
   }
-}
-
-/*
- * 网格第二行的通栏状态条。早先它是侧栏底部的一条内嵌条，但设置视图下侧栏被摘掉，
- * 通知就跟着没了 —— 而「MCP 开关拨不动」的报错正是在设置页上发出来的。
- *
- * 做成通栏而不是浮层：通知不自动消失、也没有关闭按钮（见 state.js 的 app-notice），
- * 浮层会一直盖着底下的内容，而输入框恰好也在底部。占一行就不重叠。
- * 空的时候 display:none，这一行跟着塌成 0 高。
- */
-.notices {
-  grid-row: 2;
-  grid-column: 1 / -1;
-  padding: 6px 12px;
-  max-height: 120px;
-  overflow-y: auto;
-  border-top: 1px solid var(--line);
-  background: var(--bg-raise);
-}
-
-.notices:empty {
-  display: none;
-}
-
-.notice-line {
-  color: var(--text-dim);
-  font-size: 12px;
-  padding: 2px 0;
-}
-
-.notice-line.warn {
-  color: var(--warn);
-}
-
-.notice-line.error {
-  color: var(--danger);
 }
 
 /* ---------------------------------------------------------------- 中栏 */

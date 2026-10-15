@@ -18,7 +18,7 @@ const IDS = [
   'rail', 'browse',
   'badge-agents', 'badge-sessions', 'badge-model', 'badge-skills', 'badge-mcp',
   'view-sessions', 'view-settings', 'settings-title', 'settings-sub', 'settings-body',
-  'new-session', 'new-session-agent', 'pick-project', 'project-path', 'session-list', 'notices',
+  'new-session', 'new-session-agent', 'pick-project', 'project-path', 'session-list',
   'chat-title', 'chat-agent',
   'model-input', 'mode-select', 'context-fill', 'stream', 'empty-questions',
   'composer', 'input', 'abort',
@@ -112,6 +112,17 @@ class El {
 }
 
 /**
+ * 每次 `bootRenderer()` 给 app.js 的 import 换一个 query，逼 Node 重新求值那份模块。
+ *
+ * **why**：ESM 的 import 是按 URL 缓存的。`app.js` 在模块顶层就跑 `boot()` 并把
+ * `els` / `state` / `cwd` 这些钉在**第一次**那份 `globalThis.document` 上，所以第二次
+ * `bootRenderer()` 若命中缓存，整套界面还连着**上一份**假 DOM，新 `byId` 一个 children
+ * 都拿不到（症状：`session-list.children[0]` 是 undefined）。带上 `?v=n` 就各跑各的，
+ * 每个用例块都能从干净的一页开始。
+ */
+let bootCount = 0
+
+/**
  * 装上假 DOM 并 import `app.js`。**必须在 import 之前调** —— app.js 在模块顶层就跑
  * `boot()`，晚了就是一堆 `document is not defined`。
  *
@@ -165,6 +176,8 @@ export async function bootRenderer() {
   const savedAgentAdds = []
   const savedAgentRemovals = []
   const savedAgentDefaults = []
+  /** `session/delete` 的每一份 payload。断言「删的是不是这一条、cwd 带对没有」只能看它 */
+  const savedSessionDeletes = []
   /**
    * 让用例把 `skill/add` / `mcp/add` 弄成失败。默认是空的（写盘成功）。
    * `mcp.fail` 是**每台服务器**的失败原因（`mcp/set-enabled` 那条既有分支在用），
@@ -173,6 +186,8 @@ export async function bootRenderer() {
   const skillBehavior = { fail: null }
   const mcpAddBehavior = { fail: null }
   const agentBehavior = { fail: null }
+  /** 让用例把 `session/delete` 弄成失败，验「失败要报出来、别假装删掉了」 */
+  const sessionDeleteBehavior = { fail: null }
   /**
    * 智能体的**磁盘真相**。`project/info` 那份是从这里折出六个字段的，正文与配置明细
    * 只有 `agent/get` 才给 —— 桩要是把它们也塞进 `projectInfo.agents`，就永远测不出
@@ -427,6 +442,14 @@ export async function bootRenderer() {
           return { ok: true, session }
         }
         if (channel === 'session/state') return { ok: true, session: opened.get(payload.sessionId) }
+        // 删除会话。**显式写**，否则会落到兜底的 `{ok:true}` 上 —— 那样「删了但没删
+        // 对一条」也会被判成功。桩照真后端的行为把那条会话从内存里抹掉
+        if (channel === 'session/delete') {
+          savedSessionDeletes.push(payload)
+          if (sessionDeleteBehavior.fail) return { ok: false, reason: sessionDeleteBehavior.fail }
+          opened.delete(payload.id)
+          return { ok: true, file: `C:/p/.clauda/projects/p/sessions/${payload.id}.json` }
+        }
         if (channel === 'session/send') {
           sent.push(payload)
           if (sendBehavior.fail) return { ok: false, reason: sendBehavior.fail }
@@ -691,7 +714,7 @@ export async function bootRenderer() {
     }
   }
 
-  await import(new URL('../desktop/renderer/app.js', import.meta.url).href)
+  await import(new URL(`../desktop/renderer/app.js?v=${++bootCount}`, import.meta.url).href)
   await tick()
 
   return {
@@ -717,9 +740,11 @@ export async function bootRenderer() {
     savedAgentAdds,
     savedAgentRemovals,
     savedAgentDefaults,
+    savedSessionDeletes,
     skillBehavior,
     mcpAddBehavior,
     agentBehavior,
+    sessionDeleteBehavior,
     vendors: VENDORS,
     projectInfo,
     /** 智能体的磁盘真相（`agent/get` 给的就是这里的一份）。用例可以直接改它 */

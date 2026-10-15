@@ -607,6 +607,19 @@ try {
     id: out.openWithAgent.session.id,
   })
 
+  // 删除会话：文件从 home 下真的没了，历史列表里也不再出现。
+  // 拿这条下手最省事 —— 上面 `agentSessionOnDisk` 已经证实它落过盘，此刻又正开着，
+  // 顺带验了「删除前先把活会话关掉」。穿越 id 跟 `session/resume` 一样要被挡在边界上
+  const delId = out.openWithAgent.session.id
+  const delFile = path.join(home, 'projects', slug, `${delId}.json`)
+  out.deleteId = delId
+  out.deleteBeforeExists = fs.existsSync(delFile)
+  out.deleteRes = await app.handle('session/delete', { cwd: projectDir, id: delId })
+  out.deleteFileGone = !fs.existsSync(delFile)
+  out.deleteList = await app.handle('session/list', { cwd: projectDir })
+  out.badDelete = await app.handle('session/delete', { cwd: projectDir, id: '../../被穿越出来的' })
+  out.badDeleteStray = [path.join(home, '被穿越出来的.json')].filter((f) => fs.existsSync(f))
+
   const tQuit = Date.now()
   await app.handle('app/quit')
   out.quitMs = Date.now() - tQuit

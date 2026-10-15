@@ -54,7 +54,6 @@ const els = {
   pickProject: document.getElementById('pick-project'),
   projectPath: document.getElementById('project-path'),
   sessionList: document.getElementById('session-list'),
-  notices: document.getElementById('notices'),
   chatTitle: document.getElementById('chat-title'),
   chatAgent: document.getElementById('chat-agent'),
   modelInput: document.getElementById('model-input'),
@@ -133,8 +132,15 @@ function activeSession() {
   return state.activeId ? state.sessions[state.activeId] : null
 }
 
+/**
+ * 一条界面提示。**底部那条通知栏已经去掉了**（用户要求），提示改打控制台 ——
+ * 不静默吞掉，调试时（DevTools / CDP）还看得到，只是不再占窗口底部那一行。
+ */
 function notice(level, text) {
-  dispatch({ type: 'app-notice', level, text })
+  const line = `[clauda] ${text}`
+  if (level === 'error') console.error(line)
+  else if (level === 'warn') console.warn(line)
+  else console.log(line)
 }
 
 // ------------------------------------------------------------------ 数据同步
@@ -248,10 +254,9 @@ async function openHistory(id) {
  * IPC 事件入口。
  *
  * **这里不接项目级诊断。** MCP 连不上之类的消息由主进程的 `onWarn` 直接打控制台
- * （`desktop/main.js`），从不往窗口推 —— 底部那条通知栏只放「你刚做了什么」，
- * 掺进子进程的原始报错就是刷屏。失败本身在「工具」页上看得见。
+ * （`desktop/main.js`），从不往窗口推。失败本身在「工具」页上看得见。
  *
- * 通知栏里那些成功/失败提示走的是另一条路：渲染层自己的 `notice()`。
+ * 渲染层自己那些成功/失败提示走的是 `notice()`，现在也只打控制台（底部通知栏已去掉）。
  */
 function applyEvent(sessionId, event) {
   dispatch({ ...event, sessionId })
@@ -276,7 +281,6 @@ function render() {
   renderEmptyQuestions()
   renderPanel()
   renderModal()
-  renderNotices()
 }
 
 /**
@@ -395,6 +399,12 @@ let pendingSkillRemove = null
 let pendingMcpRemove = null
 
 /**
+ * 正在等第二次确认的会话删除（存会话 id）。「进行中」和「历史会话」两组各一行一个 ×，
+ * 两步确认是为了让不可逆的动作慢一格 —— 和技能 / MCP 那两处同一条理由。
+ */
+let pendingSessionRemove = null
+
+/**
  * 技能页那一列开关**写到哪个范围**（`global` = `~/.clauda/config.json`，`project` = 本项目）。
  *
  * 做成一个页面级的选择而不是每行一个下拉：一行里再塞第二个控件，一屏一百行会糊成一片，
@@ -439,6 +449,8 @@ function resetSettingsForms() {
   pendingSkillRemove = null
   pendingMcpRemove = null
   pendingAgentRemove = null
+  // 待确认的会话删除也归位：它指向的是上一个项目里的会话
+  pendingSessionRemove = null
   // 展开的那份明细属于**上一个项目的那台服务器**，留着会拿 A 项目的工具清单去改 B 项目
   mcpToolPanel = null
   // 这个选择指向**具体的一份配置文件**，换项目之后留着「本项目」会让人以为开关还落在
@@ -2330,22 +2342,29 @@ function group(label, rows) {
 }
 
 function sessionRow(session) {
-  const row = document.createElement('button')
-  row.type = 'button'
+  const row = document.createElement('div')
   row.className = `session-row${session.id === state.activeId ? ' active' : ''}`
+  // 整行可点 = 打开这条会话。**不能再用 `<button>` 了**：行里现在还有一个删除按钮，
+  // 按钮套按钮是非法的，内层那个点不动。改成带 role 的 div，键盘照样能开
+  row.setAttribute('role', 'button')
+  row.setAttribute('tabindex', '0')
+
+  const first = session.items.find((i) => i.kind === 'user')
+  const title = first ? first.text.slice(0, 48) : '新会话'
 
   const text = document.createElement('span')
   text.className = 'session-title'
-  const first = session.items.find((i) => i.kind === 'user')
-  text.textContent = first ? first.text.slice(0, 48) : '新会话'
+  text.textContent = title
 
   const dot = document.createElement('span')
   // 等授权时侧边栏要能看出来，否则用户切到别的会话就再也想不起这件事了
   dot.className = `dot ${session.pending ? 'waiting' : session.status}`
   dot.title = session.pending ? '等待授权' : session.status === 'running' ? '运行中' : '空闲'
 
-  row.append(text, dot)
-  row.addEventListener('click', () => {
+  // 删除按钮**只能往后追加**：`children[0]/[1]` 是标题和状态点，这个顺序是测试钉住的契约
+  row.append(text, dot, sessionDelete(session.id, session.cwd || cwd, title))
+
+  const open = () => {
     showSessions()
     dispatch({ type: 'select', id: session.id })
     // 设置页看的是**项目**。点开另一个项目里的会话时，当前目录与项目信息一起跟过去 ——
@@ -2355,23 +2374,100 @@ function sessionRow(session) {
       void refreshHistory(cwd)
       void refreshProjectInfo()
     }
+  }
+  row.addEventListener('click', open)
+  row.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return
+    e.preventDefault?.()
+    open()
   })
   return row
 }
 
 function historyRow(summary) {
-  const row = document.createElement('button')
-  row.type = 'button'
+  const row = document.createElement('div')
   row.className = 'session-row history'
+  row.setAttribute('role', 'button')
+  row.setAttribute('tabindex', '0')
   const text = document.createElement('span')
   text.className = 'session-title'
   text.textContent = summary.title
   const time = document.createElement('span')
   time.className = 'session-time'
   time.textContent = String(summary.updatedAt ?? '').slice(5, 16).replace('T', ' ')
-  row.append(text, time)
-  row.addEventListener('click', () => void openHistory(summary.id))
+  row.append(text, time, sessionDelete(summary.id, summary.cwd || cwd, summary.title))
+  const open = () => void openHistory(summary.id)
+  row.addEventListener('click', open)
+  row.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return
+    e.preventDefault?.()
+    open()
+  })
   return row
+}
+
+/**
+ * 会话行尾那个删除。两步确认：第一下把 `×` 换成一问一答，第二下才真删。
+ *
+ * **确认那一对要挡住冒泡**：会话行整行可点，这个按钮就在行里面，不挡的话点「删」会
+ * 顺带把这条会话点开 —— 那一开正好发生在删掉之后，很乱。
+ */
+function sessionDelete(id, targetCwd, label) {
+  if (pendingSessionRemove !== id) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'session-del'
+    button.textContent = '×'
+    button.title = `删除「${label}」`
+    button.setAttribute('aria-label', `删除 ${label}`)
+    button.addEventListener('click', (e) => {
+      e?.stopPropagation?.()
+      pendingSessionRemove = id
+      render()
+    })
+    return button
+  }
+
+  const box = document.createElement('span')
+  box.className = 'session-del-confirm'
+  box.addEventListener('click', (e) => e?.stopPropagation?.())
+
+  const yes = document.createElement('button')
+  yes.type = 'button'
+  yes.className = 'danger'
+  yes.textContent = '删'
+  yes.title = `确认删除「${label}」`
+  yes.addEventListener('click', () => void removeSession(id, targetCwd))
+
+  const no = document.createElement('button')
+  no.type = 'button'
+  no.className = 'ghost'
+  no.textContent = '取消'
+  no.addEventListener('click', () => {
+    pendingSessionRemove = null
+    render()
+  })
+
+  box.append(yes, no)
+  return box
+}
+
+/**
+ * 真删。**先按会话自己的 cwd 删**（那一条可能属于别的项目），成功后再按左栏当下显示的
+ * 项目重拉历史 —— 删的正好是当前会话时，中栏也要跟着回落到别的会话或空态。
+ */
+async function removeSession(id, targetCwd) {
+  const res = await invoke('session/delete', { cwd: targetCwd, id })
+  pendingSessionRemove = null
+  if (!res.ok) {
+    notice('error', `没能删掉会话：${res.reason}`)
+    render()
+    return
+  }
+  dispatch({ type: 'session-removed', id })
+  await refreshHistory(cwd)
+  const session = activeSession()
+  if (session) await refreshSession(session.id)
 }
 
 /**
@@ -2740,17 +2836,6 @@ function listItem(text, className) {
   li.className = className
   li.textContent = text
   return li
-}
-
-function renderNotices() {
-  els.notices.replaceChildren(
-    ...state.notices.slice(-4).map((n) => {
-      const div = document.createElement('div')
-      div.className = `notice-line ${n.level}`
-      div.textContent = n.text
-      return div
-    }),
-  )
 }
 
 /**

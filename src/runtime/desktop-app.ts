@@ -109,6 +109,20 @@ export class DesktopApp {
           await this.manager.closeSession(str(payload, 'sessionId'))
           return { ok: true }
 
+        /**
+         * 从侧边栏删掉一个会话（「进行中」和「历史会话」两组共用这一条）。
+         *
+         * 拦一道 id 形状的理由同 `session/resume`：它会一路流到 `deleteSession` 拼出的
+         * 那个路径上，挡的不是「读错文件」而是「删错文件」。
+         */
+        case 'session/delete': {
+          const cwd = str(payload, 'cwd')
+          const id = str(payload, 'id')
+          if (!cwd || !id) return { ok: false, reason: 'session/delete 需要 cwd 和 id' }
+          if (!isSafeSessionId(id)) return { ok: false, reason: `非法会话 id：${id}` }
+          return { ok: true, file: await this.manager.deleteSession(cwd, id) }
+        }
+
         case 'session/set-model':
           return withSession(this.manager, payload, (session) => {
             this.manager.setModel(session.id, str(payload, 'model'))

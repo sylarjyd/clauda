@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { Agent, type AgentOptions, type SessionSnapshot, type TurnOutcome } from '../agent/agent.js'
+import { deleteSession as deleteSessionFile } from '../agent/session.js'
 import { agentProfileProblem, applyAgentToConfig, scopedSkills, toSpec } from '../agents/apply.js'
 import type { AgentInfo, AgentMeta, AgentSpec, HasSkills, HasTools, ResolvedAgent } from '../agents/types.js'
 import { removeAgent as removeAgentDir, writeAgent, type WriteAgentInput } from '../agents/writer.js'
@@ -964,6 +965,18 @@ export class SessionManager {
     this.sessions.delete(sessionId)
     this.marks.delete(sessionId)
     await this.releaseProject(session.cwd)
+  }
+
+  /**
+   * 删掉一个会话：**先关再删**。
+   *
+   * 顺序不能反 —— 会话还挂在 `this.sessions` 里的话，它下一次跑完一轮又会
+   * `persistSession` 把文件写回来，表现成「删了又回来了」。`closeSession` 顺手结清
+   * 待决授权、释放项目引用，删文件只是最后一步。返回被删掉的路径。
+   */
+  async deleteSession(cwd: string, id: string): Promise<string> {
+    if (this.getSession(id)) await this.closeSession(id)
+    return deleteSessionFile(cwd, id)
   }
 
   async disposeAll(): Promise<void> {

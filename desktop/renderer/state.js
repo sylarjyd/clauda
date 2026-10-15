@@ -9,9 +9,6 @@
  * 在界面上是三种不同的东西，硬塞进同一种结构的话渲染层还得再判一次类型。
  */
 
-/** 通知栏上限。它只会被读最近几条，不封顶的话开一整天窗口能攒出几万条 */
-const MAX_NOTICES = 50
-
 /**
  * 待发附件上限。和主进程 `src/runtime/attachment.ts` 的 `MAX_ATTACHMENTS` 是同一个数，
  * 但**只能各写一份** —— renderer 走 `app://` 拿不到 `dist/`，那边也有同样的手抄
@@ -47,8 +44,6 @@ export function createState() {
     /** 侧边栏的展示顺序。`sessions` 是对象，顺序只能另外存 */
     order: [],
     activeId: null,
-    /** 项目级通知（MCP 连不上之类）。它们不属于任何会话，只能挂在这一层 */
-    notices: [],
     /** 打开过多少次会话。只用来给 `openSeq` 发号，不参与任何判断 */
     opens: 0,
     /** 左导航选中的视图，见 `VIEWS` */
@@ -127,6 +122,8 @@ export function reduce(state, action) {
       // 配置 / 技能 / MCP 一个字都不会变。清掉只会让设置页闪一下空态。
       // 真换了项目（点开另一个项目里的会话）由 app.js 那边跟着换 cwd 并重拉
       return { ...state, activeId: action.id }
+    case 'session-removed':
+      return removeSession(state, action.id)
     case 'session-opened':
       return openSession(state, action.session)
     case 'view':
@@ -139,8 +136,6 @@ export function reduce(state, action) {
       return { ...state, attachments: state.attachments.filter((_, i) => i !== action.index) }
     case 'clear-attachments':
       return { ...state, attachments: [] }
-    case 'app-notice':
-      return { ...state, notices: [...state.notices, { level: action.level, text: action.text }].slice(-MAX_NOTICES) }
     default:
       return routeToSession(state, action)
   }
@@ -161,6 +156,23 @@ function openSession(state, info) {
     // 同理 `select`：新会话是另一个项目（或至少是一份新的运行时），旧的项目信息作废
     project: null,
   }
+}
+
+/**
+ * 删掉一个会话（侧边栏每行那个红按钮）。它可能是开着的（「进行中」那组），
+ * 也可能只是历史文件（「历史会话」那组）—— 后者不在 `sessions` / `order` 里，
+ * 删它时就只是把 `order` 过滤一遍（大概率没变），历史列表由调用方重拉。
+ *
+ * 删的正好是当前会话时，落回列表里最后一条还开着的；一条都没了就空态。**不能把
+ * `activeId` 留在已删的 id 上** —— 那样中栏会一直画着一条不存在的会话。
+ */
+function removeSession(state, id) {
+  if (!state.sessions[id] && !state.order.includes(id)) return state
+  const sessions = { ...state.sessions }
+  delete sessions[id]
+  const order = state.order.filter((x) => x !== id)
+  const activeId = state.activeId === id ? (order[order.length - 1] ?? null) : state.activeId
+  return { ...state, sessions, order, activeId }
 }
 
 /**

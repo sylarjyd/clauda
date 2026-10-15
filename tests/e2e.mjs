@@ -717,6 +717,27 @@ console.log('\n== 桌面端：多会话并行 + 授权往返 + 退出 ==')
       JSON.stringify(d.history?.sessions?.[0]),
     )
 
+    // 删除会话：文件从 home 下真的没了、历史列表里也不再出现。
+    // 删的那条此刻正开着 —— 主进程得先关掉活会话再删
+    check(
+      '删除会话：删之前那条确实在磁盘上',
+      d.deleteBeforeExists === true,
+      JSON.stringify({ id: d.deleteId, before: d.deleteBeforeExists }),
+    )
+    check('删除会话：通道报成功', d.deleteRes?.ok === true, JSON.stringify(d.deleteRes))
+    check(
+      '删除会话：文件从磁盘上真的没了',
+      d.deleteFileGone === true,
+      JSON.stringify({ id: d.deleteId, gone: d.deleteFileGone }),
+    )
+    check(
+      '删除会话：历史列表里不再出现它',
+      d.deleteList?.ok === true && d.deleteList.sessions.every((s) => s.id !== d.deleteId),
+      JSON.stringify(d.deleteList?.sessions?.map((s) => s.id)),
+    )
+    check('删除会话：穿越 id 被挡在边界上', d.badDelete?.ok === false, JSON.stringify(d.badDelete))
+    check('删除会话：穿越没在 home 下留下痕迹', (d.badDeleteStray ?? []).length === 0, JSON.stringify(d.badDeleteStray))
+
     const restored = d.resumed?.messages ?? []
     check('能按 id 从历史里恢复会话', d.resumed?.ok === true && d.resumed.session.id === d.sessionIds[0], JSON.stringify(d.resumed?.reason))
     check(

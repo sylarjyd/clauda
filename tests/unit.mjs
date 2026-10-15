@@ -3595,15 +3595,18 @@ console.log('\n== 桌面端渲染层：消息流归约 ==')
     `${reopened.sessions.s1.openSeq} vs ${st.sessions.s1.openSeq}`,
   )
 
-  // 项目级警告（MCP 连不上之类）不带 sessionId，不能塞进任何一个会话的消息流
-  st = reduce(st, { type: 'app-notice', level: 'warn', text: 'MCP「fs」连接失败' })
-  check(
-    '应用级通知进通知栏，不挂到任何会话上',
-    st.notices.length === 1 && st.notices[0].level === 'warn' && itemsOf(st, 's1').length === 6,
-    JSON.stringify(st.notices),
-  )
-  for (let i = 0; i < 80; i++) st = reduce(st, { type: 'app-notice', level: 'info', text: `第 ${i} 条` })
-  check('通知栏有上限，长时间挂着不会把 state 撑爆', st.notices.length === 50 && st.notices.at(-1).text === '第 79 条', String(st.notices.length))
+  // 底部通知栏已经去掉（用户要求），`app-notice` 这个 action 一并不存在了
+
+  // 删除会话的归约：会话对象、排序、以及「删掉的正好是当前会话」三种情况一起看
+  const removedOther = reduce(st, { type: 'session-removed', id: 's2' })
+  check('删掉非当前会话：那一条从会话表和排序里都消失', !removedOther.sessions.s2 && JSON.stringify(removedOther.order) === '["s1"]', JSON.stringify(removedOther.order))
+  check('删掉非当前会话：当前会话不动', removedOther.activeId === 's1', String(removedOther.activeId))
+  const removedActive = reduce(st, { type: 'session-removed', id: 's1' })
+  check('删掉当前会话：退到排序里的最后一个', removedActive.activeId === 's2', String(removedActive.activeId))
+  const removedAll = reduce(removedActive, { type: 'session-removed', id: 's2' })
+  check('删光之后当前会话置空', removedAll.activeId === null && removedAll.order.length === 0, String(removedAll.activeId))
+  const removedGhost = reduce(st, { type: 'session-removed', id: '不存在' })
+  check('删一个不存在的 id 是空操作（原状态原样返回）', removedGhost === st)
 
   // 右栏「改动文件」：只认真写成功的，且按首次出现去重
   check('只把成功的写入算进改动文件', JSON.stringify(changedFiles(st.sessions.s1)) === '[]', JSON.stringify(changedFiles(st.sessions.s1)))
@@ -4255,7 +4258,6 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   )
   // 写的是**选中的那份**（kimi），不是当前使用的 `custom` —— 这是「同时配多家」的立足点
   check('存模型带上了选中的档案名', app.savedModels.at(-1).profileKey === 'kimi', JSON.stringify(app.savedModels.at(-1)))
-  check('写完提示了写到哪个文件', textOf(app.el('notices')).includes('config.json'), textOf(app.el('notices')))
   check('改完别的那份（custom）的模型没被动', app.projectInfo.profiles.find((p) => p.key === 'custom').model === 'desk-model')
 
   // 手填接口地址走另一条通道，同样带档案名
@@ -4367,9 +4369,6 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   toggle.checked = true
   toggle.fire('change')
   await tick()
-  const mcpNotices = textOf(app.el('notices'))
-  check('MCP 开关失败时报错而不是报成功', mcpNotices.includes('spawn ENOENT'), mcpNotices)
-  check('报错里点名了是哪台', mcpNotices.includes('broken'), mcpNotices)
   const after = find(app.el('settings-body'), (n) => n.dataset?.name === 'broken').children[0]
   check('失败后开关回到真实状态（没接上就不该是开的）', after.checked === false, String(after.checked))
 
@@ -4451,7 +4450,6 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
     '新加的那台出现在列表里',
     find(app.el('settings-body'), (n) => n.dataset?.name === 'filesystem') !== null,
   )
-  check('提示里写了写到哪个文件', textOf(app.el('notices')).includes('config.json'), textOf(app.el('notices')))
 
   // 空地址必须当场拦下：跑一趟 IPC 才拿到报错，用户看到的会是一句更绕的话
   find(app.el('settings-body'), (n) => n.className === 'form-open').click()
@@ -4460,7 +4458,6 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   find(app.el('settings-body'), (n) => n.className === 'primary').click()
   await tick()
   check('没填命令就保存：本地就拦下，不发请求', app.savedMcpAdds.at(-1).name === 'filesystem', JSON.stringify(app.savedMcpAdds.at(-1)))
-  check('说了缺什么', textOf(app.el('notices')).includes('命令不能为空'), textOf(app.el('notices')))
   find(app.el('settings-body'), (n) => n.className === 'ghost').click()
   await tick()
   check('点「取消」不会留下半个表单', find(app.el('settings-body'), (n) => n.className === 'primary') === null)
@@ -4620,7 +4617,6 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   ctlIn(app.el('settings-body'), '技能名').value = '中文名'
   find(app.el('settings-body'), (n) => n.className === 'primary').click()
   await tick()
-  check('保存失败时报出主进程那句话', textOf(app.el('notices')).includes('小写字母'), textOf(app.el('notices')))
   check('失败后表单留着，不用重打一遍', ctlIn(app.el('settings-body'), '技能名') !== null)
   app.skillBehavior.fail = null
   find(app.el('settings-body'), (n) => n.className === 'ghost').click()
@@ -4850,7 +4846,7 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   app.sendBehavior.dropped = 1
   await app.el('composer').fire('submit')
   await tick()
-  check('有附件没发出去时会给个通知', textOf(app.el('notices')).includes('不合规'), textOf(app.el('notices')))
+  // 「丢掉不合规的附件要说一声」原先靠底部通知栏验，那一栏已经去掉，这里只留发送本身不报错
   app.sendBehavior.dropped = 0
 
   // ------------------------------------------------------ 智能体
@@ -4960,15 +4956,13 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   check('温度发的是数字 0.7', agentAdd?.temperature === 0.7, JSON.stringify(agentAdd?.temperature))
   check('正文原样发过去', agentAdd?.body === '你是一名严格的代码审查员。', JSON.stringify(agentAdd?.body))
   check('改过的名字当成新的一份写', agentAdd?.name === 'review-2', JSON.stringify(agentAdd?.name))
-  check('新建的那条通知说「新建」', textOf(app.el('notices')).includes('已新建智能体「review-2」'), textOf(app.el('notices')))
   rows = agentRowsNow()
   check('左栏当场多出一行（保存完不用手动刷）', rows.length === 3 && pickOfRow(rows[2]).dataset.name === 'review-2', rows.map((r) => pickOfRow(r).dataset.name).join(','))
   check('刚保存的那行高亮着', pickOfRow(rows[2]).className.includes('is-selected'), pickOfRow(rows[2]).className)
 
-  // 再存一次同名 = 覆盖，通知该说「保存」而不是又「新建」
+  // 再存一次同名 = 覆盖，不该再新建一份
   await find(app.el('settings-body'), (n) => n.className === 'primary').click()
   await tick()
-  check('同名第二次写报「保存」而不是「新建」', textOf(app.el('notices')).includes('已保存智能体「review-2」'), textOf(app.el('notices')))
   check('没有写下第二份重名文件', agentRowsNow().length === 3, String(agentRowsNow().length))
 
   // ---- 设为默认
@@ -5035,15 +5029,77 @@ console.log('\n== 桌面端渲染层：真实渲染路径（假 DOM） ==')
   await app.el('new-session').click()
   await tick()
   check('智能体不在了也照样开会话，只是没绑', app.el('chat-agent').hidden === true, JSON.stringify(app.el('chat-agent').textContent))
+
+  uninstallDom()
+}
+
+console.log('\n== 桌面端渲染层：删除会话（假 DOM） ==')
+{
+  const { bootRenderer, tick, uninstallDom } = await import(new URL('./renderer-dom.mjs', import.meta.url).href)
+  const app = await bootRenderer()
+
+  // 开两个会话：`session/open` 按顺序发 id，所以第一条是 s1、第二条是 s2
+  await app.el('new-session').click()
+  await tick()
+  await app.el('new-session').click()
+  await tick()
+  const groupRows = () => app.el('session-list').children[0].children
+  check('两条会话都进了左栏', groupRows().length === 3, String(groupRows().length))
+
+  // 每一行尾部都有那个 × —— 进行中和历史两条列表共用 `sessionDelete()`。
+  // 行里的顺序是契约：`children[0]` 标题、`children[1]` 状态点（别处钉着的）、`children[2]` 删除
+  const del1 = app.row(1).children[2]
+  check('会话行尾挂着删除按钮', del1?.className === 'session-del', String(del1?.className))
+  check('删除按钮上是「×」', del1.textContent === '×', del1.textContent)
+
+  // 会话行不能是 `<button>`：里面塞了一个删除 `<button>`，嵌套按钮非法、内层点不动
+  check('会话行是 div 不是 button', app.row(1).tagName === 'div', app.row(1).tagName)
+  check('会话行带 role=button', app.row(1).getAttribute('role') === 'button', String(app.row(1).getAttribute('role')))
+
+  // 第一下：只把 × 换成一问一答，**不**发请求、也**不**删
+  const deletesBefore = app.savedSessionDeletes.length
+  del1.click()
+  await tick()
+  check('点第一下不删，只把按钮换成一问一答', app.savedSessionDeletes.length === deletesBefore, String(app.savedSessionDeletes.length))
+  const confirm = app.row(1).children[2]
+  check('确认框里有「删」和「取消」两个按钮', confirm.className === 'session-del-confirm' && confirm.children.length === 2, confirm.className)
+
+  // 取消：回到 ×，什么也没发生
+  confirm.children[1].click()
+  await tick()
+  check('点取消回到「×」，一个请求都没发', app.row(1).children[2].className === 'session-del' && app.savedSessionDeletes.length === deletesBefore)
+
+  // 再来一遍，这次确认删。第一行是最早开的 s1
+  app.row(1).children[2].click()
+  await tick()
+  app.row(1).children[2].children[0].click()
+  await tick()
+  check('确认后发出了 session/delete', app.savedSessionDeletes.length === deletesBefore + 1, String(app.savedSessionDeletes.length))
   check(
-    '通知栏说了一声「它已经不在了」',
-    textOf(app.el('notices')).includes('智能体「gone-agent」已经不在了'),
-    textOf(app.el('notices')),
+    '删除带上了这条会话的 id 和 cwd',
+    app.savedSessionDeletes.at(-1)?.id === 's1' && app.savedSessionDeletes.at(-1)?.cwd === 'C:/p',
+    JSON.stringify(app.savedSessionDeletes.at(-1)),
   )
-  // 去重：`session/state` 是高频的，每来一次快照弹一次会把通知栏刷满
-  app.emit('s6', { type: 'session-state', session: { agentWarning: '智能体「gone-agent」已经不在了，这个会话按默认配置打开' } })
-  const warned = textOf(app.el('notices')).split('已经不在了').length - 1
-  check('同一条警告只弹一次', warned === 1, String(warned))
+  check('删掉的那条从左栏消失了', groupRows().length === 2, String(groupRows().length))
+
+  // 删掉的正好是当前会话：此刻停在 s2，删掉它之后没有别的会话了，中栏要回到空态
+  check('此刻当前会话是 s2', app.el('chat-title').textContent === 'C:/p', app.el('chat-title').textContent)
+  app.row(1).children[2].click()
+  await tick()
+  app.row(1).children[2].children[0].click()
+  await tick()
+  check('删掉当前会话后中栏回到空态', app.el('chat-title').textContent === '还没有打开的会话', app.el('chat-title').textContent)
+  check('左栏一条都不剩', groupRows().length === 1, String(groupRows().length))
+
+  // 失败路径：不能假装删掉了（那一行得留在原地）
+  await app.el('new-session').click()
+  await tick()
+  app.sessionDeleteBehavior.fail = '这个会话正忙着'
+  app.row(1).children[2].click()
+  await tick()
+  app.row(1).children[2].children[0].click()
+  await tick()
+  check('删除失败时那一行还在（没假装删掉）', groupRows().length === 2, String(groupRows().length))
 
   uninstallDom()
 }
@@ -5129,16 +5185,10 @@ console.log('\n== 自检：Electron 不许漏进运行时 ==')
   check('工具页的标题是「工具」', mcpMeta.includes("title: '工具'"), mcpMeta.slice(0, 40))
   check('工具页正文仍写「MCP 服务器」', mcpMeta.includes('由 MCP 服务器提供'), mcpMeta.slice(0, 40))
 
-  // 通知栏不能待在侧栏里。侧栏在模型/技能/MCP 三个设置视图下是 `display: none`，
-  // 于是「MCP 开关接不上」这种恰好发生在设置页上的报错，会死在引发它的那一页上，
-  // 一个字都看不到 —— 而这正是当初把通道改成 `{ok:false, reason}` 要解决的事。
-  // 纯结构断言，不点窗口就能查。
-  const sidebar = html.slice(html.indexOf('<aside class="sidebar">'), html.indexOf('</aside>'))
-  check(
-    '通知栏不在侧栏里（否则设置页上看不见报错）',
-    !sidebar.includes('id="notices"'),
-    sidebar.slice(0, 80),
-  )
+  // 底部通知栏已经整个拿掉了：报错改走 `console`，界面上不再有这一条。
+  // 纯结构断言：`#notices` 这个 id 不该再出现在 index.html 里 —— 谁要是哪天
+  // 又把它加回来，这条会红，提醒他那是一条被刻意删掉的东西。
+  check('底部通知栏已经从 index.html 里拿掉', !html.includes('id="notices"'))
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

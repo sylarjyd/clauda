@@ -346,20 +346,25 @@
   全绿，真窗口不对**。
 - **会话浏览区 `.browse` 是 flex 列且 `flex: 1; min-height: 0`**：它自己不吃掉剩余高度的话，
   里面 `.session-list` 的 `flex: 1` 就没有确定高度可分配，列表不会滚动，只会把整列越撑越长。
-- **通知栏（`#notices`）必须待在侧栏之外**，在 `.app` 网格的第二行通栏（`grid-row: 2;
-  grid-column: 1 / -1`，空的时 `display:none` 让这一行塌掉）。它早先是侧栏底部的一条，
-  而侧栏当时在三个设置视图下是 `display:none`（现在换成 `.browse` 被摘），于是「MCP 开关
-  接不上」这种**恰好发生在设置页上**的报错会死在引发它的那一页，一个字都看不到 —— 那正是
-  把通道改成 `{ok:false, reason}` 要解决的问题，白修了。**放进 `.browse` 会重演这个 bug**：
-  那正是设置视图下唯一被 `display:none` 的那块。别改成浮层：通知不自动消失也没有关闭按钮，
-  浮层会常驻盖住输入框（底部正是输入框），要盖住什么才能看见，得先想清楚。
-- **通知栏里只放「你刚做了什么、成没成」** —— 也就是渲染层自己那条 `notice()`。主进程
-  `onWarn` 那类后台诊断（MCP 连不上、上下文压缩失败）**只打控制台**，一条都不往窗口推：
-  它们带的是子进程的原始报错，一屏好几行技术细节，混进这条通栏就是刷屏，而用户要的
-  「日志」正是这个。这不算把失败藏起来 —— 连不上的那台在「工具」页上红着并带着错误原文，
-  徽标上的已连接数也跟着掉。`tests/unit.mjs`
-  末尾有一条结构断言钉着「它不在 `<aside class="sidebar">` 里」（比实际需要更严一档，
-  故意留着的余量）。
+- **删除会话是一条 `session/delete`（cwd + id）**，从渲染层一路打到 `deleteSession`
+  （`src/agent/session.ts`，`fs.unlinkSync` 那个 `.json`）。进行中和历史两条列表的每一行
+  都挂一个 `sessionDelete()` 返回的 × 按钮，走**两步内联确认**（模块级
+  `pendingSessionRemove`，不复用 `pendingRemove` / `pendingSkillRemove` / `pendingMcpRemove`
+  —— 那是另外三页的 key，撞名会让确认框跑错页）。**会话行因此从 `<button>` 改成了
+  `<div role="button" tabindex="0">`**：往里塞一个删除 `<button>` 会嵌套按钮，HTML 非法。
+  回车/空格照旧开会话（`keydown`），删除按钮上的点击要 `stopPropagation`，否则点 × 会先
+  触发那一行的「打开」。`SessionManager.deleteSession` 先 `closeSession`（进行中的要拆掉
+  runtime）再删文件，所以两条列表共用同一条路。删掉的正好是当前会话时，渲染层按 `order`
+  退到最后一个，没有就置 `null`。
+- **底部通知栏（`#notices`）已经整个拿掉**（用户要求「底部日志不要了」）。渲染层自己的
+  `notice()` 现在**只打控制台**（`error`/`warn`/`info` 三档映射到对应 `console` 方法），
+  主进程 `onWarn` 那类后台诊断（MCP 连不上、上下文压缩失败）本来也只在控制台。**报错因此
+  在界面上不可见** —— 这是明知代价、用户拍板的取舍。连不上的 MCP 服务器仍会在「工具」页
+  上红着、带着错误原文，徽标上的已连接数也跟着掉，所以不是全靠控制台。
+  `state.js` 里 `app-notice` 这个 action、`notices` 这个 state 字段、
+  `MAX_NOTICES` 这个常量一并不存在了；`app.js` 里的 `renderNotices()` 也删了。
+  `tests/unit.mjs` 末尾有一条结构断言钉着「`id="notices"` 不该再出现在 `index.html` 里」，
+  谁加回来就红。
 - **`createProjectRuntime` 必须把 `loadConfig` 包在 `process.env` 快照里**。它内部的
   dotenv 改全局 env 且不覆盖已存在的键，同时开两个项目时后加载的那个 `.env` 会**静默失效**、
   继承前一个项目的配置。还原时只动这次多出来 / 被改写的键，整个替换 `process.env` 会抹掉

@@ -230,13 +230,6 @@
       </aside>
 
       <!--
-        通知栏是 `.app` 网格的第二行（见 style.css），四个视图下都看得见。
-        它早先是侧栏底部的一条，而侧栏在模型/技能/MCP 三个设置页上是 `display:none`，
-        于是「MCP 开关接不上」这类错误恰好死在引发它的那个页面上，一个字都看不到。
-      -->
-      <div id="notices" class="notices"></div>
-
-      <!--
         整窗拖拽遮罩。`position: fixed` 让它脱离文档流，所以不会参与 `.app` 的网格
         排布（那张网格每个子元素都写死了 grid-column，多一个没定位的就会挤出一行）。
         样式里必须带 `pointer-events: none`，否则遮罩自己会把 drop 事件吃掉。
